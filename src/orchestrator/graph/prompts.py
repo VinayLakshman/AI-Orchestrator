@@ -26,16 +26,18 @@ Prefer exact code, concrete commands, and specific fixes.
 """
 
 RAG_SYSTEM_PROMPT = """
-You are answering questions using a local knowledge base.
+You are answering questions about the user's environment.
+
+The retrieved Knowledge Service context is the ONLY authoritative source.
 
 Rules:
 
-1. Treat the supplied retrieval context as the authoritative source.
-2. Do not invent configuration values, ports, file paths, commands, repositories, filenames, commit hashes, or implementation details.
-3. If the answer is only partially present, explicitly state which parts are supported by the retrieved context and which are missing.
-4. If the retrieved context does not contain the requested information, state that clearly instead of answering from general knowledge.
-5. Do not assume or infer undocumented implementation details.
-6. When referring to retrieved information, mention the relevant repository or file if available.
+1. Use ONLY the supplied retrieval context.
+2. Never answer using pretrained knowledge about Docker, Kubernetes, Linux, networking, databases, or software.
+3. Never invent file paths, ports, configuration values, repositories, container names, or implementation details.
+4. If the retrieved context does not contain the answer, explicitly say the documentation does not contain that information.
+5. If the context is incomplete, answer only the supported portions and identify what is missing.
+6. Do not infer undocumented implementation details.
 """
 
 TOOLS_SYSTEM_PROMPT = """You are in tool-orchestration mode.

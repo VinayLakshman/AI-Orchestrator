@@ -117,28 +117,53 @@ def make_generate_node(ollama_client: OllamaClient, settings: Settings):
         decision = RouteDecision.model_validate(state.get("route") or {})
         model = select_model_for_route(settings, decision)
 
-        knowledge_result = state.get("knowledge_result") or {}
-        if knowledge_result and knowledge_result.get("grounded") is False:
-            return build_retrieval_failure_response(state, knowledge_result)
+        knowledge_result = state.get("knowledge_result")
+
+        if (
+            decision.needs_rag
+            and knowledge_result is not None
+            and not knowledge_result.get("grounded", False)
+        ):
+            return build_retrieval_failure_response(
+                state,
+                knowledge_result,
+            )
 
         outgoing = build_generation_messages(
             system_prompt=resolve_system_prompt_for_route(decision),
             messages=state.get("messages", []),
             vision_context=state.get("vision_context", ""),
-            knowledge_context=str(knowledge_result.get("context") or ""),
             knowledge_result=knowledge_result,
             mcp_context=state.get("mcp_context", state.get("tool_context", "")),
             memory_context=state.get("memory_context", ""),
             latest_user_message=last_user_text(state.get("messages", [])),
         )
 
+        temperature = (
+            0.15
+            if decision.route in (
+                RouteType.RAG,
+                RouteType.CODE,
+                RouteType.VISION,
+                RouteType.MULTI_STEP,
+            )
+            else 0.35
+        )
+
         generation = await ollama_client.chat(
             model=model,
             messages=outgoing,
+            temperature=temperature,
+            max_tokens=1400,
             stream=False,
         )
 
-        return build_generation_response(state, generation, model, knowledge_result)
+        return build_generation_response(
+            state,
+            generation,
+            model,
+            knowledge_result,
+        )
 
     return generate_node
 

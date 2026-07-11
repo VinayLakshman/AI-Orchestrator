@@ -117,7 +117,7 @@ class OrchestratorResponse(BaseModel):
     answer: str
     used_models: list[str] = Field(default_factory=list)
     used_tools: list[str] = Field(default_factory=list)
-    knowledge: list[KnowledgeHit] = Field(default_factory=list)
+    knowledge_result: KnowledgeRetrieveResponse | None = None
     vision: VisionAnalysis | None = None
     vision_context: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
