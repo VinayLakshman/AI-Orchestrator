@@ -136,10 +136,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         router=router,
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
-        vision_pipeline=vision_pipeline,
-        stream_hub=stream_hub,
-        graph=graph,
-        checkpointer=checkpointer,
+        vision_pipeline=vision_pipeline
     )
 
     return OrchestratorRuntime(
