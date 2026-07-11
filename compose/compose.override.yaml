@@ -1,9 +1,0 @@
-services:
-  orchestrator:
-    volumes:
-      - ../app:/app/app:ro
-      - ../config:/app/config:ro
-      - ../docs:/app/docs:ro
-    environment:
-      APP_ENV: development
-      LOG_LEVEL: DEBUG
