@@ -9,7 +9,7 @@ def coder_node(state: OrchestratorState) -> OrchestratorState:
     if not state.get('needs_coder'):
         return state
     settings = get_settings()
-    client = OllamaClient(settings.ollama_base_url, timeout=settings.request_timeout_seconds)
+    client = OllamaClient(settings.ollama_url, timeout=settings.request_timeout_seconds)
     prompt = '\n'.join([
         'You are an internal coding assistant.',
         'Write the minimal correct solution.',
@@ -19,6 +19,6 @@ def coder_node(state: OrchestratorState) -> OrchestratorState:
         f'Tool results:\n{state.get("tool_results", "")}',
     ])
     messages = [{'role': 'user', 'content': prompt}]
-    output = asyncio.run(client.chat(settings.ollama_coder_model, messages))
+    output = asyncio.run(client.chat(settings.llm_coder_model, messages))
     state['coder_output'] = output
     return state

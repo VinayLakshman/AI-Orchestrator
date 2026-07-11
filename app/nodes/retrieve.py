@@ -26,7 +26,7 @@ def retrieve_node(state: OrchestratorState) -> OrchestratorState:
     settings = get_settings()
     client = KnowledgeServiceClient(
         base_url=settings.knowledge_service_url,
-        retrieve_path=settings.knowledge_retrieve_path,
+        retrieve_path="/retrieve",
         timeout=settings.request_timeout_seconds,
     )
     query = state.get('user_text', '')

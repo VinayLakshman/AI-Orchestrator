@@ -21,9 +21,9 @@ async def models():
     return {
         'object': 'list',
         'data': [
-            {'id': settings.ollama_main_model, 'object': 'model', 'owned_by': 'local'},
-            {'id': settings.ollama_coder_model, 'object': 'model', 'owned_by': 'local'},
-            {'id': settings.ollama_vision_model, 'object': 'model', 'owned_by': 'local'},
+            {'id': settings.llm_main_model, 'object': 'model', 'owned_by': 'local'},
+            {'id': settings.llm_coder_model, 'object': 'model', 'owned_by': 'local'},
+            {'id': settings.llm_vision_model, 'object': 'model', 'owned_by': 'local'},
         ],
     }
 
