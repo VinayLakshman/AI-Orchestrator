@@ -6,7 +6,9 @@ from ..clients import KnowledgeClient, OllamaClient
 from ..router import RequestRouter
 from ..schemas import ChatMessage, ChatRole, KnowledgeHit, RouteDecision, RouteType
 from ..settings import Settings
-from ..vision import VisionPipeline, build_vision_injection_message
+from ..vision.pipeline import VisionPipeline
+from ..vision.prompts import build_vision_injection_message
+from ..vision.fetcher import strip_images_from_messages
 from .prompts import (
     BASE_SYSTEM_PROMPT,
     CODE_SYSTEM_PROMPT,
@@ -87,8 +89,6 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
         result = await vision_pipeline.process(state)
 
         if result is None:
-            from ..vision.fetcher import strip_images_from_messages
-
             cleaned = strip_images_from_messages(state.get("messages", []))
             return {"messages": cleaned}
 
@@ -223,7 +223,10 @@ def make_generate_node(ollama_client: OllamaClient, settings: Settings):
             outgoing_messages.append(
                 ChatMessage(
                     role=ChatRole.SYSTEM,
-                    content=build_vision_injection_message(vision_context, last_user_text(state.get("messages", []))),
+                    content=build_vision_injection_message(
+                        vision_context,
+                        last_user_text(state.get("messages", [])),
+                    ),
                     metadata={"source": "vision", "kind": "analysis_context"},
                 )
             )

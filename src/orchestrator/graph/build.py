@@ -11,7 +11,7 @@ from ..clients import KnowledgeClient, OllamaClient
 from ..router import RequestRouter
 from ..router.classifier import RoutingClassifier
 from ..settings import Settings
-from ..vision import VisionPipeline
+from ..vision.pipeline import VisionPipeline
 from .nodes import make_clarify_node, make_generate_node, make_retrieve_node, make_route_node, make_vision_node
 from .state import OrchestratorState
 
