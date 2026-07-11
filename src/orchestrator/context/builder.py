@@ -13,7 +13,6 @@ from ..graph.prompts import (
 from ..schemas import ChatMessage, ChatRole, RouteDecision, RouteType
 from ..settings import Settings
 from ..vision.prompts import build_vision_injection_message
-from .validator import RetrievalValidationResult
 
 
 def last_user_text(messages: list[dict[str, Any]] | None) -> str:
@@ -81,25 +80,32 @@ def _message_text_matches_last_user(messages: list[ChatMessage], latest_user_mes
     return False
 
 
-def _build_retrieval_metadata_message(validation: RetrievalValidationResult, intent: str) -> ChatMessage:
-    return ChatMessage(
-        role=ChatRole.SYSTEM,
-        content=f"""
-Knowledge Retrieval
+def _build_retrieval_metadata_message(knowledge_result: dict[str, Any] | None) -> ChatMessage | None:
+    if not knowledge_result:
+        return None
 
-Intent:
-{intent}
+    intent = str(knowledge_result.get("intent") or "unknown")
+    grounded = bool(knowledge_result.get("grounded", False))
+    confidence = knowledge_result.get("confidence")
+    retrieval_reason = str(knowledge_result.get("retrieval_reason") or "unknown")
+    primary_hits = knowledge_result.get("primary_hits") or []
+    expanded_hits = knowledge_result.get("expanded_hits") or []
 
-Grounded:
-{validation.grounded}
+    confidence_text = f"{float(confidence):.3f}" if confidence is not None else "n/a"
+    content = "\n".join(
+        [
+            "Knowledge Retrieval",
+            "",
+            f"Intent: {intent}",
+            f"Grounded: {'true' if grounded else 'false'}",
+            f"Confidence: {confidence_text}",
+            f"Reason: {retrieval_reason}",
+            f"Primary Hits: {len(primary_hits)}",
+            f"Expanded Hits: {len(expanded_hits)}",
+        ]
+    ).strip()
 
-Hits:
-{validation.hit_count}
-
-Best Score:
-{validation.score:.3f}
-""".strip(),
-    )
+    return ChatMessage(role=ChatRole.SYSTEM, content=content)
 
 
 def build_generation_messages(
@@ -108,8 +114,7 @@ def build_generation_messages(
     messages: list[dict[str, Any]] | None = None,
     vision_context: str = "",
     knowledge_context: str = "",
-    validation: RetrievalValidationResult | None = None,
-    retrieval_metadata_intent: str = "unknown",
+    knowledge_result: dict[str, Any] | None = None,
     mcp_context: str = "",
     memory_context: str = "",
     latest_user_message: str | None = None,
@@ -125,13 +130,12 @@ def build_generation_messages(
             )
         )
 
-    if validation is not None and validation.context:
-        outgoing.append(ChatMessage(role=ChatRole.SYSTEM, content=validation.context))
-    elif knowledge_context:
+    if knowledge_context:
         outgoing.append(ChatMessage(role=ChatRole.SYSTEM, content=knowledge_context))
 
-    if validation is not None:
-        outgoing.append(_build_retrieval_metadata_message(validation, retrieval_metadata_intent))
+    retrieval_metadata_message = _build_retrieval_metadata_message(knowledge_result)
+    if retrieval_metadata_message is not None:
+        outgoing.append(retrieval_metadata_message)
 
     if mcp_context:
         outgoing.append(ChatMessage(role=ChatRole.SYSTEM, content=mcp_context))

@@ -16,9 +16,7 @@ class OrchestratorState(TypedDict, total=False):
     vision_image_hashes: list[str]
     vision_cache_hit: bool
 
-    knowledge: list[dict[str, Any]]
-    knowledge_context: str
-    retrieval_stats: dict[str, Any]
+    knowledge_result: dict[str, Any]
 
     used_models: list[str]
     used_tools: list[str]

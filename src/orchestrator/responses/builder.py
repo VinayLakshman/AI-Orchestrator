@@ -3,23 +3,25 @@ from __future__ import annotations
 from typing import Any
 
 from ..context.builder import last_user_text
-from ..context.validator import RetrievalValidationResult
 from ..graph.state import OrchestratorState
 from ..schemas import ChatMessage, ChatRole
 
 
 def build_retrieval_failure_response(
     state: OrchestratorState,
-    validation: RetrievalValidationResult,
+    knowledge_result: dict[str, Any],
 ) -> dict[str, Any]:
-    retrieval_stats = validation.metadata or {}
-
-    query = retrieval_stats.get("question") or retrieval_stats.get("query") or last_user_text(state.get("messages", []))
+    query = last_user_text(state.get("messages", []))
+    retrieval_reason = str(
+        knowledge_result.get("retrieval_reason")
+        or "Knowledge retrieval did not produce a grounded result"
+    )
+    confidence = knowledge_result.get("confidence")
 
     answer = (
         "I couldn't answer this from your indexed knowledge base.\n\n"
         f"Query:\n{query}\n\n"
-        f"Reason:\n{validation.reason}\n\n"
+        f"Reason:\n{retrieval_reason}\n\n"
         "The orchestrator intentionally stopped before calling the language model "
         "because answering without grounded knowledge could produce hallucinated information."
     )
@@ -30,6 +32,9 @@ def build_retrieval_failure_response(
         metadata={
             "grounded": False,
             "retrieval_failed": True,
+            "retrieval_reason": retrieval_reason,
+            "confidence": confidence,
+            "intent": knowledge_result.get("intent"),
         },
     )
 
@@ -44,9 +49,10 @@ def build_retrieval_failure_response(
         "metadata": {
             **state.get("metadata", {}),
             "rag_grounded": False,
-            "retrieval_reason": validation.reason,
-            "retrieval_score": validation.score,
-            "retrieval_stats": retrieval_stats,
+            "retrieval_reason": retrieval_reason,
+            "retrieval_confidence": confidence,
+            "retrieval_intent": knowledge_result.get("intent"),
+            "knowledge_result": knowledge_result,
         },
     }
 
@@ -55,15 +61,24 @@ def build_generation_response(
     state: OrchestratorState,
     generation: Any,
     model: str,
-    validation: RetrievalValidationResult | None = None,
+    knowledge_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    content = generation.content.strip() if getattr(generation, "content", None) else str(generation)
+    grounded = bool((knowledge_result or {}).get("grounded", False))
+    confidence = (knowledge_result or {}).get("confidence")
+    retrieval_reason = (knowledge_result or {}).get("retrieval_reason")
+    intent = (knowledge_result or {}).get("intent")
+
     assistant = ChatMessage(
         role=ChatRole.ASSISTANT,
-        content=generation.content.strip(),
+        content=content,
         metadata={
             "model": model,
             "route": state.get("route", {}).get("route") or state.get("route_name"),
-            "grounded": validation.grounded if validation is not None else None,
+            "grounded": grounded,
+            "confidence": confidence,
+            "retrieval_reason": retrieval_reason,
+            "intent": intent,
         },
     )
 
@@ -78,7 +93,10 @@ def build_generation_response(
         "metadata": {
             **state.get("metadata", {}),
             "generation_model": model,
-            "rag_grounded": validation.grounded if validation is not None else None,
-            "retrieval_stats": validation.metadata if validation is not None else {},
+            "rag_grounded": grounded,
+            "retrieval_confidence": confidence,
+            "retrieval_reason": retrieval_reason,
+            "retrieval_intent": intent,
+            "knowledge_result": knowledge_result,
         },
     }

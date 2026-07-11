@@ -9,7 +9,6 @@ from ..context.builder import (
     resolve_system_prompt_for_route,
     select_model_for_route,
 )
-from ..context.validator import KnowledgeHit, render_knowledge_context, validate_retrieval
 from ..responses.builder import build_generation_response, build_retrieval_failure_response
 from ..router import RequestRouter
 from ..schemas import ChatMessage, ChatRole, RouteDecision, RouteType
@@ -89,11 +88,7 @@ def make_retrieve_node(knowledge_client: KnowledgeClient, settings: Settings):
         decision = RouteDecision.model_validate(route_raw)
 
         if not decision.needs_rag:
-            return {
-                "knowledge": [],
-                "knowledge_context": "",
-                "retrieval_stats": {},
-            }
+            return {"knowledge_result": {}}
 
         question = last_user_text(state.get("messages", []))
         result = await knowledge_client.retrieve(
@@ -103,27 +98,11 @@ def make_retrieve_node(knowledge_client: KnowledgeClient, settings: Settings):
             neighbor_window=settings.knowledge_neighbor_window,
         )
 
-        hits = [*result.primary_hits, *result.expanded_hits]
-        knowledge_context = (result.context or "").strip()
-
         return {
-            "knowledge": [hit.model_dump(exclude_none=True) for hit in hits],
-            "knowledge_context": knowledge_context,
-            "retrieval_stats": {
-                "question": result.question,
-                "intent": result.intent,
-                "embedding_time": result.embedding_time,
-                "search_time": result.search_time,
-                "rerank_time": result.rerank_time,
-                "expansion_time": result.expansion_time,
-                "total_time": result.total_time,
-                "primary_hits": len(result.primary_hits),
-                "expanded_hits": len(result.expanded_hits),
-            },
+            "knowledge_result": result.model_dump(exclude_none=True),
             "used_tools": list(dict.fromkeys(state.get("used_tools", []) + ["knowledge_service"])),
             "metadata": {
                 **state.get("metadata", {}),
-                "knowledge_hits": len(hits),
                 "knowledge_query": question,
                 "knowledge_intent": result.intent,
                 "knowledge_total_time": result.total_time,
@@ -138,26 +117,16 @@ def make_generate_node(ollama_client: OllamaClient, settings: Settings):
         decision = RouteDecision.model_validate(state.get("route") or {})
         model = select_model_for_route(settings, decision)
 
-        validation = None
-        if decision.needs_rag:
-            validation = validate_retrieval(
-                knowledge_context=state.get("knowledge_context", ""),
-                knowledge_hits=[KnowledgeHit.model_validate(item) for item in state.get("knowledge", [])],
-                retrieval_stats=state.get("retrieval_stats", {}),
-                settings=settings,
-                render_context=render_knowledge_context,
-            )
-
-            if not validation.grounded:
-                return build_retrieval_failure_response(state, validation)
+        knowledge_result = state.get("knowledge_result") or {}
+        if knowledge_result and knowledge_result.get("grounded") is False:
+            return build_retrieval_failure_response(state, knowledge_result)
 
         outgoing = build_generation_messages(
             system_prompt=resolve_system_prompt_for_route(decision),
             messages=state.get("messages", []),
             vision_context=state.get("vision_context", ""),
-            knowledge_context=state.get("knowledge_context", ""),
-            validation=validation,
-            retrieval_metadata_intent=state.get("retrieval_stats", {}).get("intent", "unknown"),
+            knowledge_context=str(knowledge_result.get("context") or ""),
+            knowledge_result=knowledge_result,
             mcp_context=state.get("mcp_context", state.get("tool_context", "")),
             memory_context=state.get("memory_context", ""),
             latest_user_message=last_user_text(state.get("messages", [])),
@@ -169,7 +138,7 @@ def make_generate_node(ollama_client: OllamaClient, settings: Settings):
             stream=False,
         )
 
-        return build_generation_response(state, generation, model, validation)
+        return build_generation_response(state, generation, model, knowledge_result)
 
     return generate_node
 

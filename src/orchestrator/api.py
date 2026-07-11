@@ -8,8 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .graph import OrchestratorRuntime
-from .schemas import ChatMessage, ChatRequest, OrchestratorResponse
-from .settings import get_settings
+from .schemas import ChatMessage, ChatRequest, KnowledgeHit, OrchestratorResponse
 
 router = APIRouter(tags=["orchestrator"])
 
@@ -72,12 +71,18 @@ def _input_state_from_request(payload: ChatRequest, request: Request) -> dict[st
         },
         "used_models": [],
         "used_tools": [],
-        "knowledge": [],
+        "knowledge_result": {},
     }
 
 
 def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorResponse:
     route = state.get("route") or {}
+    knowledge_result = state.get("knowledge_result") or {}
+    knowledge_hits = []
+
+    for hit in [*(knowledge_result.get("primary_hits") or []), *(knowledge_result.get("expanded_hits") or [])]:
+        if isinstance(hit, dict):
+            knowledge_hits.append(KnowledgeHit.model_validate(hit))
 
     return OrchestratorResponse(
         thread_id=thread_id,
@@ -85,7 +90,7 @@ def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorR
         answer=state.get("answer") or "",
         used_models=state.get("used_models") or [],
         used_tools=state.get("used_tools") or [],
-        knowledge=state.get("knowledge") or [],
+        knowledge=knowledge_hits,
         vision=state.get("vision"),
         vision_context=state.get("vision_context") or "",
         metadata=state.get("metadata", {}),
