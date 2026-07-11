@@ -88,7 +88,7 @@ class KnowledgeRetrieveResponse(BaseModel):
     rerank_time: float
     expansion_time: float
     total_time: float
-    context: str
+    context: str | None = None
     primary_hits: list[KnowledgeHit] = Field(default_factory=list)
     expanded_hits: list[KnowledgeHit] = Field(default_factory=list)
 

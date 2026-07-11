@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     knowledge_top_k: int = 6
     knowledge_candidate_limit: int = 12
     knowledge_neighbor_window: int = 1
+    knowledge_min_score: float = 0.55
+    knowledge_min_hits: int = 1
 
     # Vision pipeline
     vision_enabled: bool = True

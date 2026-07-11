@@ -3,85 +3,20 @@ from __future__ import annotations
 from typing import Any
 
 from ..clients import KnowledgeClient, OllamaClient
-from ..router import RequestRouter
-from ..schemas import ChatMessage, ChatRole, KnowledgeHit, RouteDecision, RouteType
-from ..settings import Settings
-from ..vision.pipeline import VisionPipeline
-from ..vision.prompts import build_vision_injection_message
-from ..vision.fetcher import strip_images_from_messages
-from .prompts import (
-    BASE_SYSTEM_PROMPT,
-    CODE_SYSTEM_PROMPT,
-    CLARIFY_SYSTEM_PROMPT,
-    RAG_SYSTEM_PROMPT,
-    TOOLS_SYSTEM_PROMPT,
-    VISION_SYSTEM_PROMPT,
+from ..context.builder import (
+    build_generation_messages,
+    last_user_text,
+    resolve_system_prompt_for_route,
+    select_model_for_route,
 )
+from ..context.validator import KnowledgeHit, render_knowledge_context, validate_retrieval
+from ..responses.builder import build_generation_response, build_retrieval_failure_response
+from ..router import RequestRouter
+from ..schemas import ChatMessage, ChatRole, RouteDecision, RouteType
+from ..settings import Settings
+from ..vision.fetcher import strip_images_from_messages
+from ..vision.pipeline import VisionPipeline
 from .state import OrchestratorState
-
-
-def last_user_text(messages: list[dict[str, Any]]) -> str:
-    for message in reversed(messages):
-        if message.get("role") == ChatRole.USER.value and message.get("content"):
-            content = message["content"]
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text = str(part.get("text", "")).strip()
-                        if text:
-                            text_parts.append(text)
-                return "\n".join(text_parts).strip()
-            return str(content)
-    return ""
-
-
-def state_messages_to_chat_messages(messages: list[dict[str, Any]]) -> list[ChatMessage]:
-    return [ChatMessage.model_validate(message) for message in messages]
-
-
-def normalize_knowledge(raw: list[dict[str, Any]]) -> list[KnowledgeHit]:
-    return [KnowledgeHit.model_validate(item) for item in raw]
-
-
-def render_knowledge_context(chunks: list[KnowledgeHit]) -> str:
-    if not chunks:
-        return ""
-
-    lines: list[str] = ["Retrieved knowledge context:"]
-    for idx, chunk in enumerate(chunks, start=1):
-        score = f" (score={chunk.score:.3f})" if isinstance(chunk.score, float) else ""
-        source = f" source={chunk.repository}" if chunk.repository else ""
-        lines.append(f"[{idx}]{score}{source}")
-        lines.append(chunk.content.strip())
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-def choose_model(settings: Settings, decision: RouteDecision) -> str:
-    if decision.route == RouteType.VISION:
-        return settings.vision_model
-    if decision.route == RouteType.CODE:
-        return settings.coder_model
-    return settings.general_model
-
-
-def system_prompt_for_route(decision: RouteDecision) -> str:
-    if decision.route == RouteType.VISION:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, VISION_SYSTEM_PROMPT])
-    if decision.route == RouteType.CODE:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, CODE_SYSTEM_PROMPT])
-    if decision.route == RouteType.RAG:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, RAG_SYSTEM_PROMPT])
-    if decision.route == RouteType.TOOLS:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, TOOLS_SYSTEM_PROMPT])
-    if decision.route == RouteType.CLARIFY:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, CLARIFY_SYSTEM_PROMPT])
-    if decision.route == RouteType.MULTI_STEP:
-        return BASE_SYSTEM_PROMPT
-    return BASE_SYSTEM_PROMPT
 
 
 def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
@@ -169,10 +104,7 @@ def make_retrieve_node(knowledge_client: KnowledgeClient, settings: Settings):
         )
 
         hits = [*result.primary_hits, *result.expanded_hits]
-        knowledge_context = result.context.strip()
-
-        if not knowledge_context and hits:
-            knowledge_context = render_knowledge_context(hits)
+        knowledge_context = (result.context or "").strip()
 
         return {
             "knowledge": [hit.model_dump(exclude_none=True) for hit in hits],
@@ -203,90 +135,41 @@ def make_retrieve_node(knowledge_client: KnowledgeClient, settings: Settings):
 
 def make_generate_node(ollama_client: OllamaClient, settings: Settings):
     async def generate_node(state: OrchestratorState) -> dict[str, Any]:
-        route_raw = state.get("route") or {}
-        decision = RouteDecision.model_validate(route_raw)
+        decision = RouteDecision.model_validate(state.get("route") or {})
+        model = select_model_for_route(settings, decision)
 
-        model = choose_model(settings, decision)
-        system_prompt = system_prompt_for_route(decision)
-
-        vision_context = (state.get("vision_context") or "").strip()
-        knowledge_context = (state.get("knowledge_context") or "").strip()
-        knowledge_hits = normalize_knowledge(state.get("knowledge", []))
-
-        chat_messages = state_messages_to_chat_messages(state.get("messages", []))
-
-        outgoing_messages: list[ChatMessage] = [
-            ChatMessage(role=ChatRole.SYSTEM, content=system_prompt)
-        ]
-
-        if vision_context:
-            outgoing_messages.append(
-                ChatMessage(
-                    role=ChatRole.SYSTEM,
-                    content=build_vision_injection_message(
-                        vision_context,
-                        last_user_text(state.get("messages", [])),
-                    ),
-                    metadata={"source": "vision", "kind": "analysis_context"},
-                )
+        validation = None
+        if decision.needs_rag:
+            validation = validate_retrieval(
+                knowledge_context=state.get("knowledge_context", ""),
+                knowledge_hits=[KnowledgeHit.model_validate(item) for item in state.get("knowledge", [])],
+                retrieval_stats=state.get("retrieval_stats", {}),
+                settings=settings,
+                render_context=render_knowledge_context,
             )
 
-        if knowledge_context:
-            outgoing_messages.append(
-                ChatMessage(
-                    role=ChatRole.SYSTEM,
-                    content=knowledge_context,
-                    metadata={"source": "knowledge_service", "kind": "retrieval_context"},
-                )
-            )
-        elif knowledge_hits:
-            outgoing_messages.append(
-                ChatMessage(
-                    role=ChatRole.SYSTEM,
-                    content=render_knowledge_context(knowledge_hits),
-                    metadata={"source": "knowledge_service", "kind": "retrieved_hits"},
-                )
-            )
+            if not validation.grounded:
+                return build_retrieval_failure_response(state, validation)
 
-        if decision.route == RouteType.TOOLS:
-            outgoing_messages.append(
-                ChatMessage(
-                    role=ChatRole.SYSTEM,
-                    content=(
-                        "If the user asked for action execution, explain the intended action "
-                        "and whether the tool executor is available. Do not fabricate tool results."
-                    ),
-                )
-            )
-
-        outgoing_messages.extend(chat_messages)
+        outgoing = build_generation_messages(
+            system_prompt=resolve_system_prompt_for_route(decision),
+            messages=state.get("messages", []),
+            vision_context=state.get("vision_context", ""),
+            knowledge_context=state.get("knowledge_context", ""),
+            validation=validation,
+            retrieval_metadata_intent=state.get("retrieval_stats", {}).get("intent", "unknown"),
+            mcp_context=state.get("mcp_context", state.get("tool_context", "")),
+            memory_context=state.get("memory_context", ""),
+            latest_user_message=last_user_text(state.get("messages", [])),
+        )
 
         generation = await ollama_client.chat(
             model=model,
-            messages=outgoing_messages,
-            temperature=0.15 if decision.route in {RouteType.CODE, RouteType.RAG, RouteType.VISION} else 0.35,
-            max_tokens=1400,
+            messages=outgoing,
             stream=False,
         )
 
-        assistant_message = ChatMessage(
-            role=ChatRole.ASSISTANT,
-            content=generation.content.strip(),
-            metadata={
-                "model": model,
-                "route": decision.route.value,
-            },
-        )
-
-        return {
-            "answer": assistant_message.content,
-            "messages": [*state.get("messages", []), assistant_message.model_dump(exclude_none=True)],
-            "used_models": list(dict.fromkeys(state.get("used_models", []) + [model])),
-            "metadata": {
-                **state.get("metadata", {}),
-                "generation_model": model,
-            },
-        }
+        return build_generation_response(state, generation, model, validation)
 
     return generate_node
 
