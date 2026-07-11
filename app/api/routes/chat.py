@@ -46,7 +46,7 @@ async def chat_completions(payload: OpenAIChatRequest, request: Request):
     content = await _run_graph(payload)
     REQUEST_LATENCY.observe(time.perf_counter() - start)
     response = build_chat_completion(payload.model, content)
-    if payload.stream:
+    if payload.stream and get_settings().enable_streaming:
         async def gen():
             chunk = {
                 'id': response.id,

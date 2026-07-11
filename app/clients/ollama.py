@@ -1,4 +1,3 @@
-import base64
 import logging
 from typing import Any
 
@@ -18,11 +17,15 @@ class OllamaClient:
                 payload['messages'] = list(messages)
                 payload['messages'][-1] = dict(payload['messages'][-1])
                 payload['messages'][-1]['images'] = images
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(f'{self.base_url}/api/chat', json=payload)
-            r.raise_for_status()
-            data = r.json()
-            return data.get('message', {}).get('content', '')
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(f'{self.base_url}/api/chat', json=payload)
+                r.raise_for_status()
+                data = r.json()
+        except Exception as exc:
+            logger.warning('ollama chat failed for model %s: %s', model, exc)
+            return ''
+        return data.get('message', {}).get('content', '')
 
     @staticmethod
     def normalize_data_url(data_url: str) -> str:
