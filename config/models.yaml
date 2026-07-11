@@ -1,0 +1,3 @@
+main_model: qwen3:14b
+coder_model: qwen2.5-coder:7b
+vision_model: qwen2.5-vl:7b

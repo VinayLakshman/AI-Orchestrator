@@ -1,0 +1,3 @@
+app:
+  name: ai-orchestrator
+  env: development

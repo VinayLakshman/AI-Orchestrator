@@ -1,0 +1,2 @@
+class OrchestratorError(Exception):
+    pass
