@@ -128,7 +128,7 @@ def make_generate_node(ollama_client: OllamaClient, settings: Settings):
         if (
             decision.needs_rag
             and knowledge_result is not None
-            and not knowledge_result.get("grounded", False)
+            and not knowledge_result.grounded
         ):
             return build_retrieval_failure_response(
                 state,
