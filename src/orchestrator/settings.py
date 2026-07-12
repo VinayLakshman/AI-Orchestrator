@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://ollama:11434"
     general_model: str = "qwen3:14b"
     coder_model: str = "qwen2.5-coder:7b"
-    vision_model: str = "qwen2.5-vl:7b"
+    vision_model: str = "qwen2.5vl:7b"
 
     # Optional small router model. Leave empty to use deterministic + heuristic routing only.
     router_model: str | None = None
