@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # Vision pipeline
     vision_enabled: bool = True
     vision_max_images: int = 8
-    vision_timeout_s: float = 180.0
+    vision_timeout_s: float = 300.0
     vision_fetch_base_url: str = "http://open-webui:8080"
     vision_inject_analysis_as_system: bool = True
 
@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     # Runtime limits
     max_context_messages: int = 24
     max_tool_rounds: int = 4
-    request_timeout_s: float = 60.0
+    request_timeout_s: float = 300.0
 
     # OpenAI-compatible surface
     openai_api_key: SecretStr | None = None
