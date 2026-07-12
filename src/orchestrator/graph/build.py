@@ -11,8 +11,15 @@ from ..clients import KnowledgeClient, OllamaClient
 from ..router import RequestRouter
 from ..router.classifier import RoutingClassifier
 from ..settings import Settings
+from ..streaming.hub import StreamHub
 from ..vision.pipeline import VisionPipeline
-from .nodes import make_clarify_node, make_generate_node, make_retrieve_node, make_route_node, make_vision_node
+from .nodes import (
+    make_clarify_node,
+    make_generate_node,
+    make_retrieve_node,
+    make_route_node,
+    make_vision_node,
+)
 from .state import OrchestratorState
 from ..schemas import RouteDecision, RouteType
 
@@ -27,6 +34,7 @@ class OrchestratorRuntime:
     knowledge_client: KnowledgeClient
     ollama_client: OllamaClient
     vision_pipeline: VisionPipeline
+    stream_hub: StreamHub
     graph: Any
     checkpointer: Any
 
@@ -121,6 +129,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     ollama_client = OllamaClient(settings=settings, client=ollama_http)
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
     vision_pipeline = VisionPipeline(settings=settings, client=ollama_http)
+    stream_hub = StreamHub()
 
     graph, checkpointer = build_graph(
         settings=settings,
@@ -128,6 +137,9 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
         vision_pipeline=vision_pipeline,
+        stream_hub=stream_hub,
+        graph=graph,
+        checkpointer=checkpointer,
     )
 
     return OrchestratorRuntime(
@@ -136,6 +148,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
         vision_pipeline=vision_pipeline,
+        stream_hub=stream_hub,
         graph=graph,
         checkpointer=checkpointer,
     )

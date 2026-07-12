@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from time import time
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .graph import OrchestratorRuntime
 from .schemas import (
@@ -23,6 +24,7 @@ from .schemas import (
     RouteDecision,
 )
 from .settings import get_settings
+from .streaming import StreamKind, StreamPublisher, openai_chunk, openai_done, stream_scope
 
 router = APIRouter(tags=["orchestrator"])
 
@@ -74,18 +76,27 @@ def _to_chat_request(
     )
 
 
-def _input_state_from_request(payload: ChatRequest, request: Request) -> dict[str, Any]:
+def _input_state_from_request(
+    payload: ChatRequest,
+    request: Request,
+    *,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    metadata = {
+        **payload.metadata,
+        "requested_model": payload.model,
+        "requested_stream": payload.stream,
+        "temperature": payload.temperature,
+        "max_tokens": payload.max_tokens,
+        "request_headers": _request_headers(request),
+    }
+    if request_id:
+        metadata["request_id"] = request_id
+
     return {
         "thread_id": _thread_id_from_request(payload),
         "messages": [message.model_dump(exclude_none=True) for message in payload.messages],
-        "metadata": {
-            **payload.metadata,
-            "requested_model": payload.model,
-            "requested_stream": payload.stream,
-            "temperature": payload.temperature,
-            "max_tokens": payload.max_tokens,
-            "request_headers": _request_headers(request),
-        },
+        "metadata": metadata,
         "used_models": [],
         "used_tools": [],
         "knowledge_result": None,
@@ -110,6 +121,41 @@ def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorR
         vision_context=state.get("vision_context", ""),
         metadata=state.get("metadata", {}),
     )
+
+
+async def _run_graph_with_stream(
+    *,
+    runtime: OrchestratorRuntime,
+    request_id: str,
+    thread_id: str,
+    state_input: dict[str, Any],
+    publisher: StreamPublisher,
+) -> dict[str, Any]:
+    async with stream_scope(publisher):
+        await publisher.graph_started(route_hint=state_input.get("metadata", {}).get("requested_model"))
+        try:
+            result = await runtime.graph.ainvoke(
+                state_input,
+                config={"configurable": {"thread_id": thread_id}},
+            )
+            route_name = result.get("route_name") or result.get("route", {}).get("route")
+            await publisher.graph_finished(route=route_name)
+            return result
+        except Exception as exc:
+            await publisher.graph_failed(str(exc))
+            raise
+        finally:
+            await runtime.stream_hub.close(request_id)
+
+
+def _request_headers_out(request_id: str, thread_id: str) -> dict[str, str]:
+    return {
+        "cache-control": "no-cache",
+        "connection": "keep-alive",
+        "x-accel-buffering": "no",
+        "x-orchestrator-request-id": request_id,
+        "x-orchestrator-thread-id": thread_id,
+    }
 
 
 @router.get("/healthz")
@@ -157,6 +203,33 @@ async def chat(
     return _response_from_state(thread_id, result)
 
 
+@router.get("/v1/streams/{request_id}")
+async def stream_events(
+    request: Request,
+    request_id: str,
+    runtime: OrchestratorRuntime = Depends(get_runtime),
+) -> StreamingResponse:
+    stream = await runtime.stream_hub.get(request_id)
+    if stream is None:
+        raise HTTPException(status_code=404, detail="Unknown request_id")
+
+    after_seq_raw = request.headers.get("last-event-id") or request.query_params.get("after_seq") or "0"
+    try:
+        after_seq = int(after_seq_raw)
+    except ValueError:
+        after_seq = 0
+
+    async def event_gen():
+        async for event in stream.subscribe(after_seq=after_seq):
+            yield event.to_sse()
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers=_request_headers_out(request_id, stream.conversation_id or ""),
+    )
+
+
 @router.post(
     "/v1/chat/completions",
     response_model=OpenAIChatCompletionResponse,
@@ -165,50 +238,124 @@ async def openai_chat_completions(
     payload: OpenAIChatCompletionRequest,
     request: Request,
     runtime: OrchestratorRuntime = Depends(get_runtime),
-) -> OpenAIChatCompletionResponse:
+):
     chat_request = _to_chat_request(payload)
-
     thread_id = _thread_id_from_request(chat_request)
+    request_id = f"chatcmpl-{uuid4().hex}"
 
     state_input = _input_state_from_request(
         chat_request,
         request,
+        request_id=request_id,
     )
 
-    result = await runtime.graph.ainvoke(
-        state_input,
-        config={
-            "configurable": {
-                "thread_id": thread_id,
+    headers = _request_headers_out(request_id, thread_id)
+
+    if not payload.stream:
+        result = await runtime.graph.ainvoke(
+            state_input,
+            config={
+                "configurable": {
+                    "thread_id": thread_id,
+                },
             },
-        },
+        )
+
+        answer = result.get("answer", "")
+        model_used = (
+            result.get("used_models")
+            or [payload.model or "orchestrator"]
+        )[-1]
+
+        return JSONResponse(
+            content=OpenAIChatCompletionResponse(
+                id=request_id,
+                created=int(time()),
+                model=model_used,
+                choices=[
+                    OpenAIChatCompletionChoice(
+                        index=0,
+                        message=OpenAIMessage(
+                            role="assistant",
+                            content=answer,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                metadata={
+                    "thread_id": thread_id,
+                    "route": result.get("route", {}).get("route"),
+                    "used_models": result.get("used_models", []),
+                    "used_tools": result.get("used_tools", []),
+                },
+            ).model_dump(mode="json"),
+            headers=headers,
+        )
+
+    stream = await runtime.stream_hub.create(request_id=request_id, conversation_id=thread_id)
+    publisher = StreamPublisher(stream)
+
+    graph_task = asyncio.create_task(
+        _run_graph_with_stream(
+            runtime=runtime,
+            request_id=request_id,
+            thread_id=thread_id,
+            state_input=state_input,
+            publisher=publisher,
+        ),
+        name=f"orchestrator-stream-{request_id}",
     )
 
-    answer = result.get("answer", "")
+    async def event_gen():
+        assistant_role_sent = False
 
-    model_used = (
-        result.get("used_models")
-        or [payload.model or "orchestrator"]
-    )[-1]
+        try:
+            async for event in stream.subscribe(after_seq=0):
+                if event.kind == StreamKind.LLM_TOKEN:
+                    token = str(event.data.get("token") or "")
+                    if not assistant_role_sent:
+                        assistant_role_sent = True
+                        yield openai_chunk(
+                            request_id=request_id,
+                            model=payload.model,
+                            delta={"role": "assistant"},
+                        )
+                    if token:
+                        yield openai_chunk(
+                            request_id=request_id,
+                            model=payload.model,
+                            delta={"content": token},
+                        )
 
-    return OpenAIChatCompletionResponse(
-        id=f"chatcmpl-{uuid4().hex}",
-        created=int(time()),
-        model=model_used,
-        choices=[
-            OpenAIChatCompletionChoice(
-                index=0,
-                message=OpenAIMessage(
-                    role="assistant",
-                    content=answer,
-                ),
+            with suppress(Exception):
+                await graph_task
+
+            if not assistant_role_sent:
+                yield openai_chunk(
+                    request_id=request_id,
+                    model=payload.model,
+                    delta={"role": "assistant"},
+                )
+
+            yield openai_chunk(
+                request_id=request_id,
+                model=payload.model,
+                delta={},
                 finish_reason="stop",
             )
-        ],
-        metadata={
-            "thread_id": thread_id,
-            "route": result.get("route", {}).get("route"),
-            "used_models": result.get("used_models", []),
-            "used_tools": result.get("used_tools", []),
-        },
+            yield openai_done()
+
+        except asyncio.CancelledError:
+            graph_task.cancel()
+            raise
+        finally:
+            if not graph_task.done():
+                graph_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await graph_task
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers=headers,
     )

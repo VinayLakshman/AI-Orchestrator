@@ -11,23 +11,56 @@ from ..context.builder import (
 )
 from ..responses.builder import build_generation_response, build_retrieval_failure_response
 from ..router import RequestRouter
-from ..schemas import ChatMessage, ChatRole, RouteDecision, RouteType
+from ..schemas import ChatMessage, ChatRole, ModelGenerationResponse, RouteDecision, RouteType
 from ..settings import Settings
-from ..vision.fetcher import strip_images_from_messages
+from ..streaming.context import get_current_stream
+from ..vision.fetcher import collect_latest_message_images, strip_images_from_messages
 from ..vision.pipeline import VisionPipeline
 from .state import OrchestratorState
 
 
+def _knowledge_hit_sources(result: Any) -> list[str]:
+    sources: list[str] = []
+    if result is None:
+        return sources
+
+    for hit in getattr(result, "primary_hits", []) or []:
+        repository = getattr(hit, "repository", "")
+        path = getattr(hit, "path", "")
+        if repository or path:
+            sources.append(f"{repository}:{path}".strip(":"))
+    return sources
+
+
 def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
     async def vision_node(state: OrchestratorState) -> dict[str, Any]:
+        stream = get_current_stream()
+        image_refs = collect_latest_message_images(state.get("messages", []), settings.vision_max_images)
+        if stream and image_refs:
+            await stream.vision_started(image_count=len(image_refs))
+
         result = await vision_pipeline.process(state)
 
         if result is None:
             cleaned = strip_images_from_messages(state.get("messages", []))
+            if stream:
+                await stream.vision_finished(summary="No image attachments were found.")
             return {"messages": cleaned}
 
         analysis = result.analysis
         vision_context = result.context_markdown
+
+        if stream:
+            await stream.vision_progress(
+                message="Vision analysis is complete and context has been prepared.",
+                data={
+                    "task": analysis.task_type.value,
+                    "confidence": analysis.confidence,
+                    "cache_hit": result.cache_hit,
+                    "image_count": analysis.image_count,
+                },
+            )
+            await stream.vision_finished(summary=analysis.summary)
 
         return {
             "messages": result.cleaned_messages,
@@ -56,6 +89,10 @@ def make_route_node(router: RequestRouter, settings: Settings):
         messages = state.get("messages", [])
         user_text = last_user_text(messages)
 
+        stream = get_current_stream()
+        if stream:
+            await stream.routing_started(query=user_text)
+
         decision = await router.route(user_text)
 
         vision_context = state.get("vision_context") or ""
@@ -67,6 +104,9 @@ def make_route_node(router: RequestRouter, settings: Settings):
                 needs_vision=True,
                 candidate_models=[settings.vision_model],
             )
+
+        if stream:
+            await stream.routing_finished(route=decision.route.value, reason=decision.reason)
 
         return {
             "route": decision.model_dump(),
@@ -91,12 +131,34 @@ def make_retrieve_node(knowledge_client: KnowledgeClient, settings: Settings):
             return {}
 
         question = last_user_text(state.get("messages", []))
+        stream = get_current_stream()
+        if stream:
+            await stream.knowledge_started(query=question)
+
         result = await knowledge_client.retrieve(
             question=question,
             top_k=settings.knowledge_top_k,
             candidate_limit=settings.knowledge_candidate_limit,
             neighbor_window=settings.knowledge_neighbor_window,
         )
+
+        if stream:
+            await stream.knowledge_progress(
+                message=(
+                    "Knowledge retrieval completed "
+                    f"with {len(result.primary_hits)} primary hits."
+                ),
+                data={
+                    "primary_hits": len(result.primary_hits),
+                    "expanded_hits": len(result.expanded_hits),
+                    "grounded": result.grounded,
+                    "confidence": result.confidence,
+                },
+            )
+            await stream.knowledge_finished(
+                documents=len(result.primary_hits) + len(result.expanded_hits),
+                sources=_knowledge_hit_sources(result),
+            )
 
         return {
             "knowledge_result": result,
@@ -156,13 +218,51 @@ def make_generate_node(ollama_client: OllamaClient, settings: Settings):
             else 0.35
         )
 
-        generation = await ollama_client.chat(
-            model=model,
-            messages=outgoing,
-            temperature=temperature,
-            max_tokens=1400,
-            stream=False,
-        )
+        stream = get_current_stream()
+        generation: ModelGenerationResponse
+
+        if stream:
+            if decision.route == RouteType.CODE or decision.needs_code:
+                await stream.code_started(task="code generation")
+
+            await stream.llm_started(model=model)
+
+            content_parts: list[str] = []
+            final_raw: dict[str, Any] = {}
+
+            try:
+                async for chunk in ollama_client.stream_chat(
+                    model=model,
+                    messages=outgoing,
+                    temperature=temperature,
+                    max_tokens=1400,
+                ):
+                    if chunk.content:
+                        content_parts.append(chunk.content)
+                        await stream.llm_token(chunk.content)
+                    final_raw = chunk.raw or final_raw
+
+                generation = ModelGenerationResponse(
+                    model=model,
+                    content="".join(content_parts),
+                    raw=final_raw,
+                )
+
+                await stream.llm_finished()
+
+                if decision.route == RouteType.CODE or decision.needs_code:
+                    await stream.code_finished(result=generation.content[:500])
+            except Exception as exc:
+                await stream.error(str(exc), stage="generation")
+                raise
+        else:
+            generation = await ollama_client.chat(
+                model=model,
+                messages=outgoing,
+                temperature=temperature,
+                max_tokens=1400,
+                stream=False,
+            )
 
         return build_generation_response(
             state,
@@ -178,6 +278,7 @@ def make_clarify_node():
     async def clarify_node(state: OrchestratorState) -> dict[str, Any]:
         route_raw = state.get("route") or {}
         decision = RouteDecision.model_validate(route_raw)
+        stream = get_current_stream()
 
         answer = (
             "I need one more detail to route this cleanly. "
