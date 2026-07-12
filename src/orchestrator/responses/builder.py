@@ -12,10 +12,12 @@ def build_retrieval_failure_response(
     knowledge_result: KnowledgeRetrieveResponse,
 ) -> dict[str, Any]:
     query = last_user_text(state.get("messages", []))
-    retrieval_reason = str(
+
+    retrieval_reason = (
         knowledge_result.retrieval_reason
         or "Knowledge retrieval did not produce a grounded result"
     )
+
     confidence = knowledge_result.confidence
 
     answer = (
@@ -52,7 +54,6 @@ def build_retrieval_failure_response(
             "retrieval_reason": retrieval_reason,
             "retrieval_confidence": confidence,
             "retrieval_intent": knowledge_result.intent,
-            "knowledge_result": knowledge_result,
         },
     }
 
@@ -63,18 +64,28 @@ def build_generation_response(
     model: str,
     knowledge_result: KnowledgeRetrieveResponse | None = None,
 ) -> dict[str, Any]:
-    content = generation.content.strip() if getattr(generation, "content", None) else str(generation)
-    grounded = knowledge_result.grounded or False
-    confidence = knowledge_result.confidence
-    retrieval_reason = knowledge_result.retrieval_reason
-    intent = knowledge_result.intent
+    content = (
+        generation.content.strip()
+        if getattr(generation, "content", None)
+        else str(generation)
+    )
+
+    grounded = knowledge_result.grounded if knowledge_result else False
+    confidence = knowledge_result.confidence if knowledge_result else None
+    retrieval_reason = (
+        knowledge_result.retrieval_reason
+        if knowledge_result
+        else None
+    )
+    intent = knowledge_result.intent if knowledge_result else None
 
     assistant = ChatMessage(
         role=ChatRole.ASSISTANT,
         content=content,
         metadata={
             "model": model,
-            "route": state.get("route", {}).get("route") or state.get("route_name"),
+            "route": state.get("route", {}).get("route")
+            or state.get("route_name"),
             "grounded": grounded,
             "confidence": confidence,
             "retrieval_reason": retrieval_reason,
@@ -88,7 +99,11 @@ def build_generation_response(
             *state.get("messages", []),
             assistant.model_dump(exclude_none=True),
         ],
-        "used_models": list(dict.fromkeys(state.get("used_models", []) + [model])),
+        "used_models": list(
+            dict.fromkeys(
+                state.get("used_models", []) + [model]
+            )
+        ),
         "used_tools": state.get("used_tools", []),
         "metadata": {
             **state.get("metadata", {}),
@@ -97,6 +112,5 @@ def build_generation_response(
             "retrieval_confidence": confidence,
             "retrieval_reason": retrieval_reason,
             "retrieval_intent": intent,
-            "knowledge_result": knowledge_result,
         },
     }

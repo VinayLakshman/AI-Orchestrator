@@ -10,7 +10,13 @@ from ..graph.prompts import (
     TOOLS_SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
 )
-from ..schemas import ChatMessage, ChatRole, RouteDecision, RouteType, KnowledgeRetrieveResponse
+from ..schemas import (
+    ChatMessage,
+    ChatRole,
+    KnowledgeRetrieveResponse,
+    RouteDecision,
+    RouteType,
+)
 from ..settings import Settings
 from ..vision.prompts import build_vision_injection_message
 
@@ -29,7 +35,7 @@ def last_user_text(messages: list[dict[str, Any]] | None) -> str:
             return content.strip()
 
         if isinstance(content, list):
-            parts = []
+            parts: list[str] = []
 
             for part in content:
                 if (
@@ -70,7 +76,6 @@ def select_model_for_route(
     settings: Settings,
     decision: RouteDecision,
 ) -> str:
-
     if decision.route == RouteType.VISION:
         return settings.vision_model
 
@@ -83,7 +88,6 @@ def select_model_for_route(
 def _state_messages_to_chat_messages(
     messages: list[dict[str, Any]] | None,
 ) -> list[ChatMessage]:
-
     if not messages:
         return []
 
@@ -91,45 +95,6 @@ def _state_messages_to_chat_messages(
         ChatMessage.model_validate(message)
         for message in messages
     ]
-
-
-def _build_retrieval_metadata_message(
-    knowledge_result: KnowledgeRetrieveResponse,
-) -> ChatMessage:
-    confidence = knowledge_result.confidence
-    confidence_text = (
-        f"{float(confidence):.3f}"
-        if confidence is not None
-        else "n/a"
-    )
-
-    grounded = knowledge_result.grounded or False
-    intent = knowledge_result.intent or "unknown"
-    reason = knowledge_result.retrieval_reason or "none"
-
-    primary_hits = len(knowledge_result.primary_hits or [])
-    expanded_hits = len(knowledge_result.expanded_hits or [])
-
-    return ChatMessage(
-        role=ChatRole.SYSTEM,
-        metadata={
-            "source": "knowledge_service",
-            "type": "retrieval_metadata",
-        },
-        content=f"""
-            Knowledge Retrieval Metadata
-
-            Grounded: {grounded}
-            Confidence: {confidence_text}
-            Intent: {intent}
-            Reason: {reason}
-
-            Primary Hits: {primary_hits}
-            Expanded Hits: {expanded_hits}
-
-            The retrieved context that follows is the authoritative knowledge source for this request.
-        """.strip(),
-    )
 
 
 def build_generation_messages(
@@ -151,45 +116,29 @@ def build_generation_messages(
     ]
 
     #
-    # Knowledge Service (highest priority context)
+    # Knowledge Context
     #
 
     if knowledge_result:
-
-        outgoing.append(
-            _build_retrieval_metadata_message(
-                knowledge_result
-            )
-        )
-
-        context = (
-            knowledge_result.context
-            or ""
-        ).strip()
+        context = (knowledge_result.context or "").strip()
 
         if context:
-
             outgoing.append(
                 ChatMessage(
                     role=ChatRole.SYSTEM,
                     metadata={
                         "source": "knowledge_service",
-                        "grounded": knowledge_result.grounded or False,
-                        "confidence": knowledge_result.confidence,
                     },
                     content=f"""
-                        The following information was retrieved from the user's indexed local knowledge base.
+                        Knowledge Context
 
-                        Treat this as the ONLY authoritative source for answering the user's question.
+                        Use only the information below when answering.
 
-                        Do NOT use pretrained knowledge to fill gaps.
-                        If the answer is not contained in this context, explicitly state that the documentation does not contain that information.
+                        Do not infer, assume, or invent facts that are not explicitly supported by this context.
 
-                        ========== BEGIN RETRIEVED CONTEXT ==========
+                        If the answer is not documented here, clearly state that instead of guessing.
 
                         {context}
-
-                        =========== END RETRIEVED CONTEXT ===========
                     """.strip(),
                 )
             )
@@ -199,7 +148,6 @@ def build_generation_messages(
     #
 
     if vision_context:
-
         outgoing.append(
             ChatMessage(
                 role=ChatRole.SYSTEM,
@@ -219,7 +167,6 @@ def build_generation_messages(
     #
 
     if memory_context:
-
         outgoing.append(
             ChatMessage(
                 role=ChatRole.SYSTEM,
@@ -235,7 +182,6 @@ def build_generation_messages(
     #
 
     if mcp_context:
-
         outgoing.append(
             ChatMessage(
                 role=ChatRole.SYSTEM,
@@ -254,7 +200,7 @@ def build_generation_messages(
     outgoing.extend(history_messages)
 
     #
-    # Fallback Latest User Message
+    # Latest User Message (fallback)
     #
 
     if (
