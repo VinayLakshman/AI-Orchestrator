@@ -96,19 +96,19 @@ def _state_messages_to_chat_messages(
 def _build_retrieval_metadata_message(
     knowledge_result: KnowledgeRetrieveResponse,
 ) -> ChatMessage:
-    confidence = knowledge_result.get("confidence")
+    confidence = knowledge_result.confidence
     confidence_text = (
         f"{float(confidence):.3f}"
         if confidence is not None
         else "n/a"
     )
 
-    grounded = knowledge_result.get("grounded", False)
-    intent = knowledge_result.get("intent") or "unknown"
-    reason = knowledge_result.get("retrieval_reason") or "none"
+    grounded = knowledge_result.grounded or False
+    intent = knowledge_result.intent or "unknown"
+    reason = knowledge_result.retrieval_reason or "none"
 
-    primary_hits = len(knowledge_result.get("primary_hits") or [])
-    expanded_hits = len(knowledge_result.get("expanded_hits") or [])
+    primary_hits = len(knowledge_result.primary_hits or [])
+    expanded_hits = len(knowledge_result.expanded_hits or [])
 
     return ChatMessage(
         role=ChatRole.SYSTEM,
@@ -163,7 +163,7 @@ def build_generation_messages(
         )
 
         context = (
-            knowledge_result.get("context")
+            knowledge_result.context
             or ""
         ).strip()
 
@@ -174,8 +174,8 @@ def build_generation_messages(
                     role=ChatRole.SYSTEM,
                     metadata={
                         "source": "knowledge_service",
-                        "grounded": knowledge_result.get("grounded", False),
-                        "confidence": knowledge_result.get("confidence"),
+                        "grounded": knowledge_result.grounded or False,
+                        "confidence": knowledge_result.confidence,
                     },
                     content=f"""
                         The following information was retrieved from the user's indexed local knowledge base.

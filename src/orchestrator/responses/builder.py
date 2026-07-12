@@ -13,10 +13,10 @@ def build_retrieval_failure_response(
 ) -> dict[str, Any]:
     query = last_user_text(state.get("messages", []))
     retrieval_reason = str(
-        knowledge_result.get("retrieval_reason")
+        knowledge_result.retrieval_reason
         or "Knowledge retrieval did not produce a grounded result"
     )
-    confidence = knowledge_result.get("confidence")
+    confidence = knowledge_result.confidence
 
     answer = (
         "I couldn't answer this from your indexed knowledge base.\n\n"
@@ -34,7 +34,7 @@ def build_retrieval_failure_response(
             "retrieval_failed": True,
             "retrieval_reason": retrieval_reason,
             "confidence": confidence,
-            "intent": knowledge_result.get("intent"),
+            "intent": knowledge_result.intent,
         },
     )
 
@@ -51,7 +51,7 @@ def build_retrieval_failure_response(
             "rag_grounded": False,
             "retrieval_reason": retrieval_reason,
             "retrieval_confidence": confidence,
-            "retrieval_intent": knowledge_result.get("intent"),
+            "retrieval_intent": knowledge_result.intent,
             "knowledge_result": knowledge_result,
         },
     }
@@ -64,10 +64,10 @@ def build_generation_response(
     knowledge_result: KnowledgeRetrieveResponse | None = None,
 ) -> dict[str, Any]:
     content = generation.content.strip() if getattr(generation, "content", None) else str(generation)
-    grounded = bool((knowledge_result or {}).get("grounded", False))
-    confidence = (knowledge_result or {}).get("confidence")
-    retrieval_reason = (knowledge_result or {}).get("retrieval_reason")
-    intent = (knowledge_result or {}).get("intent")
+    grounded = knowledge_result.grounded or False
+    confidence = knowledge_result.confidence
+    retrieval_reason = knowledge_result.retrieval_reason
+    intent = knowledge_result.intent
 
     assistant = ChatMessage(
         role=ChatRole.ASSISTANT,
