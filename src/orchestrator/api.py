@@ -157,23 +157,39 @@ async def chat(
     return _response_from_state(thread_id, result)
 
 
-@router.post("/v1/chat/completions", response_model=OpenAIChatCompletionResponse)
+@router.post(
+    "/v1/chat/completions",
+    response_model=OpenAIChatCompletionResponse,
+)
 async def openai_chat_completions(
     payload: OpenAIChatCompletionRequest,
     request: Request,
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ) -> OpenAIChatCompletionResponse:
     chat_request = _to_chat_request(payload)
+
     thread_id = _thread_id_from_request(chat_request)
-    state_input = _input_state_from_request(chat_request, request)
+
+    state_input = _input_state_from_request(
+        chat_request,
+        request,
+    )
 
     result = await runtime.graph.ainvoke(
         state_input,
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "configurable": {
+                "thread_id": thread_id,
+            },
+        },
     )
 
     answer = result.get("answer", "")
-    model_used = (result.get("used_models") or [payload.model])[ -1 ]
+
+    model_used = (
+        result.get("used_models")
+        or [payload.model or "orchestrator"]
+    )[-1]
 
     return OpenAIChatCompletionResponse(
         id=f"chatcmpl-{uuid4().hex}",
@@ -182,17 +198,17 @@ async def openai_chat_completions(
         choices=[
             OpenAIChatCompletionChoice(
                 index=0,
-                message=OpenAIMessage(role="assistant", content=answer),
+                message=OpenAIMessage(
+                    role="assistant",
+                    content=answer,
+                ),
                 finish_reason="stop",
             )
         ],
         metadata={
             "thread_id": thread_id,
-            "route": result.get("route", {}),
+            "route": result.get("route", {}).get("route"),
             "used_models": result.get("used_models", []),
             "used_tools": result.get("used_tools", []),
-            "vision": result.get("vision"),
-            "vision_context": result.get("vision_context", ""),
-            "knowledge_result": result.get("knowledge_result"),
         },
     )

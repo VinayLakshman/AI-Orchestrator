@@ -30,8 +30,8 @@ class RoutingClassifier:
         if not self.settings.router_model:
             return RouteDecision(
                 route=RouteType.GENERAL,
-                confidence=0.5,
-                reason="No router model configured; defaulting to general route.",
+                confidence=1.0,
+                reason="No router model configured; using deterministic fallback.",
             )
 
         payload = {
@@ -61,8 +61,8 @@ class RoutingClassifier:
         except Exception:
             return RouteDecision(
                 route=RouteType.GENERAL,
-                confidence=0.35,
-                reason="Router model failed; falling back to general route.",
+                confidence=1.0,
+                reason="Router model unavailable; falling back to general routing.",
             )
         finally:
             if close_client:
