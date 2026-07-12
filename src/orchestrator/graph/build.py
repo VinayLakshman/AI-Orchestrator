@@ -14,6 +14,7 @@ from ..settings import Settings
 from ..vision.pipeline import VisionPipeline
 from .nodes import make_clarify_node, make_generate_node, make_retrieve_node, make_route_node, make_vision_node
 from .state import OrchestratorState
+from ..schemas import RouteDecision, RouteType
 
 
 CheckpointerKind = Literal["memory", "sqlite"]
@@ -73,15 +74,16 @@ def build_graph(
     builder.add_edge("vision", "route")
 
     def select_next(state: OrchestratorState) -> str:
-        route_raw = state.get("route") or {}
-        route_name = str(route_raw.get("route", state.get("route_name", "general")))
+        decision = RouteDecision.model_validate(state["route"])
 
-        if route_name == "clarify":
+        if decision.route == RouteType.CLARIFY:
             return "clarify"
 
-        if route_name in {"rag", "multi_step"}:
-            route_dict = route_raw if isinstance(route_raw, dict) else {}
-            if route_dict.get("needs_rag", False):
+        if decision.route == RouteType.RAG:
+            return "retrieve"
+
+        if decision.route == RouteType.MULTI_STEP:
+            if decision.needs_rag:
                 return "retrieve"
             return "generate"
 

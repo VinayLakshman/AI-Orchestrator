@@ -10,7 +10,7 @@ from ..graph.prompts import (
     TOOLS_SYSTEM_PROMPT,
     VISION_SYSTEM_PROMPT,
 )
-from ..schemas import ChatMessage, ChatRole, RouteDecision, RouteType
+from ..schemas import ChatMessage, ChatRole, RouteDecision, RouteType, KnowledgeRetrieveResponse
 from ..settings import Settings
 from ..vision.prompts import build_vision_injection_message
 
@@ -94,7 +94,7 @@ def _state_messages_to_chat_messages(
 
 
 def _build_retrieval_metadata_message(
-    knowledge_result: dict[str, Any],
+    knowledge_result: KnowledgeRetrieveResponse,
 ) -> ChatMessage:
     confidence = knowledge_result.get("confidence")
     confidence_text = (
@@ -137,7 +137,7 @@ def build_generation_messages(
     system_prompt: str,
     messages: list[dict[str, Any]] | None = None,
     vision_context: str = "",
-    knowledge_result: dict[str, Any] | None = None,
+    knowledge_result: KnowledgeRetrieveResponse | None = None,
     mcp_context: str = "",
     memory_context: str = "",
     latest_user_message: str | None = None,

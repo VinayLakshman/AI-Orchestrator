@@ -4,12 +4,12 @@ from typing import Any
 
 from ..context.builder import last_user_text
 from ..graph.state import OrchestratorState
-from ..schemas import ChatMessage, ChatRole
+from ..schemas import ChatMessage, ChatRole, KnowledgeRetrieveResponse
 
 
 def build_retrieval_failure_response(
     state: OrchestratorState,
-    knowledge_result: dict[str, Any],
+    knowledge_result: KnowledgeRetrieveResponse,
 ) -> dict[str, Any]:
     query = last_user_text(state.get("messages", []))
     retrieval_reason = str(
@@ -61,7 +61,7 @@ def build_generation_response(
     state: OrchestratorState,
     generation: Any,
     model: str,
-    knowledge_result: dict[str, Any] | None = None,
+    knowledge_result: KnowledgeRetrieveResponse | None = None,
 ) -> dict[str, Any]:
     content = generation.content.strip() if getattr(generation, "content", None) else str(generation)
     grounded = bool((knowledge_result or {}).get("grounded", False))
