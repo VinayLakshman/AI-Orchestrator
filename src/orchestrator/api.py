@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import time
 from typing import Any
 from uuid import uuid4
 
@@ -8,7 +9,20 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .graph import OrchestratorRuntime
-from .schemas import ChatMessage, ChatRequest, KnowledgeHit, OrchestratorResponse, KnowledgeRetrieveResponse
+from .schemas import (
+    ChatMessage,
+    ChatRequest,
+    KnowledgeRetrieveResponse,
+    OpenAIChatCompletionChoice,
+    OpenAIChatCompletionRequest,
+    OpenAIChatCompletionResponse,
+    OpenAIMessage,
+    OpenAIModelCard,
+    OpenAIModelListResponse,
+    OrchestratorResponse,
+    RouteDecision,
+)
+from .settings import get_settings
 
 router = APIRouter(tags=["orchestrator"])
 
@@ -20,15 +34,6 @@ def get_runtime(request: Request) -> OrchestratorRuntime:
     return runtime
 
 
-class OpenAIChatRequest(BaseModel):
-    model: str | None = None
-    messages: list[dict[str, Any]] = Field(default_factory=list)
-    stream: bool = False
-    temperature: float | None = None
-    max_tokens: int | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
 def _request_headers(request: Request) -> dict[str, str]:
     headers: dict[str, str] = {}
     for key in ("authorization", "cookie"):
@@ -38,8 +43,26 @@ def _request_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _to_chat_request(payload: OpenAIChatRequest, thread_id: str | None = None) -> ChatRequest:
-    messages = [ChatMessage.model_validate(item) for item in payload.messages]
+def _thread_id_from_request(payload: ChatRequest) -> str:
+    if payload.thread_id:
+        return payload.thread_id[:255]
+    return str(uuid4())
+
+
+def _to_chat_request(
+    payload: OpenAIChatCompletionRequest,
+    thread_id: str | None = None,
+) -> ChatRequest:
+    messages = [
+        ChatMessage(
+            role=msg.role,  # ChatRole-compatible string works here
+            content=msg.content,
+            name=msg.name,
+            tool_call_id=msg.tool_call_id,
+        )
+        for msg in payload.messages
+    ]
+
     return ChatRequest(
         messages=messages,
         thread_id=thread_id,
@@ -49,12 +72,6 @@ def _to_chat_request(payload: OpenAIChatRequest, thread_id: str | None = None) -
         max_tokens=payload.max_tokens,
         metadata=payload.metadata,
     )
-
-
-def _thread_id_from_request(payload: ChatRequest) -> str:
-    if payload.thread_id:
-        return payload.thread_id[:255]
-    return str(uuid4())
 
 
 def _input_state_from_request(payload: ChatRequest, request: Request) -> dict[str, Any]:
@@ -71,19 +88,16 @@ def _input_state_from_request(payload: ChatRequest, request: Request) -> dict[st
         },
         "used_models": [],
         "used_tools": [],
-        "knowledge_result": {},
+        "knowledge_result": None,
     }
 
 
 def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorResponse:
-    route = state.get("route") or {}
-    knowledge_result = state.get("knowledge_result") or {}
-    knowledge_hits = []
+    route = RouteDecision.model_validate(state.get("route") or {})
+    knowledge_result = state.get("knowledge_result")
 
     if isinstance(knowledge_result, dict):
-        knowledge_result = KnowledgeRetrieveResponse.model_validate(
-            knowledge_result
-        )
+        knowledge_result = KnowledgeRetrieveResponse.model_validate(knowledge_result)
 
     return OrchestratorResponse(
         thread_id=thread_id,
@@ -112,6 +126,20 @@ async def readyz(runtime: OrchestratorRuntime = Depends(get_runtime)) -> dict[st
     }
 
 
+@router.get("/v1/models", response_model=OpenAIModelListResponse)
+async def list_models() -> OpenAIModelListResponse:
+    settings = get_settings()
+
+    return OpenAIModelListResponse(
+        data=[
+            OpenAIModelCard(id="orchestrator", owned_by="local"),
+            OpenAIModelCard(id=settings.general_model, owned_by="local"),
+            OpenAIModelCard(id=settings.coder_model, owned_by="local"),
+            OpenAIModelCard(id=settings.vision_model, owned_by="local"),
+        ]
+    )
+
+
 @router.post("/chat", response_model=OrchestratorResponse)
 async def chat(
     payload: ChatRequest,
@@ -129,15 +157,15 @@ async def chat(
     return _response_from_state(thread_id, result)
 
 
-@router.post("/v1/chat/completions")
+@router.post("/v1/chat/completions", response_model=OpenAIChatCompletionResponse)
 async def openai_chat_completions(
+    payload: OpenAIChatCompletionRequest,
     request: Request,
     runtime: OrchestratorRuntime = Depends(get_runtime),
-) -> JSONResponse:
-    body = await request.json()
-    payload = _to_chat_request(OpenAIChatRequest.model_validate(body))
-    thread_id = _thread_id_from_request(payload)
-    state_input = _input_state_from_request(payload, request)
+) -> OpenAIChatCompletionResponse:
+    chat_request = _to_chat_request(payload)
+    thread_id = _thread_id_from_request(chat_request)
+    state_input = _input_state_from_request(chat_request, request)
 
     result = await runtime.graph.ainvoke(
         state_input,
@@ -145,33 +173,26 @@ async def openai_chat_completions(
     )
 
     answer = result.get("answer", "")
-    model_used = (result.get("used_models") or [payload.model or "orchestrator"])[-1]
+    model_used = (result.get("used_models") or [payload.model])[ -1 ]
 
-    response = {
-        "id": f"chatcmpl-{uuid4().hex}",
-        "object": "chat.completion",
-        "created": int(__import__("time").time()),
-        "model": model_used,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": answer},
-                "finish_reason": "stop",
-            }
+    return OpenAIChatCompletionResponse(
+        id=f"chatcmpl-{uuid4().hex}",
+        created=int(time()),
+        model=model_used,
+        choices=[
+            OpenAIChatCompletionChoice(
+                index=0,
+                message=OpenAIMessage(role="assistant", content=answer),
+                finish_reason="stop",
+            )
         ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
-        "metadata": {
+        metadata={
             "thread_id": thread_id,
             "route": result.get("route", {}),
             "used_models": result.get("used_models", []),
             "used_tools": result.get("used_tools", []),
             "vision": result.get("vision"),
             "vision_context": result.get("vision_context", ""),
+            "knowledge_result": result.get("knowledge_result"),
         },
-    }
-
-    return JSONResponse(response)
+    )
