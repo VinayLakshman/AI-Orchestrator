@@ -88,7 +88,7 @@ def make_retrieve_node(knowledge_client: KnowledgeClient, settings: Settings):
         decision = RouteDecision.model_validate(route_raw)
 
         if not decision.needs_rag:
-            return {"knowledge_result": {}}
+            return {}
 
         question = last_user_text(state.get("messages", []))
         result = await knowledge_client.retrieve(
@@ -99,7 +99,7 @@ def make_retrieve_node(knowledge_client: KnowledgeClient, settings: Settings):
         )
 
         return {
-            "knowledge_result": result.model_dump(exclude_none=True),
+            "knowledge_result": result,
             "used_tools": list(dict.fromkeys(state.get("used_tools", []) + ["knowledge_service"])),
             "metadata": {
                 **state.get("metadata", {}),
@@ -118,6 +118,12 @@ def make_generate_node(ollama_client: OllamaClient, settings: Settings):
         model = select_model_for_route(settings, decision)
 
         knowledge_result = state.get("knowledge_result")
+
+        if decision.needs_rag:
+            if knowledge_result is None:
+                raise RuntimeError(
+                    "BUG: retrieve node did not populate knowledge_result."
+                )
 
         if (
             decision.needs_rag

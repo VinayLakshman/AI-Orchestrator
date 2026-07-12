@@ -76,7 +76,7 @@ class KnowledgeHit(BaseModel):
     language: str
     chunk_index: int
     chunk_count: int
-    score: float
+    score: float | None = None
     content: str
 
 

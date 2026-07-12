@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, TypedDict
+from ..schemas import KnowledgeRetrieveResponse
 
 
 class OrchestratorState(TypedDict, total=False):
@@ -16,7 +17,7 @@ class OrchestratorState(TypedDict, total=False):
     vision_image_hashes: list[str]
     vision_cache_hit: bool
 
-    knowledge_result: dict[str, Any]
+    knowledge_result:  KnowledgeRetrieveResponse | None
 
     used_models: list[str]
     used_tools: list[str]
