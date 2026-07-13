@@ -28,7 +28,7 @@ class ToolRequest(BaseModel):
     description: str = ""
 
 
-class ControllerPlan(BaseModel):
+class ExecutionPlan(BaseModel):
     classification: Literal[
         "GENERAL",
         "KNOWLEDGE",
@@ -42,24 +42,23 @@ class ControllerPlan(BaseModel):
     summary: str = ""
     complexity: Literal["low", "medium", "high"] = "medium"
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    action: ControllerAction = ControllerAction.CONTINUE
+    complete: bool = False
     next_specialist: SpecialistType | None = None
+    pending_specialists: list[SpecialistType] = Field(default_factory=list)
     retry: bool = False
     retry_reason: str = ""
-    complete: bool = False
-
-    requires_vision: bool = False
-    requires_knowledge: bool = False
-    requires_coder: bool = False
-    requires_tools: bool = False
-    requires_reasoning: bool = False
-    requires_clarification: bool = False
-
+    needs_reasoning: bool = False
+    final_answer_ready: bool = False
     clarification_question: str | None = None
+    fallback_to_general: bool = False
+    knowledge_sufficient: bool | None = None
     tool_requests: list[ToolRequest] = Field(default_factory=list)
-    execution_steps: list[SpecialistType] = Field(default_factory=list)
-    fallback: Literal["general", "reasoning", "clarify", "none"] = "general"
     completion_condition: str = ""
     explanation: str = ""
+    reason: str = ""
+    issues: list[str] = Field(default_factory=list)
+    notes: str = ""
 
     route_hint: RouteDecision | None = None
 
@@ -73,38 +72,16 @@ class ControllerPlan(BaseModel):
             return "REASONING"
         return normalized
 
-    @field_validator("fallback", mode="before")
-    @classmethod
-    def _normalize_fallback(cls, value: Any) -> str:
-        normalized = str(value or "general").strip().lower()
-        if normalized == "reason":
-            return "reasoning"
-        return normalized
-
-
-class ControllerValidation(BaseModel):
-    action: ControllerAction = ControllerAction.CONTINUE
-    summary: str = ""
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    next_specialist: SpecialistType | None = None
-    retry: bool = False
-    retry_reason: str = ""
-    needs_reasoning: bool = False
-    final_answer_ready: bool = False
-    complete: bool = False
-    next_steps: list[SpecialistType] = Field(default_factory=list)
-    fallback_to_general: bool = False
-    knowledge_sufficient: bool | None = None
-    reason: str = ""
-    issues: list[str] = Field(default_factory=list)
-    notes: str = ""
-
     @field_validator("action", mode="before")
     @classmethod
     def _normalize_action(cls, value: Any) -> Any:
         if isinstance(value, str) and value.strip().lower() == "reasoning":
             return "reason"
         return value
+
+
+ControllerPlan = ExecutionPlan
+ControllerValidation = ExecutionPlan
 
 
 class CoderResult(BaseModel):

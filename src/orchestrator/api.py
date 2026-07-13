@@ -18,6 +18,7 @@ from .schemas import (
     ControllerPlan,
     ControllerValidation,
     CoderResult,
+    ExecutionPlan,
     OpenAIChatCompletionChoice,
     OpenAIChatCompletionRequest,
     OpenAIChatCompletionResponse,
@@ -111,6 +112,7 @@ def _input_state_from_request(
         "coder_result": None,
         "tool_result": None,
         "reasoning_result": None,
+        "execution_plan": None,
         "retry_limit": 1,
         "executed_specialists": [],
         "pending_specialists": [],
@@ -155,7 +157,7 @@ def _knowledge_from_state(state: dict[str, Any]) -> KnowledgeRetrieveResponse | 
 
 
 def _controller_plan_from_state(state: dict[str, Any]) -> ControllerPlan | None:
-    value = state.get("controller_plan")
+    value = state.get("execution_plan") or state.get("controller_plan")
     if isinstance(value, dict):
         return ControllerPlan.model_validate(value)
     if isinstance(value, ControllerPlan):
@@ -164,7 +166,7 @@ def _controller_plan_from_state(state: dict[str, Any]) -> ControllerPlan | None:
 
 
 def _controller_validation_from_state(state: dict[str, Any]) -> ControllerValidation | None:
-    value = state.get("controller_validation")
+    value = state.get("execution_plan") or state.get("controller_validation")
     if isinstance(value, dict):
         return ControllerValidation.model_validate(value)
     if isinstance(value, ControllerValidation):

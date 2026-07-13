@@ -4,7 +4,7 @@ from typing import Any, TypedDict
 
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse
-from ..schemas import ControllerPlan, ControllerValidation, CoderResult, RouteDecision, ToolResult
+from ..schemas import ControllerPlan, ControllerValidation, CoderResult, ExecutionPlan, RouteDecision, ToolResult
 
 
 class OrchestratorState(TypedDict, total=False):
@@ -20,6 +20,7 @@ class OrchestratorState(TypedDict, total=False):
     route: dict[str, Any] | RouteDecision
     controller_plan: dict[str, Any] | ControllerPlan
     controller_validation: dict[str, Any] | ControllerValidation
+    execution_plan: dict[str, Any] | ExecutionPlan
 
     executed_specialists: list[str]
     pending_specialists: list[str]

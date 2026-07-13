@@ -70,7 +70,11 @@ def render_structured_context(
 
     if controller_plan:
         add("Controller Plan", controller_plan.model_dump_json(indent=2))
-    if controller_validation:
+    if controller_validation and (
+        not controller_plan
+        or controller_validation.model_dump(exclude_none=True)
+        != controller_plan.model_dump(exclude_none=True)
+    ):
         add("Controller Validation", controller_validation.model_dump_json(indent=2))
 
     if knowledge_result and knowledge_result.context:

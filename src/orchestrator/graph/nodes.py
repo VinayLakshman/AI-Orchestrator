@@ -73,6 +73,11 @@ def _as_tool(value: Any) -> ToolResult | None:
     return None
 
 
+def _current_execution_plan(state: OrchestratorState) -> ControllerPlan | None:
+    value = state.get("execution_plan") or state.get("controller_validation") or state.get("controller_plan")
+    return _as_plan(value)
+
+
 def _step_from_pending(pending_steps: list[str] | None) -> SpecialistType | None:
     if not pending_steps:
         return None
@@ -121,6 +126,9 @@ def _retry_counts_from_state(state: OrchestratorState) -> dict[str, int]:
 
 
 def _current_pending_steps(state: OrchestratorState) -> list[str]:
+    plan = _current_execution_plan(state)
+    if plan and plan.pending_specialists:
+        return _unique_specialist_values(plan.pending_specialists)
     pending = list(state.get("pending_specialists", []) or [])
     if not pending:
         pending = list(state.get("pending_steps", []) or [])
@@ -136,12 +144,17 @@ def _current_failed_steps(state: OrchestratorState) -> list[str]:
 
 
 def _has_finalize_path(state: OrchestratorState) -> bool:
+    plan = _current_execution_plan(state)
+    if plan is not None:
+        return bool(plan.complete)
     return not _current_pending_steps(state) and not bool(state.get("needs_reasoning")) and not bool(state.get("requires_clarification"))
 
 
 def _workflow_signature(state: OrchestratorState) -> str:
+    plan = _current_execution_plan(state)
     snapshot = {
         "current_step": str(state.get("current_step", "") or ""),
+        "execution_plan": plan.model_dump(exclude_none=True) if plan else {},
         "pending_specialists": _current_pending_steps(state),
         "executed_specialists": _current_executed_steps(state),
         "failed_specialists": _current_failed_steps(state),
@@ -185,8 +198,10 @@ def _pending_update(step: SpecialistType | None) -> list[str]:
 
 
 def _state_snapshot(state: OrchestratorState) -> dict[str, Any]:
+    plan = _current_execution_plan(state)
     return {
         "current_step": state.get("current_step", ""),
+        "execution_plan": plan.model_dump(exclude_none=True) if plan else {},
         "pending_steps": _current_pending_steps(state),
         "pending_specialists": _current_pending_steps(state),
         "completed_steps": list(state.get("completed_steps", []) or []),
@@ -263,9 +278,13 @@ def _consume_current_step(
             executed.append(current_step_name)
 
     validation_status = str(validation.action.value)
-    next_specialist = validation.next_specialist
+    next_specialist = _normalize_specialist(validation.next_specialist)
     retry_requested = bool(validation.retry)
     retry_reason = str(validation.retry_reason or "").strip()
+    requested_pending = _unique_specialist_values(
+        validation.pending_specialists
+        or ([next_specialist] if next_specialist is not None else [])
+    )
 
     specialist_status = str(state.get("specialist_status", "") or "").strip().lower()
     if specialist_status == "failed" and current_step_name:
@@ -284,44 +303,48 @@ def _consume_current_step(
         and retry_counts.get(current_step_name, 0) < settings.max_specialist_retries
     )
 
-    scheduled_next: list[str] = []
     if validation.action == ControllerAction.FINALIZE or validation.complete:
-        scheduled_next = []
-        validation_status = "finalize"
-    elif validation.action == ControllerAction.CLARIFY:
-        scheduled_next = []
-        validation_status = "clarify"
         pending = []
-        state_requires_clarification = True
-    elif validation.action == ControllerAction.REASON or validation.needs_reasoning:
-        scheduled_next = []
-        validation_status = "reason"
-    elif next_specialist is not None:
-        candidate = next_specialist.value
-        if _can_schedule_specialist(state, next_specialist, retry=can_retry):
-            if candidate not in completed and candidate not in pending:
-                scheduled_next = [candidate]
-                validation_status = "retry" if can_retry else "continue"
-        else:
-            validation_status = "ignored_repeat"
-    elif state.get("needs_reasoning"):
-        validation_status = "reason"
-    else:
         validation_status = "finalize"
-
-    needs_reasoning = bool(validation.needs_reasoning or validation.action == ControllerAction.REASON)
-    requires_clarification = bool(validation.action == ControllerAction.CLARIFY)
-    if validation.action == ControllerAction.FINALIZE or validation.complete:
         needs_reasoning = False
         requires_clarification = False
+        next_pending = []
+    else:
+        next_pending = requested_pending
+        if next_specialist is not None and not can_retry:
+            candidate = next_specialist.value
+            if candidate in executed and candidate not in failed:
+                next_pending = []
+                validation_status = "ignored_repeat"
+            elif candidate in failed and retry_counts.get(candidate, 0) >= settings.max_specialist_retries:
+                next_pending = []
+                validation_status = "ignored_repeat"
+        if can_retry:
+            next_pending = [next_specialist.value]
+            validation_status = "retry"
+        elif next_specialist is not None and next_pending:
+            validation_status = "continue" if next_specialist.value not in {"reasoning", "clarify"} else next_specialist.value
+        elif next_specialist is not None and next_specialist.value == "clarify":
+            validation_status = "clarify"
+        elif next_specialist is not None and next_specialist.value == "reasoning":
+            validation_status = "reason"
+        else:
+            validation_status = "finalize"
 
-    if scheduled_next:
-        pending = scheduled_next
-    elif validation.action not in {ControllerAction.REASON, ControllerAction.CLARIFY}:
-        pending = []
+        needs_reasoning = bool(validation.needs_reasoning or next_specialist == SpecialistType.REASONING)
+        requires_clarification = bool(next_specialist == SpecialistType.CLARIFY)
+        pending = next_pending
 
     controller_cycles = int(state.get("controller_cycles", 0) or 0) + 1
     specialist_executions = int(state.get("specialist_executions", 0) or 0)
+
+    plan_payload = validation.model_dump(exclude_none=True)
+    plan_payload["complete"] = bool(validation.complete or validation.action == ControllerAction.FINALIZE or not pending)
+    plan_payload["pending_specialists"] = pending
+    plan_payload["next_specialist"] = pending[0] if pending else None
+    plan_payload["final_answer_ready"] = bool(plan_payload["complete"])
+    plan_payload["needs_reasoning"] = bool(needs_reasoning)
+    plan_payload["action"] = validation.action.value
 
     snapshot = {
         "current_step": "",
@@ -333,6 +356,7 @@ def _consume_current_step(
         "needs_reasoning": needs_reasoning,
         "requires_clarification": requires_clarification,
         "validation_status": validation_status,
+        "execution_plan": plan_payload,
     }
     signature = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
     previous_signature = str(state.get("last_progress_signature", "") or "")
@@ -353,10 +377,18 @@ def _consume_current_step(
         needs_reasoning = False
         requires_clarification = False
         validation_status = "finalize"
+        plan_payload["complete"] = True
+        plan_payload["pending_specialists"] = []
+        plan_payload["next_specialist"] = None
+        plan_payload["final_answer_ready"] = True
     elif limit_hit:
         pending = []
         needs_reasoning = False
         requires_clarification = False
+        plan_payload["complete"] = True
+        plan_payload["pending_specialists"] = []
+        plan_payload["next_specialist"] = None
+        plan_payload["final_answer_ready"] = True
 
     workflow_progress = int(state.get("workflow_progress", 0) or 0) + 1
 
@@ -378,6 +410,8 @@ def _consume_current_step(
         "last_controller_decision": validation_status,
         "last_specialist": current_step_name,
         "validation_status": validation_status,
+        "execution_plan": plan_payload,
+        "controller_validation": plan_payload,
     }
 
     if retry_requested and retry_reason:
@@ -409,6 +443,15 @@ def _step_update(state: OrchestratorState, step: SpecialistType) -> dict[str, An
 
 
 def _select_next_node(state: OrchestratorState) -> str:
+    plan = _current_execution_plan(state)
+    if plan is not None:
+        if plan.complete:
+            return "finalize"
+        next_specialist = _normalize_specialist(plan.next_specialist)
+        if next_specialist is not None:
+            return next_specialist.value
+        return "finalize"
+
     pending = _current_pending_steps(state)
     if pending:
         return pending[0]
@@ -450,11 +493,30 @@ def make_prepare_node(settings: Settings):
             "used_models": list(state.get("used_models", []) or []),
             "used_tools": list(state.get("used_tools", []) or []),
             "messages": messages,
+            "execution_plan": None,
+            "controller_plan": None,
+            "controller_validation": None,
+            "pending_steps": [],
+            "pending_specialists": [],
+            "completed_steps": [],
+            "current_step": "",
+            "needs_reasoning": False,
+            "requires_clarification": False,
+            "controller_cycles": 0,
+            "specialist_executions": 0,
+            "workflow_progress": 0,
+            "workflow_stall_count": 0,
+            "last_progress_signature": "",
+            "last_controller_decision": "",
+            "last_specialist": "",
+            "validation_status": "",
+            "specialist_status": "",
+            "final_answer_ready": False,
+            "answer": "",
             "retry_limit": settings.max_specialist_retries,
-            "executed_specialists": _unique_specialist_values(state.get("executed_specialists", []) or []),
-            "pending_specialists": _current_pending_steps(state),
-            "failed_specialists": _unique_specialist_values(state.get("failed_specialists", []) or []),
-            "retry_counts": _retry_counts_from_state(state),
+            "executed_specialists": [],
+            "failed_specialists": [],
+            "retry_counts": {},
         }
 
     return prepare_node
@@ -468,20 +530,7 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
         plan = await controller.plan(state)
         route = plan_to_route(plan)
-        next_step = plan.next_specialist
-        pending_steps = _pending_update(next_step)
-
-        if state.get("has_images") and settings.enable_vision:
-            if next_step != SpecialistType.VISION:
-                pending_steps = [SpecialistType.VISION.value]
-                plan.next_specialist = SpecialistType.VISION
-                plan.requires_vision = True
-                plan.execution_steps = [SpecialistType.VISION]
-
-        if (plan.classification == "GENERAL" or plan.complete) and not (
-            state.get("has_images") and settings.enable_vision
-        ):
-            pending_steps = []
+        pending_steps = _pending_update(plan.next_specialist) if not plan.complete else []
 
         if stream:
             await stream.controller_plan(intent=plan.intent, steps=pending_steps)
@@ -492,8 +541,8 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
                 "controller_intent": plan.intent,
                 "controller_complexity": plan.complexity,
                 "controller_confidence": plan.confidence,
-                "controller_requires_reasoning": plan.requires_reasoning,
-                "controller_requires_clarification": plan.requires_clarification,
+                "controller_requires_reasoning": plan.needs_reasoning,
+                "controller_requires_clarification": plan.next_specialist == SpecialistType.CLARIFY,
                 "controller_next_specialist": plan.next_specialist.value if plan.next_specialist else "",
                 "controller_complete": plan.complete,
             }
@@ -501,40 +550,35 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
         _log_transition(
             "controller_plan",
-            controller_decision=plan.next_specialist.value if plan.next_specialist else "finalize",
-            selected_next_node=_select_next_node(
-                {
-                    **state,
-                    "pending_steps": pending_steps,
-                    "pending_specialists": pending_steps,
-                    "needs_reasoning": bool(plan.requires_reasoning),
-                    "requires_clarification": bool(plan.requires_clarification),
-                    "current_step": "",
-                }
-            ),
+            controller_decision="finalize" if plan.complete else (plan.next_specialist.value if plan.next_specialist else "finalize"),
+            selected_next_node="finalize" if plan.complete else (plan.next_specialist.value if plan.next_specialist else "finalize"),
             **_state_snapshot({
                 **state,
+                "execution_plan": plan.model_dump(exclude_none=True),
                 "pending_steps": pending_steps,
                 "pending_specialists": pending_steps,
-                "needs_reasoning": bool(plan.requires_reasoning),
-                "requires_clarification": bool(plan.requires_clarification),
+                "needs_reasoning": bool(plan.needs_reasoning),
+                "requires_clarification": plan.next_specialist == SpecialistType.CLARIFY,
                 "current_step": "",
             }),
         )
 
+        plan_payload = plan.model_dump(exclude_none=True)
+        plan_payload["pending_specialists"] = pending_steps
         return {
-            "controller_plan": plan.model_dump(exclude_none=True),
+            "execution_plan": plan_payload,
+            "controller_plan": plan_payload,
             "route": route.model_dump(),
             "pending_steps": pending_steps,
             "pending_specialists": pending_steps,
             "completed_steps": list(state.get("completed_steps", []) or []),
             "current_step": "",
-            "needs_reasoning": bool(plan.requires_reasoning),
-            "requires_clarification": bool(plan.requires_clarification),
+            "needs_reasoning": bool(plan.needs_reasoning),
+            "requires_clarification": plan.next_specialist == SpecialistType.CLARIFY,
             "clarification_question": plan.clarification_question or "",
             "metadata": metadata,
             "used_models": _update_used_models(state, settings.controller_model),
-            "last_controller_decision": plan.next_specialist.value if plan.next_specialist else "finalize",
+            "last_controller_decision": "finalize" if plan.complete else (plan.next_specialist.value if plan.next_specialist else "finalize"),
             "validation_status": "planned",
             "workflow_progress": int(state.get("workflow_progress", 0) or 0) + 1,
         }
@@ -669,10 +713,10 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
 
 def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
     user_text = last_user_text(state.get("messages", []))
-    plan = _as_plan(state.get("controller_plan"))
+    plan = _as_plan(state.get("execution_plan") or state.get("controller_plan"))
     knowledge = _as_knowledge(state.get("knowledge_result"))
     vision = state.get("vision_context", "")
-    validation = _as_validation(state.get("controller_validation"))
+    validation = _as_validation(state.get("execution_plan") or state.get("controller_validation"))
 
     context_parts = [
         "You are the coding specialist.",
@@ -770,7 +814,7 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
 def make_tools_node(settings: Settings):
     async def tools_node(state: OrchestratorState) -> dict[str, Any]:
         updates = _step_update(state, SpecialistType.TOOLS)
-        plan = _as_plan(state.get("controller_plan"))
+        plan = _as_plan(state.get("execution_plan") or state.get("controller_plan"))
         tool_requests = list(plan.tool_requests if plan else [])
         if not tool_requests:
             result_payload = {
@@ -860,7 +904,7 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         selected_next_node = _select_next_node({**state, **updates})
         _log_transition(
             "controller_validated",
-            controller_decision=validation.action.value,
+            controller_decision=selected_next_node,
             selected_next_node=selected_next_node,
             **_state_snapshot({**state, **updates}),
         )
@@ -897,8 +941,8 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
                             knowledge_result=_as_knowledge(state.get("knowledge_result")),
                             coder_result=_as_coder(state.get("coder_result")),
                             tool_result=_as_tool(state.get("tool_result")),
-                            controller_plan=_as_plan(state.get("controller_plan")),
-                            controller_validation=_as_validation(state.get("controller_validation")),
+                            controller_plan=_as_plan(state.get("execution_plan") or state.get("controller_plan")),
+                            controller_validation=_as_validation(state.get("execution_plan") or state.get("controller_validation")),
                         )
                         or "No structured context available.",
                     ),
@@ -931,9 +975,21 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
                 "reasoning_result": generation.model_dump(exclude_none=True),
                 "used_models": _update_used_models(state, settings.reasoning_model),
                 "needs_reasoning": False,
+                "requires_clarification": False,
+                "pending_steps": [],
+                "pending_specialists": [],
                 "final_answer_ready": True,
                 "specialist_status": "success" if generation.content.strip() else "failed",
                 "validation_status": "reasoned",
+                "execution_plan": {
+                    **(_as_plan(state.get("execution_plan") or state.get("controller_plan")).model_dump(exclude_none=True)
+                       if _as_plan(state.get("execution_plan") or state.get("controller_plan"))
+                       else {}),
+                    "complete": True,
+                    "next_specialist": None,
+                    "pending_specialists": [],
+                    "final_answer_ready": True,
+                },
                 "workflow_progress": int(state.get("workflow_progress", 0) or 0) + 1,
             }
         except Exception as exc:
@@ -946,7 +1002,7 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
 
 def make_clarify_node():
     async def clarify_node(state: OrchestratorState) -> dict[str, Any]:
-        plan = _as_plan(state.get("controller_plan"))
+        plan = _as_plan(state.get("execution_plan") or state.get("controller_plan"))
         answer = ""
         if plan and plan.clarification_question:
             answer = plan.clarification_question.strip()
@@ -965,8 +1021,21 @@ def make_clarify_node():
         return {
             "answer": answer,
             "messages": [*state.get("messages", []), assistant_message.model_dump(exclude_none=True)],
+            "pending_steps": [],
+            "pending_specialists": [],
+            "needs_reasoning": False,
+            "requires_clarification": False,
             "final_answer_ready": True,
             "validation_status": "clarify",
+            "execution_plan": {
+                **(_as_plan(state.get("execution_plan") or state.get("controller_plan")).model_dump(exclude_none=True)
+                   if _as_plan(state.get("execution_plan") or state.get("controller_plan"))
+                   else {}),
+                "complete": True,
+                "next_specialist": None,
+                "pending_specialists": [],
+                "final_answer_ready": True,
+            },
             "workflow_progress": int(state.get("workflow_progress", 0) or 0) + 1,
         }
 
@@ -1003,8 +1072,8 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
             content=answer,
             metadata={
                 "model": model,
-                "controller_plan": state.get("controller_plan"),
-                "controller_validation": state.get("controller_validation"),
+                "controller_plan": state.get("execution_plan") or state.get("controller_plan"),
+                "controller_validation": state.get("execution_plan") or state.get("controller_validation"),
             },
         )
 
@@ -1022,9 +1091,22 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
             "messages": [*state.get("messages", []), assistant_message.model_dump(exclude_none=True)],
             "metadata": metadata,
             "used_models": _update_used_models(state, model),
+            "pending_steps": [],
+            "pending_specialists": [],
+            "needs_reasoning": False,
+            "requires_clarification": False,
             "final_answer_ready": True,
             "validation_status": "finalize",
             "last_controller_decision": "finalize",
+            "execution_plan": {
+                **(_as_plan(state.get("execution_plan") or state.get("controller_plan")).model_dump(exclude_none=True)
+                   if _as_plan(state.get("execution_plan") or state.get("controller_plan"))
+                   else {}),
+                "complete": True,
+                "next_specialist": None,
+                "pending_specialists": [],
+                "final_answer_ready": True,
+            },
             "workflow_progress": int(state.get("workflow_progress", 0) or 0) + 1,
         }
 

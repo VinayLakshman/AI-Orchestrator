@@ -31,6 +31,8 @@ class SpecialistType(StrEnum):
     VISION = "vision"
     CODER = "coder"
     TOOLS = "tools"
+    REASONING = "reasoning"
+    CLARIFY = "clarify"
 
 
 class ControllerAction(StrEnum):
@@ -49,4 +51,3 @@ class VisionTaskType(StrEnum):
     DOCUMENT = "document"
     PHOTO = "photo"
     MIXED = "mixed"
-

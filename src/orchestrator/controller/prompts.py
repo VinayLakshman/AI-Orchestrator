@@ -25,34 +25,29 @@ Classifications:
 - CLARIFY: only when the request is genuinely ambiguous.
 
 Planning rules:
-- Do not answer the user directly in this step.
 - Return STRICT JSON ONLY.
-- Do not expose chain-of-thought, analysis, or step-by-step reasoning.
-- Do not narrate internal planning, evidence, or hidden control flow.
-- Return only the requested JSON fields.
-- Prefer GENERAL whenever the resident controller can answer from model knowledge.
+- Do not expose reasoning, analysis, or internal control flow.
+- Prefer GENERAL whenever the controller can answer directly.
 - Use KNOWLEDGE only for project-specific or indexed information.
-- Do not use KNOWLEDGE for common public concepts like Docker, Kubernetes,
-  Podman, Linux, networking basics, databases, or algorithms unless the user
-  explicitly asks about local/indexed/project-specific material.
-- If images are present or the user asks about visual content, include vision.
-- If code must be written, edited, debugged, reviewed, or explained, include coder.
-- If external execution is needed, include tools.
-- Use reasoning only when the request explicitly requires deeper synthesis.
-- Choose at most one next specialist.
-- Do not repeat a specialist unless the workflow explicitly failed and a retry is requested.
-- Mark complete when no further specialist work is needed.
-- Re-plan after every specialist based on returned evidence.
-- Never assume a specialist succeeded just because it executed.
+- Use CODE only for writing, editing, debugging, or explaining code.
+- Use VISION only when image understanding is required.
+- Use TOOLS only when external execution is required.
+- Use REASONING only when the request explicitly needs synthesis.
+- Choose at most one next step.
+- Do not repeat a step unless retry is explicitly requested after failure.
+- Mark complete when no further work is needed.
+- Re-plan after every specialist result.
 
 Return this JSON shape:
 {
   "intent": "short intent label",
+  "classification": "GENERAL|KNOWLEDGE|CODE|VISION|TOOLS|REASONING|CLARIFY",
+  "complete": false,
   "next_specialist": "knowledge|vision|coder|tools|null",
+  "pending_specialists": ["knowledge"],
   "retry": false,
   "retry_reason": "",
   "needs_reasoning": false,
-  "complete": false,
   "confidence": 0.0,
   "explanation": "brief routing rationale"
 }
@@ -61,9 +56,8 @@ Return this JSON shape:
 
 def build_controller_validation_prompt() -> str:
     return """
-You are re-planning after one specialist step in a controller-first graph.
-Specialist output is evidence, not the final answer. A specialist execution is
-not automatically a successful result.
+You are re-planning after one specialist step.
+Specialist output is evidence, not the final answer.
 
 Evaluate:
 - specialist type
@@ -74,28 +68,27 @@ Evaluate:
 - whether the current request is satisfied
 
 Decide one action:
-- continue: invoke exactly one next specialist
-- finalize: the resident controller can synthesize a user-facing answer now
-- reason: escalate to the large reasoning model
-- clarify: ask the user a targeted clarification question
+- continue: invoke exactly one next step
+- finalize: the controller can answer now
+- reason: use the reasoning node
+- clarify: ask one targeted clarification
 
 Knowledge fallback:
-- If retrieval has no documents, low confidence, or insufficient evidence, never
-  end with an empty response.
-- If the user asked common world knowledge, set fallback_to_general true and action finalize.
-- If the request still needs project-specific evidence, use reason or clarify.
+- If retrieval is weak for common world knowledge, set fallback_to_general true and action finalize.
+- If retrieval is weak for project-specific material, choose reason or clarify.
 
 Return STRICT JSON ONLY with this shape:
 {
   "action": "continue|finalize|reason|clarify",
   "summary": "brief validation summary",
   "confidence": 0.0,
+  "complete": false,
   "next_specialist": "knowledge|vision|coder|tools|null",
+  "pending_specialists": ["knowledge"],
   "retry": false,
   "retry_reason": "",
   "needs_reasoning": false,
   "final_answer_ready": false,
-  "complete": false,
   "fallback_to_general": false,
   "knowledge_sufficient": null,
   "reason": "why this action is correct",
@@ -106,7 +99,7 @@ Return STRICT JSON ONLY with this shape:
 Rules:
 - Re-plan based on evidence, not on the fact that a node ran.
 - Finalize when the request is satisfied.
-- Continue only with exactly one next specialist.
+- Continue only with exactly one next step.
 - Retry only if the current specialist explicitly failed.
 - Reason only when the request explicitly requires deeper synthesis.
 - Clarify only when the request cannot be answered without one more user detail.
