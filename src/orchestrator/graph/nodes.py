@@ -766,19 +766,11 @@ def make_clarify_node():
 def make_finalize_node(controller: ControllerEngine, settings: Settings):
     async def finalize_node(state: OrchestratorState) -> dict[str, Any]:
         stream = get_current_stream()
-        reasoning_result = state.get("reasoning_result")
-        if isinstance(reasoning_result, dict):
-            reasoning_result = ModelGenerationResponse.model_validate(reasoning_result)
-        elif not isinstance(reasoning_result, ModelGenerationResponse):
-            reasoning_result = None
 
         existing_answer = str(state.get("answer", "") or "").strip()
         if existing_answer:
             answer = existing_answer
             model = str(state.get("metadata", {}).get("final_model") or settings.controller_model)
-        elif reasoning_result is not None:
-            answer = reasoning_result.content
-            model = reasoning_result.model
         else:
             if stream:
                 await stream.llm_started(model=settings.controller_model)
@@ -789,6 +781,12 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
 
             if stream:
                 await stream.llm_finished()
+
+        if not answer.strip():
+            answer = (
+                "I could not generate a complete answer for that request. "
+                "Please try again with a little more detail."
+            )
 
         assistant_message = ChatMessage(
             role=ChatRole.ASSISTANT,

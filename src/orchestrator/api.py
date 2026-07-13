@@ -215,7 +215,11 @@ def _answer_from_state(state: dict[str, Any]) -> tuple[str, str]:
         if final_answer:
             return final_answer, "metadata.final_answer"
 
-    return "", "missing"
+    return (
+        "I could not generate a complete answer for that request. "
+        "Please try again with a little more detail.",
+        "fallback",
+    )
 
 
 def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorResponse:

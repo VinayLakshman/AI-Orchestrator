@@ -5,6 +5,7 @@ from typing import Any
 from ..common.enums import ChatRole, RouteType
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
+from ..models.ollama import ModelGenerationResponse
 from ..schemas import ControllerPlan, ControllerValidation, CoderResult, RouteDecision, ToolResult
 from ..settings import Settings
 from ..vision.prompts import build_vision_injection_message
@@ -56,6 +57,7 @@ def render_structured_context(
     knowledge_result: KnowledgeRetrieveResponse | None = None,
     coder_result: CoderResult | None = None,
     tool_result: ToolResult | None = None,
+    reasoning_result: ModelGenerationResponse | None = None,
     controller_plan: ControllerPlan | None = None,
     controller_validation: ControllerValidation | None = None,
 ) -> str:
@@ -89,6 +91,9 @@ def render_structured_context(
             tool_result.model_dump_json(indent=2),
         )
 
+    if reasoning_result and reasoning_result.content:
+        add("Reasoning Result", reasoning_result.content)
+
     return "\n".join(parts).strip()
 
 
@@ -100,6 +105,7 @@ def build_controller_messages(
     knowledge_result: KnowledgeRetrieveResponse | None = None,
     coder_result: CoderResult | None = None,
     tool_result: ToolResult | None = None,
+    reasoning_result: ModelGenerationResponse | None = None,
     controller_plan: ControllerPlan | None = None,
     controller_validation: ControllerValidation | None = None,
     latest_user_message: str | None = None,
@@ -111,6 +117,7 @@ def build_controller_messages(
         knowledge_result=knowledge_result,
         coder_result=coder_result,
         tool_result=tool_result,
+        reasoning_result=reasoning_result,
         controller_plan=controller_plan,
         controller_validation=controller_validation,
     )
