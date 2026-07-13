@@ -28,7 +28,7 @@ Behavior:
 - For knowledge/RAG tasks, treat retrieved chunks as authoritative context.
 - For vision tasks, analyze visual content carefully when image inputs are available.
 - For tool tasks, explain what would be executed and what result is expected.
-- For multi-step tasks, solve in a structured way.
+- For multi-step tasks, keep the answer structured but do not reveal internal reasoning.
 """
 
 VISION_SYSTEM_PROMPT = """You are in vision-analysis mode.

@@ -75,6 +75,9 @@ class OllamaClient:
             "default" if think is None else ("enabled" if think else "disabled"),
         )
 
+    def _log_payload(self, payload: dict[str, Any]) -> None:
+        logger.debug("ollama_request_payload=%s", json.dumps(payload, sort_keys=True, default=str))
+
     async def _get_client(self, *, streaming: bool = False) -> tuple[httpx.AsyncClient, bool]:
         timeout = self._build_timeout(streaming=streaming)
         client = self.client
@@ -126,6 +129,7 @@ class OllamaClient:
             keep_alive=keep_alive,
             think=think,
         )
+        self._log_payload(payload)
 
         client, close_client = await self._get_client()
         try:
@@ -158,6 +162,7 @@ class OllamaClient:
             keep_alive=keep_alive,
             think=think,
         )
+        self._log_payload(payload)
 
         client, close_client = await self._get_client(streaming=True)
         try:
