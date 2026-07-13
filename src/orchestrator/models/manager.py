@@ -67,4 +67,5 @@ class ModelManager:
             max_tokens=4,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
+            think=self.settings.controller_think,
         )

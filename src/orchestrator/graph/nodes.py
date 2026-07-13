@@ -10,7 +10,7 @@ from ..context.builder import last_user_text, render_structured_context
 from ..controller.engine import ControllerEngine, plan_to_route
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
-from ..models.ollama import ModelGenerationResponse
+from ..models.ollama import ModelGenerationResponse, extract_assistant_text
 from ..schemas import ControllerPlan, ControllerValidation, CoderResult, ToolResult
 from ..logging import get_logger
 from ..settings import Settings
@@ -521,7 +521,7 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
         parsed: dict[str, Any] = {}
         try:
             import json
-            text = response.content.strip()
+            text = extract_assistant_text(response.content) or extract_assistant_text(response.raw)
             if text.startswith("```"):
                 text = text.strip("`").strip()
                 if text.lower().startswith("json"):
@@ -537,13 +537,13 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
 
         coder_result = CoderResult(
             task=str(parsed.get("task") or "").strip(),
-            summary=str(parsed.get("summary") or "").strip() or response.content[:400],
-            code=str(parsed.get("code") or response.content).strip(),
+            summary=str(parsed.get("summary") or "").strip() or text[:400],
+            code=str(parsed.get("code") or text).strip(),
             files=[str(item) for item in (parsed.get("files") or []) if str(item).strip()],
             tests=[str(item) for item in (parsed.get("tests") or []) if str(item).strip()],
             warnings=[str(item) for item in (parsed.get("warnings") or []) if str(item).strip()],
             confidence=float(parsed.get("confidence") or 0.0),
-            raw_text=response.content,
+            raw_text=text,
         )
 
         if stream:
@@ -706,6 +706,7 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
                 temperature=settings.reasoning_temperature,
                 max_tokens=settings.reasoning_max_tokens,
                 keep_alive=settings.reasoning_keep_alive,
+                think=settings.reasoning_think,
             ):
                 if chunk.content:
                     content_parts.append(chunk.content)
@@ -715,7 +716,7 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
 
             generation = ModelGenerationResponse(
                 model=settings.reasoning_model,
-                content="".join(content_parts).strip(),
+                content=extract_assistant_text("".join(content_parts)),
                 raw=final_raw,
             )
 
@@ -769,7 +770,7 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
 
         existing_answer = str(state.get("answer", "") or "").strip()
         if existing_answer:
-            answer = existing_answer
+            answer = extract_assistant_text(existing_answer)
             model = str(state.get("metadata", {}).get("final_model") or settings.controller_model)
         else:
             if stream:
@@ -777,7 +778,7 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
 
             generation = await controller.finalize(state)
             model = generation.model
-            answer = generation.content.strip()
+            answer = extract_assistant_text(generation.content) or extract_assistant_text(generation.raw)
 
             if stream:
                 await stream.llm_finished()

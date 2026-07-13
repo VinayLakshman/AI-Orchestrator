@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     controller_keep_alive: str = "30m"
     reasoning_keep_alive: str = "15m"
+    controller_model_think: bool = False
+    reasoning_model_think: bool = True
     controller_temperature: float = 0.15
     reasoning_temperature: float = 0.2
     controller_max_tokens: int = 1024
@@ -86,6 +88,14 @@ class Settings(BaseSettings):
     @property
     def general_model(self) -> str:
         return self.controller_model
+
+    @property
+    def controller_think(self) -> bool:
+        return self.controller_model_think
+
+    @property
+    def reasoning_think(self) -> bool:
+        return self.reasoning_model_think
 
     @property
     def router_model(self) -> str | None:

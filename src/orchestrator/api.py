@@ -13,7 +13,7 @@ from .common.constants import THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
 from .models.chat import ChatMessage, ChatRequest
 from .models.knowledge import KnowledgeRetrieveResponse
-from .models.ollama import ModelGenerationResponse
+from .models.ollama import ModelGenerationResponse, extract_assistant_text
 from .schemas import (
     ControllerPlan,
     ControllerValidation,
@@ -184,26 +184,24 @@ def _assistant_content_from_messages(state: dict[str, Any]) -> str:
     messages = state.get("messages", []) or []
     for message in reversed(messages):
         if isinstance(message, dict) and message.get("role") == "assistant":
-            content = message.get("content")
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-            if content is not None:
-                text = str(content).strip()
-                if text:
-                    return text
+            text = extract_assistant_text(message.get("content"))
+            if text:
+                return text
     return ""
 
 
 def _answer_from_state(state: dict[str, Any]) -> tuple[str, str]:
-    answer = str(state.get("answer", "") or "").strip()
+    answer = extract_assistant_text(state.get("answer"))
     if answer:
         return answer, "answer"
 
     reasoning = state.get("reasoning_result")
     if isinstance(reasoning, dict):
         reasoning = ModelGenerationResponse.model_validate(reasoning)
-    if isinstance(reasoning, ModelGenerationResponse) and reasoning.content.strip():
-        return reasoning.content.strip(), "reasoning_result.content"
+    if isinstance(reasoning, ModelGenerationResponse):
+        reasoning_content = extract_assistant_text(reasoning.content) or extract_assistant_text(reasoning.raw)
+        if reasoning_content:
+            return reasoning_content, "reasoning_result.content"
 
     assistant_content = _assistant_content_from_messages(state)
     if assistant_content:
@@ -211,7 +209,7 @@ def _answer_from_state(state: dict[str, Any]) -> tuple[str, str]:
 
     metadata = state.get("metadata", {}) or {}
     if isinstance(metadata, dict):
-        final_answer = str(metadata.get("final_answer", "") or "").strip()
+        final_answer = extract_assistant_text(metadata.get("final_answer"))
         if final_answer:
             return final_answer, "metadata.final_answer"
 

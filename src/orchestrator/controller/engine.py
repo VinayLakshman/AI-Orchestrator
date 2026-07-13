@@ -12,7 +12,7 @@ from ..common.enums import (
 )
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
-from ..models.ollama import ModelGenerationResponse
+from ..models.ollama import ModelGenerationResponse, extract_assistant_text, normalize_generation_response
 from ..context.builder import build_controller_messages, last_user_text, render_structured_context
 from ..models.manager import ModelManager
 from ..schemas import ControllerPlan, ControllerValidation, CoderResult, RouteDecision, ToolResult
@@ -325,30 +325,6 @@ def _fallback_final_answer(state: dict[str, Any]) -> str:
     )
 
 
-def _extract_text_from_raw_response(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, list):
-        parts = [_extract_text_from_raw_response(item) for item in value]
-        return "\n".join(part for part in parts if part).strip()
-    if isinstance(value, dict):
-        for key in ("message", "response", "content", "assistant", "text"):
-            extracted = _extract_text_from_raw_response(value.get(key))
-            if extracted:
-                return extracted
-        if "choices" in value:
-            extracted = _extract_text_from_raw_response(value.get("choices"))
-            if extracted:
-                return extracted
-        if "messages" in value:
-            extracted = _extract_text_from_raw_response(value.get("messages"))
-            if extracted:
-                return extracted
-    return str(value).strip()
-
-
 def _specialist_evidence_summary(
     state: dict[str, Any],
     *,
@@ -535,6 +511,7 @@ class ControllerEngine:
             max_tokens=self.settings.controller_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
+            think=self.settings.controller_think,
         )
 
         parsed = _extract_json_object(response.content)
@@ -696,6 +673,7 @@ class ControllerEngine:
             max_tokens=self.settings.controller_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
+            think=self.settings.controller_think,
         )
 
         parsed = _extract_json_object(response.content)
@@ -805,8 +783,9 @@ class ControllerEngine:
             max_tokens=self.settings.controller_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
+            think=self.settings.controller_think,
         )
-        extracted = response.content.strip() or _extract_text_from_raw_response(response.raw)
+        extracted = extract_assistant_text(response.content) or extract_assistant_text(response.raw)
         if not extracted.strip():
             return ModelGenerationResponse(
                 model=response.model,
@@ -841,5 +820,6 @@ class ControllerEngine:
             max_tokens=self.settings.reasoning_max_tokens,
             stream=False,
             keep_alive=self.settings.reasoning_keep_alive,
+            think=self.settings.reasoning_think,
         )
-        return response
+        return normalize_generation_response(response.model, response.content or response.raw)

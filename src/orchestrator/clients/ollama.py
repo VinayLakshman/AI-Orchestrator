@@ -6,9 +6,18 @@ import json
 
 import httpx
 
-from ..models.ollama import ModelGenerationResponse, OllamaStreamChunk
+from ..models.ollama import (
+    ModelGenerationResponse,
+    OllamaStreamChunk,
+    extract_assistant_text,
+    normalize_generation_response,
+)
+from ..logging import get_logger
 from ..settings import Settings
 from ..models.chat import ChatMessage
+
+
+logger = get_logger(__name__)
 
 
 class OllamaClient:
@@ -36,6 +45,7 @@ class OllamaClient:
         stream: bool = False,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
+        think: bool | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model,
@@ -50,37 +60,20 @@ class OllamaClient:
             payload["options"]["num_predict"] = max_tokens
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+        if think is not None:
+            payload["think"] = think
 
         return payload
 
     def _extract_content(self, data: dict[str, Any]) -> str:
-        message = data.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            if content is not None:
-                return str(content)
+        return extract_assistant_text(data)
 
-        if "response" in data and data["response"] is not None:
-            return str(data.get("response") or "")
-
-        if "content" in data:
-            content = data["content"]
-            if isinstance(content, list):
-                return "\n".join(
-                    part.get("text", "")
-                    for part in content
-                    if isinstance(part, dict) and part.get("type") == "text"
-                ).strip()
-            return str(content or "")
-
-        if "choices" in data and data["choices"]:
-            try:
-                choice = data["choices"][0]
-                return str(choice.get("message", {}).get("content", "") or "")
-            except Exception:
-                return ""
-
-        return ""
+    def _log_request(self, *, model: str, think: bool | None) -> None:
+        logger.debug(
+            "ollama_request model=%s think=%s",
+            model,
+            "default" if think is None else ("enabled" if think else "disabled"),
+        )
 
     async def _get_client(self, *, streaming: bool = False) -> tuple[httpx.AsyncClient, bool]:
         timeout = self._build_timeout(streaming=streaming)
@@ -103,6 +96,7 @@ class OllamaClient:
         stream: bool = False,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
+        think: bool | None = None,
     ) -> ModelGenerationResponse:
         if stream:
             content = []
@@ -114,12 +108,14 @@ class OllamaClient:
                 max_tokens=max_tokens,
                 options=options,
                 keep_alive=keep_alive,
+                think=think,
             ):
                 if chunk.content:
                     content.append(chunk.content)
                 final_raw = chunk.raw or final_raw
             return ModelGenerationResponse(model=model, content="".join(content).strip(), raw=final_raw)
 
+        self._log_request(model=model, think=think)
         payload = self._build_payload(
             model,
             messages,
@@ -128,6 +124,7 @@ class OllamaClient:
             stream=False,
             options=options,
             keep_alive=keep_alive,
+            think=think,
         )
 
         client, close_client = await self._get_client()
@@ -135,8 +132,7 @@ class OllamaClient:
             resp = await client.post("/api/chat", json=payload)
             resp.raise_for_status()
             data = resp.json()
-            content = self._extract_content(data)
-            return ModelGenerationResponse(model=model, content=content, raw=data if isinstance(data, dict) else {})
+            return normalize_generation_response(model, data)
         finally:
             if close_client:
                 await client.aclose()
@@ -149,7 +145,9 @@ class OllamaClient:
         max_tokens: int | None = None,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
+        think: bool | None = None,
     ) -> AsyncIterator[OllamaStreamChunk]:
+        self._log_request(model=model, think=think)
         payload = self._build_payload(
             model,
             messages,
@@ -158,6 +156,7 @@ class OllamaClient:
             stream=True,
             options=options,
             keep_alive=keep_alive,
+            think=think,
         )
 
         client, close_client = await self._get_client(streaming=True)
