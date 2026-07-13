@@ -8,20 +8,24 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from ..clients import KnowledgeClient, OllamaClient
-from ..router import RequestRouter
-from ..router.classifier import RoutingClassifier
+from ..controller.engine import ControllerEngine
+from ..models.manager import ModelManager
 from ..settings import Settings
 from ..streaming.hub import StreamHub
 from ..vision.pipeline import VisionPipeline
 from .nodes import (
     make_clarify_node,
-    make_generate_node,
-    make_retrieve_node,
-    make_route_node,
+    make_controller_plan_node,
+    make_controller_validate_node,
+    make_coder_node,
+    make_finalize_node,
+    make_knowledge_node,
+    make_prepare_node,
+    make_reasoning_node,
+    make_tools_node,
     make_vision_node,
 )
 from .state import OrchestratorState
-from ..schemas import RouteDecision, RouteType
 
 
 CheckpointerKind = Literal["memory", "sqlite"]
@@ -30,7 +34,8 @@ CheckpointerKind = Literal["memory", "sqlite"]
 @dataclass(slots=True)
 class OrchestratorRuntime:
     settings: Settings
-    router: RequestRouter
+    model_manager: ModelManager
+    controller: ControllerEngine
     knowledge_client: KnowledgeClient
     ollama_client: OllamaClient
     vision_pipeline: VisionPipeline
@@ -59,57 +64,100 @@ def build_checkpointer(settings: Settings) -> tuple[Any, CheckpointerKind]:
 
 def build_graph(
     settings: Settings,
-    router: RequestRouter,
+    controller: ControllerEngine,
     knowledge_client: KnowledgeClient,
     ollama_client: OllamaClient,
     vision_pipeline: VisionPipeline,
 ) -> tuple[Any, Any]:
     builder = StateGraph(OrchestratorState)
 
+    prepare_node = make_prepare_node(settings)
+    plan_node = make_controller_plan_node(controller, settings)
     vision_node = make_vision_node(vision_pipeline, settings)
-    route_node = make_route_node(router, settings)
-    retrieve_node = make_retrieve_node(knowledge_client, settings)
-    generate_node = make_generate_node(ollama_client, settings)
+    knowledge_node = make_knowledge_node(knowledge_client, settings)
+    coder_node = make_coder_node(controller, settings)
+    tools_node = make_tools_node(settings)
+    validate_node = make_controller_validate_node(controller, settings)
+    reasoning_node = make_reasoning_node(controller, settings)
     clarify_node = make_clarify_node()
+    finalize_node = make_finalize_node(controller, settings)
 
+    builder.add_node("prepare", prepare_node)
+    builder.add_node("plan", plan_node)
     builder.add_node("vision", vision_node)
-    builder.add_node("route", route_node)
-    builder.add_node("retrieve", retrieve_node)
-    builder.add_node("generate", generate_node)
+    builder.add_node("knowledge", knowledge_node)
+    builder.add_node("coder", coder_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("validate", validate_node)
+    builder.add_node("reasoning", reasoning_node)
     builder.add_node("clarify", clarify_node)
+    builder.add_node("finalize", finalize_node)
 
-    builder.add_edge(START, "vision")
-    builder.add_edge("vision", "route")
+    builder.add_edge(START, "prepare")
+    builder.add_edge("prepare", "plan")
 
-    def select_next(state: OrchestratorState) -> str:
-        decision = RouteDecision.model_validate(state["route"])
-
-        if decision.route == RouteType.CLARIFY:
+    def route_after_plan(state: OrchestratorState) -> str:
+        if state.get("requires_clarification"):
             return "clarify"
 
-        if decision.route == RouteType.RAG:
-            return "retrieve"
+        pending = list(state.get("pending_steps", []) or [])
+        if pending:
+            return pending[0]
 
-        if decision.route == RouteType.MULTI_STEP:
-            if decision.needs_rag:
-                return "retrieve"
-            return "generate"
+        if state.get("needs_reasoning"):
+            return "reasoning"
 
-        return "generate"
+        return "finalize"
+
+    def route_after_validate(state: OrchestratorState) -> str:
+        if state.get("requires_clarification"):
+            return "clarify"
+
+        pending = list(state.get("pending_steps", []) or [])
+        if pending:
+            return pending[0]
+
+        if state.get("needs_reasoning"):
+            return "reasoning"
+
+        return "finalize"
 
     builder.add_conditional_edges(
-        "route",
-        select_next,
+        "plan",
+        route_after_plan,
         {
-            "retrieve": "retrieve",
-            "generate": "generate",
+            "vision": "vision",
+            "knowledge": "knowledge",
+            "coder": "coder",
+            "tools": "tools",
+            "reasoning": "reasoning",
+            "finalize": "finalize",
             "clarify": "clarify",
         },
     )
 
-    builder.add_edge("retrieve", "generate")
-    builder.add_edge("generate", END)
+    builder.add_edge("vision", "validate")
+    builder.add_edge("knowledge", "validate")
+    builder.add_edge("coder", "validate")
+    builder.add_edge("tools", "validate")
+
+    builder.add_conditional_edges(
+        "validate",
+        route_after_validate,
+        {
+            "vision": "vision",
+            "knowledge": "knowledge",
+            "coder": "coder",
+            "tools": "tools",
+            "reasoning": "reasoning",
+            "finalize": "finalize",
+            "clarify": "clarify",
+        },
+    )
+
+    builder.add_edge("reasoning", "finalize")
     builder.add_edge("clarify", END)
+    builder.add_edge("finalize", END)
 
     checkpointer, _kind = build_checkpointer(settings)
     graph = builder.compile(checkpointer=checkpointer)
@@ -118,30 +166,34 @@ def build_graph(
 
 
 async def build_runtime(settings: Settings) -> OrchestratorRuntime:
-    ollama_http = httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=settings.request_timeout_s)
+    ollama_http = httpx.AsyncClient(
+        base_url=settings.ollama_base_url,
+        timeout=settings.request_timeout_s,
+    )
     knowledge_http = httpx.AsyncClient(
         base_url=settings.knowledge_service_url,
         timeout=settings.request_timeout_s,
     )
 
-    classifier = RoutingClassifier(settings=settings, client=ollama_http)
-    router = RequestRouter(settings=settings, classifier=classifier)
     ollama_client = OllamaClient(settings=settings, client=ollama_http)
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
+    model_manager = ModelManager(settings=settings, ollama_client=ollama_client)
+    controller = ControllerEngine(settings=settings, ollama=ollama_client, models=model_manager)
     vision_pipeline = VisionPipeline(settings=settings, client=ollama_http)
     stream_hub = StreamHub()
 
     graph, checkpointer = build_graph(
         settings=settings,
-        router=router,
+        controller=controller,
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
-        vision_pipeline=vision_pipeline
+        vision_pipeline=vision_pipeline,
     )
 
     return OrchestratorRuntime(
         settings=settings,
-        router=router,
+        model_manager=model_manager,
+        controller=controller,
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
         vision_pipeline=vision_pipeline,

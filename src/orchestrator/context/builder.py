@@ -2,20 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..graph.prompts import (
-    BASE_SYSTEM_PROMPT,
-    CLARIFY_SYSTEM_PROMPT,
-    CODE_SYSTEM_PROMPT,
-    RAG_SYSTEM_PROMPT,
-    TOOLS_SYSTEM_PROMPT,
-    VISION_SYSTEM_PROMPT,
-)
 from ..schemas import (
     ChatMessage,
     ChatRole,
+    ControllerPlan,
+    ControllerValidation,
     KnowledgeRetrieveResponse,
     RouteDecision,
     RouteType,
+    SpecialistType,
+    ToolResult,
+    CoderResult,
 )
 from ..settings import Settings
 from ..vision.prompts import build_vision_injection_message
@@ -53,23 +50,109 @@ def last_user_text(messages: list[dict[str, Any]] | None) -> str:
     return ""
 
 
+def _state_messages_to_chat_messages(
+    messages: list[dict[str, Any]] | None,
+) -> list[ChatMessage]:
+    if not messages:
+        return []
+
+    return [ChatMessage.model_validate(message) for message in messages]
+
+
+def render_structured_context(
+    *,
+    vision_context: str = "",
+    knowledge_result: KnowledgeRetrieveResponse | None = None,
+    coder_result: CoderResult | None = None,
+    tool_result: ToolResult | None = None,
+    controller_plan: ControllerPlan | None = None,
+    controller_validation: ControllerValidation | None = None,
+) -> str:
+    parts: list[str] = []
+
+    def add(title: str, value: str) -> None:
+        value = (value or "").strip()
+        if value:
+            parts.extend([f"## {title}", value, ""])
+
+    if controller_plan:
+        add("Controller Plan", controller_plan.model_dump_json(indent=2))
+    if controller_validation:
+        add("Controller Validation", controller_validation.model_dump_json(indent=2))
+
+    if knowledge_result and knowledge_result.context:
+        add("Knowledge Context", knowledge_result.context)
+
+    if vision_context:
+        add("Vision Context", vision_context)
+
+    if coder_result and (coder_result.summary or coder_result.code):
+        add(
+            "Coder Result",
+            coder_result.model_dump_json(indent=2),
+        )
+
+    if tool_result and (tool_result.summary or tool_result.result):
+        add(
+            "Tool Result",
+            tool_result.model_dump_json(indent=2),
+        )
+
+    return "\n".join(parts).strip()
+
+
+def build_controller_messages(
+    *,
+    system_prompt: str,
+    messages: list[dict[str, Any]] | None = None,
+    vision_context: str = "",
+    knowledge_result: KnowledgeRetrieveResponse | None = None,
+    coder_result: CoderResult | None = None,
+    tool_result: ToolResult | None = None,
+    controller_plan: ControllerPlan | None = None,
+    controller_validation: ControllerValidation | None = None,
+    latest_user_message: str | None = None,
+) -> list[ChatMessage]:
+    outgoing: list[ChatMessage] = [ChatMessage(role=ChatRole.SYSTEM, content=system_prompt)]
+
+    structured_context = render_structured_context(
+        vision_context=vision_context,
+        knowledge_result=knowledge_result,
+        coder_result=coder_result,
+        tool_result=tool_result,
+        controller_plan=controller_plan,
+        controller_validation=controller_validation,
+    )
+    if structured_context:
+        outgoing.append(
+            ChatMessage(
+                role=ChatRole.SYSTEM,
+                metadata={"source": "structured_context"},
+                content=structured_context,
+            )
+        )
+
+    outgoing.extend(_state_messages_to_chat_messages(messages))
+
+    if latest_user_message and last_user_text(messages) != latest_user_message:
+        outgoing.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
+
+    return outgoing
+
+
 def resolve_system_prompt_for_route(decision: RouteDecision) -> str:
+    # Backward compatibility: keep the old API surface available.
     if decision.route == RouteType.VISION:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, VISION_SYSTEM_PROMPT])
-
+        return "You are a dedicated vision assistant."
     if decision.route == RouteType.CODE:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, CODE_SYSTEM_PROMPT])
-
+        return "You are a dedicated coding assistant."
     if decision.route == RouteType.RAG:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, RAG_SYSTEM_PROMPT])
-
+        return "You are a grounded retrieval assistant."
     if decision.route == RouteType.TOOLS:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, TOOLS_SYSTEM_PROMPT])
-
+        return "You are a tool execution assistant."
     if decision.route == RouteType.CLARIFY:
-        return "\n\n".join([BASE_SYSTEM_PROMPT, CLARIFY_SYSTEM_PROMPT])
-
-    return BASE_SYSTEM_PROMPT
+        return "You are a clarification assistant."
+    return "You are a general assistant."
 
 
 def select_model_for_route(
@@ -78,23 +161,11 @@ def select_model_for_route(
 ) -> str:
     if decision.route == RouteType.VISION:
         return settings.vision_model
-
     if decision.route == RouteType.CODE:
         return settings.coder_model
-
-    return settings.general_model
-
-
-def _state_messages_to_chat_messages(
-    messages: list[dict[str, Any]] | None,
-) -> list[ChatMessage]:
-    if not messages:
-        return []
-
-    return [
-        ChatMessage.model_validate(message)
-        for message in messages
-    ]
+    if decision.route in (RouteType.RAG, RouteType.TOOLS, RouteType.MULTI_STEP):
+        return settings.controller_model
+    return settings.controller_model
 
 
 def build_generation_messages(
@@ -107,114 +178,14 @@ def build_generation_messages(
     memory_context: str = "",
     latest_user_message: str | None = None,
 ) -> list[ChatMessage]:
+    return build_controller_messages(
+        system_prompt=system_prompt,
+        messages=messages,
+        vision_context=vision_context,
+        knowledge_result=knowledge_result,
+        latest_user_message=latest_user_message,
+    )
 
-    outgoing: list[ChatMessage] = [
-        ChatMessage(
-            role=ChatRole.SYSTEM,
-            content=system_prompt,
-        )
-    ]
 
-    #
-    # Knowledge Context
-    #
-
-    if knowledge_result:
-        context = (knowledge_result.context or "").strip()
-
-        if context:
-            outgoing.append(
-                ChatMessage(
-                    role=ChatRole.SYSTEM,
-                    metadata={
-                        "source": "knowledge_service",
-                    },
-                    content=f"""
-                        Knowledge Context
-
-                        Use only the information below when answering.
-
-                        Do not infer, assume, or invent facts that are not explicitly supported by this context.
-
-                        If the answer is not documented here, clearly state that instead of guessing.
-
-                        {context}
-                    """.strip(),
-                )
-            )
-
-    #
-    # Vision Context
-    #
-
-    if vision_context:
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={
-                    "source": "vision",
-                },
-                content=build_vision_injection_message(
-                    vision_context,
-                    latest_user_message
-                    or last_user_text(messages),
-                ),
-            )
-        )
-
-    #
-    # Memory Context
-    #
-
-    if memory_context:
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={
-                    "source": "memory",
-                },
-                content=memory_context,
-            )
-        )
-
-    #
-    # MCP / Tool Context
-    #
-
-    if mcp_context:
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={
-                    "source": "mcp",
-                },
-                content=mcp_context,
-            )
-        )
-
-    #
-    # Conversation History
-    #
-
-    history_messages = _state_messages_to_chat_messages(messages)
-    outgoing.extend(history_messages)
-
-    #
-    # Latest User Message (fallback)
-    #
-
-    if (
-        latest_user_message
-        and (
-            not history_messages
-            or last_user_text(messages) != latest_user_message
-        )
-    ):
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.USER,
-                content=latest_user_message,
-            )
-        )
-
-    return outgoing
+def build_vision_injection_block(context_markdown: str, user_text: str = "") -> str:
+    return build_vision_injection_message(context_markdown, user_text)

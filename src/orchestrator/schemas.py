@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any
+from enum import Enum, StrEnum
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,20 @@ class ToolType(str, Enum):
     MCP = "mcp"
     KNOWLEDGE = "knowledge"
     OLLAMA = "ollama"
+
+
+class SpecialistType(StrEnum):
+    KNOWLEDGE = "knowledge"
+    VISION = "vision"
+    CODER = "coder"
+    TOOLS = "tools"
+
+
+class ControllerAction(StrEnum):
+    CONTINUE = "continue"
+    FINALIZE = "finalize"
+    REASON = "reason"
+    CLARIFY = "clarify"
 
 
 class ChatRole(str, Enum):
@@ -59,6 +73,43 @@ class RouteDecision(BaseModel):
     needs_code: bool = False
     needs_planning: bool = False
     candidate_models: list[str] = Field(default_factory=list)
+
+
+class ToolRequest(BaseModel):
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
+
+
+class ControllerPlan(BaseModel):
+    intent: str = ""
+    summary: str = ""
+    complexity: Literal["low", "medium", "high"] = "medium"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    requires_vision: bool = False
+    requires_knowledge: bool = False
+    requires_coder: bool = False
+    requires_tools: bool = False
+    requires_reasoning: bool = False
+    requires_clarification: bool = False
+
+    clarification_question: str | None = None
+    tool_requests: list[ToolRequest] = Field(default_factory=list)
+    execution_steps: list[SpecialistType] = Field(default_factory=list)
+
+    route_hint: RouteDecision | None = None
+
+
+class ControllerValidation(BaseModel):
+    action: ControllerAction = ControllerAction.CONTINUE
+    summary: str = ""
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    needs_reasoning: bool = False
+    final_answer_ready: bool = False
+    next_steps: list[SpecialistType] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
+    notes: str = ""
 
 
 class KnowledgeRetrieveRequest(BaseModel):
@@ -111,17 +162,42 @@ class ModelGenerationResponse(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+class CoderResult(BaseModel):
+    task: str = ""
+    summary: str = ""
+    code: str = ""
+    files: list[str] = Field(default_factory=list)
+    tests: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    raw_text: str = ""
+
+
+class ToolResult(BaseModel):
+    tool_name: str = ""
+    status: str = "ok"
+    summary: str = ""
+    result: dict[str, Any] = Field(default_factory=dict)
+    raw_text: str = ""
+
+
 class OrchestratorResponse(BaseModel):
     thread_id: str
-    route: RouteDecision
+    route: RouteDecision | None = None
+    controller_plan: ControllerPlan | None = None
+    controller_validation: ControllerValidation | None = None
     answer: str
     used_models: list[str] = Field(default_factory=list)
     used_tools: list[str] = Field(default_factory=list)
     knowledge_result: KnowledgeRetrieveResponse | None = None
     vision: VisionAnalysis | None = None
     vision_context: str = ""
+    coder_result: CoderResult | None = None
+    tool_result: ToolResult | None = None
+    reasoning: ModelGenerationResponse | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-    
+
+
 class OpenAIMessage(BaseModel):
     role: str
     content: str | list[dict[str, Any]]

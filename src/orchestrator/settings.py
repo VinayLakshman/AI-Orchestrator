@@ -24,14 +24,24 @@ class Settings(BaseSettings):
 
     # Ollama / local models
     ollama_base_url: str = "http://ollama:11434"
-    general_model: str = "qwen3:14b"
-    coder_model: str = "qwen2.5-coder:7b"
-    vision_model: str = "qwen2.5vl:7b"
+    ollama_keep_alive: str = "30m"
+    ollama_num_parallel: int = 1
+    ollama_max_loaded_models: int = 2
 
-    # Optional small router model. Leave empty to use deterministic + heuristic routing only.
-    router_model: str | None = None
-    router_timeout_s: float = 8.0
-    routing_confidence_threshold: float = 0.65
+    controller_model: str = "qwen3:4b"
+    reasoning_model: str = "qwen3:14b"
+    coder_model: str = "qwen2.5-coder:7b"
+    vision_model: str = "qwen2.5-vl:7b"
+    embedding_model: str = "nomic-embed-text"
+
+    controller_keep_alive: str = "30m"
+    reasoning_keep_alive: str = "15m"
+    controller_temperature: float = 0.15
+    reasoning_temperature: float = 0.2
+    controller_max_tokens: int = 1024
+    reasoning_max_tokens: int = 1600
+    coder_max_tokens: int = 1200
+    vision_max_tokens: int = 1200
 
     # Knowledge service
     knowledge_service_url: str = "http://knowledge-service:8000"
@@ -58,6 +68,7 @@ class Settings(BaseSettings):
 
     # Runtime limits
     max_context_messages: int = 24
+    max_controller_cycles: int = 6
     max_tool_rounds: int = 4
     request_timeout_s: float = 300.0
 
@@ -69,10 +80,14 @@ class Settings(BaseSettings):
     enable_streaming: bool = True
     enable_rag: bool = True
     enable_vision: bool = True
-    enable_mcp: bool = True
 
-    # Optional shared secret for internal endpoints
-    internal_api_key: SecretStr | None = None
+    @property
+    def general_model(self) -> str:
+        return self.controller_model
+
+    @property
+    def router_model(self) -> str | None:
+        return None
 
 
 @lru_cache(maxsize=1)

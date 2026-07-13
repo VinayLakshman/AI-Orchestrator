@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from enum import Enum
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 
-class VisionTaskType(str, Enum):
+class VisionTaskType(StrEnum):
     OCR = "ocr"
     SCREENSHOT = "screenshot"
     TERMINAL = "terminal"
@@ -17,29 +18,28 @@ class VisionTaskType(str, Enum):
     MIXED = "mixed"
 
 
-class ResolvedImage(BaseModel):
-    ref: str
-    mime_type: str = "image/png"
-    sha256: str
-    base64_data: str
-
-
 class VisionAnalysis(BaseModel):
-    task_type: VisionTaskType
-    confidence: float = Field(ge=0.0, le=1.0)
-    summary: str
-
+    task_type: VisionTaskType = VisionTaskType.MIXED
+    confidence: float = 0.0
+    summary: str = ""
     ocr: str = ""
     layout: str = ""
     metrics: str = ""
     errors_warnings: str = ""
     observations: str = ""
     answer_context: str = ""
-
     image_count: int = 0
     source_model: str = ""
     raw_text: str = ""
     hashes: list[str] = Field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ResolvedImage:
+    base64_data: str
+    mime_type: str
+    sha256: str
+    source: str
 
 
 class VisionResult(BaseModel):

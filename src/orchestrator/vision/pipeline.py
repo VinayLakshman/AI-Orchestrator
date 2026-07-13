@@ -1,78 +1,57 @@
 from __future__ import annotations
 
-import json
-import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
+from ..logging import get_logger
+from ..schemas import ChatMessage
 from ..settings import Settings
-from .detector import infer_vision_task
-
+from .detector import infer_vision_task, VisionTaskType
 from .fetcher import (
     collect_latest_message_images,
     extract_latest_user_text,
-    strip_images_from_messages,
     resolve_image_ref,
+    strip_images_from_messages,
 )
-from .models import ResolvedImage, VisionAnalysis, VisionResult, VisionTaskType
+from .models import ResolvedImage, VisionAnalysis, VisionResult
 from .prompts import build_vision_system_prompt, render_vision_context
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
+@dataclass
 class VisionPipeline:
-    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
-        self.settings = settings
-        self.client = client
-        self._cache: dict[str, VisionResult] = {}
+    settings: Settings
+    client: httpx.AsyncClient
+    _cache: dict[str, VisionResult] = field(default_factory=dict)
 
-    @staticmethod
-    def _parse_ollama_content(response: Any) -> str:
-        try:
-            if isinstance(response, dict):
-                if "message" in response and isinstance(response["message"], dict):
-                    return response["message"].get("content", "") or ""
-
-                if "response" in response:
-                    return str(response.get("response") or "").strip()
-
-                if "content" in response:
-                    content = response["content"]
-                    if isinstance(content, list):
-                        return "\n".join(
-                            part.get("text", "")
-                            for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        ).strip()
-                    return str(content or "").strip()
-
-                if "choices" in response and response["choices"]:
-                    return response["choices"][0].get("message", {}).get("content", "") or ""
-
-            return str(response or "").strip()
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _extract_json_object(raw_text: str) -> dict[str, Any]:
-        text = (raw_text or "").strip()
+    def _extract_json_object(self, text: str) -> dict[str, Any]:
+        text = (text or "").strip()
         if not text:
             return {}
-
         if text.startswith("```"):
             text = text.strip("`").strip()
             if text.lower().startswith("json"):
                 text = text[4:].strip()
-
         start = text.find("{")
         end = text.rfind("}")
-        candidate = text
+        candidate = text[start : end + 1] if start != -1 and end != -1 and end > start else text
+        try:
+            import json
+            return json.loads(candidate)
+        except Exception:
+            return {}
 
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start : end + 1]
-
-        return json.loads(candidate)
+    def _parse_ollama_content(self, data: dict[str, Any]) -> str:
+        if isinstance(data.get("message"), dict):
+            content = data["message"].get("content")
+            if isinstance(content, str):
+                return content
+        if isinstance(data.get("response"), str):
+            return data["response"]
+        return ""
 
     def _build_fallback_analysis(
         self,
@@ -82,20 +61,17 @@ class VisionPipeline:
         hashes: list[str],
         raw_text: str,
     ) -> VisionAnalysis:
-        fallback = (raw_text or "").strip()
-        if not fallback:
-            fallback = "Vision model returned no structured output."
-
+        summary = raw_text.strip()[:500] or f"Analyzed {image_count} image(s)."
         return VisionAnalysis(
             task_type=task_type,
-            confidence=0.35,
-            summary=fallback[:500],
+            confidence=0.55,
+            summary=summary,
             ocr="",
             layout="",
             metrics="",
             errors_warnings="",
-            observations=fallback[:1000],
-            answer_context=fallback[:1500],
+            observations=summary,
+            answer_context=summary,
             image_count=image_count,
             source_model=self.settings.vision_model,
             raw_text=raw_text,
@@ -264,7 +240,14 @@ class VisionPipeline:
                     hashes=image_hashes,
                     raw_text=str(exc),
                 ),
-                context_markdown="",
+                context_markdown=render_vision_context(
+                    self._build_fallback_analysis(
+                        task_type=task_type,
+                        image_count=len(resolved_images),
+                        hashes=image_hashes,
+                        raw_text=str(exc),
+                    )
+                ),
                 cleaned_messages=cleaned_messages,
                 image_hashes=image_hashes,
                 cache_hit=False,

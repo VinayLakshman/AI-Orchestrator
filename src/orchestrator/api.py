@@ -13,6 +13,10 @@ from .graph import OrchestratorRuntime
 from .schemas import (
     ChatMessage,
     ChatRequest,
+    ControllerPlan,
+    ControllerValidation,
+    CoderResult,
+    ModelGenerationResponse,
     KnowledgeRetrieveResponse,
     OpenAIChatCompletionChoice,
     OpenAIChatCompletionRequest,
@@ -22,6 +26,8 @@ from .schemas import (
     OpenAIModelListResponse,
     OrchestratorResponse,
     RouteDecision,
+    SpecialistType,
+    ToolResult,
 )
 from .settings import get_settings
 from .streaming import StreamKind, StreamPublisher, openai_chunk, openai_done, stream_scope
@@ -100,25 +106,97 @@ def _input_state_from_request(
         "used_models": [],
         "used_tools": [],
         "knowledge_result": None,
+        "vision": None,
+        "vision_context": "",
+        "coder_result": None,
+        "tool_result": None,
+        "reasoning_result": None,
+        "pending_steps": [],
+        "completed_steps": [],
+        "needs_reasoning": False,
+        "requires_clarification": False,
+        "final_answer_ready": False,
     }
 
 
-def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorResponse:
-    route = RouteDecision.model_validate(state.get("route") or {})
-    knowledge_result = state.get("knowledge_result")
+def _route_from_state(state: dict[str, Any]) -> RouteDecision | None:
+    route = state.get("route")
+    if route is None:
+        plan = state.get("controller_plan")
+        if isinstance(plan, dict):
+            route = plan.get("route_hint")
+    if route is None:
+        return None
+    return RouteDecision.model_validate(route)
 
+
+def _knowledge_from_state(state: dict[str, Any]) -> KnowledgeRetrieveResponse | None:
+    knowledge_result = state.get("knowledge_result")
     if isinstance(knowledge_result, dict):
-        knowledge_result = KnowledgeRetrieveResponse.model_validate(knowledge_result)
+        return KnowledgeRetrieveResponse.model_validate(knowledge_result)
+    if isinstance(knowledge_result, KnowledgeRetrieveResponse):
+        return knowledge_result
+    return None
+
+
+def _controller_plan_from_state(state: dict[str, Any]) -> ControllerPlan | None:
+    value = state.get("controller_plan")
+    if isinstance(value, dict):
+        return ControllerPlan.model_validate(value)
+    if isinstance(value, ControllerPlan):
+        return value
+    return None
+
+
+def _controller_validation_from_state(state: dict[str, Any]) -> ControllerValidation | None:
+    value = state.get("controller_validation")
+    if isinstance(value, dict):
+        return ControllerValidation.model_validate(value)
+    if isinstance(value, ControllerValidation):
+        return value
+    return None
+
+
+def _coder_from_state(state: dict[str, Any]) -> CoderResult | None:
+    value = state.get("coder_result")
+    if isinstance(value, dict):
+        return CoderResult.model_validate(value)
+    if isinstance(value, CoderResult):
+        return value
+    return None
+
+
+def _tool_from_state(state: dict[str, Any]) -> ToolResult | None:
+    value = state.get("tool_result")
+    if isinstance(value, dict):
+        return ToolResult.model_validate(value)
+    if isinstance(value, ToolResult):
+        return value
+    return None
+
+
+def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorResponse:
+    answer = str(state.get("answer", "") or "")
+    reasoning = state.get("reasoning_result")
+    if isinstance(reasoning, dict):
+        reasoning = ModelGenerationResponse.model_validate(reasoning)
+    elif reasoning is not None and not isinstance(reasoning, ModelGenerationResponse):
+        reasoning = None
 
     return OrchestratorResponse(
         thread_id=thread_id,
-        route=route,
-        answer=state.get("answer", ""),
+        route=_route_from_state(state),
+        controller_plan=_controller_plan_from_state(state),
+        controller_validation=_controller_validation_from_state(state),
+        answer=answer,
         used_models=state.get("used_models", []),
         used_tools=state.get("used_tools", []),
-        knowledge_result=knowledge_result,
+        knowledge_result=_knowledge_from_state(state),
         vision=state.get("vision"),
         vision_context=state.get("vision_context", ""),
+        coder_result=_coder_from_state(state),
+        tool_result=_tool_from_state(state),
+        reasoning=reasoning,
         metadata=state.get("metadata", {}),
     )
 
@@ -132,20 +210,17 @@ async def _run_graph_with_stream(
     publisher: StreamPublisher,
 ) -> dict[str, Any]:
     async with stream_scope(publisher):
-        await publisher.graph_started(route_hint=state_input.get("metadata", {}).get("requested_model"))
+        await publisher.graph_started()
         try:
             result = await runtime.graph.ainvoke(
                 state_input,
                 config={"configurable": {"thread_id": thread_id}},
             )
-            route_name = result.get("route_name") or result.get("route", {}).get("route")
-            await publisher.graph_finished(route=route_name)
+            await publisher.graph_finished(route=(result.get("route") or {}).get("route") if isinstance(result.get("route"), dict) else None)
             return result
         except Exception as exc:
             await publisher.graph_failed(str(exc))
             raise
-        finally:
-            await runtime.stream_hub.close(request_id)
 
 
 def _request_headers_out(request_id: str, thread_id: str) -> dict[str, str]:
@@ -173,15 +248,16 @@ async def readyz(runtime: OrchestratorRuntime = Depends(get_runtime)) -> dict[st
 
 
 @router.get("/v1/models", response_model=OpenAIModelListResponse)
-async def list_models() -> OpenAIModelListResponse:
-    settings = get_settings()
-
+async def list_models(runtime: OrchestratorRuntime = Depends(get_runtime)) -> OpenAIModelListResponse:
+    settings = runtime.settings
     return OpenAIModelListResponse(
         data=[
             OpenAIModelCard(id="orchestrator", owned_by="local"),
-            OpenAIModelCard(id=settings.general_model, owned_by="local"),
+            OpenAIModelCard(id=settings.controller_model, owned_by="local"),
+            OpenAIModelCard(id=settings.reasoning_model, owned_by="local"),
             OpenAIModelCard(id=settings.coder_model, owned_by="local"),
             OpenAIModelCard(id=settings.vision_model, owned_by="local"),
+            OpenAIModelCard(id=settings.embedding_model, owned_by="local"),
         ]
     )
 
@@ -239,123 +315,66 @@ async def openai_chat_completions(
     request: Request,
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ):
-    chat_request = _to_chat_request(payload)
-    thread_id = _thread_id_from_request(chat_request)
-    request_id = f"chatcmpl-{uuid4().hex}"
+    request_id = str(uuid4())
+    thread_id = _thread_id_from_request(_to_chat_request(payload))
+    chat_request = _to_chat_request(payload, thread_id=thread_id)
+    state_input = _input_state_from_request(chat_request, request, request_id=request_id)
 
-    state_input = _input_state_from_request(
-        chat_request,
-        request,
-        request_id=request_id,
-    )
-
-    headers = _request_headers_out(request_id, thread_id)
-
-    if not payload.stream:
-        result = await runtime.graph.ainvoke(
-            state_input,
-            config={
-                "configurable": {
-                    "thread_id": thread_id,
-                },
-            },
-        )
-
-        answer = result.get("answer", "")
-        model_used = (
-            result.get("used_models")
-            or [payload.model or "orchestrator"]
-        )[-1]
-
-        return JSONResponse(
-            content=OpenAIChatCompletionResponse(
-                id=request_id,
-                created=int(time()),
-                model=model_used,
-                choices=[
-                    OpenAIChatCompletionChoice(
-                        index=0,
-                        message=OpenAIMessage(
-                            role="assistant",
-                            content=answer,
-                        ),
-                        finish_reason="stop",
-                    )
-                ],
-                metadata={
-                    "thread_id": thread_id,
-                    "route": result.get("route", {}).get("route"),
-                    "used_models": result.get("used_models", []),
-                    "used_tools": result.get("used_tools", []),
-                },
-            ).model_dump(mode="json"),
-            headers=headers,
-        )
-
-    stream = await runtime.stream_hub.create(request_id=request_id, conversation_id=thread_id)
+    stream = runtime.stream_hub.get_or_create(request_id, conversation_id=thread_id)
     publisher = StreamPublisher(stream)
 
-    graph_task = asyncio.create_task(
-        _run_graph_with_stream(
-            runtime=runtime,
-            request_id=request_id,
-            thread_id=thread_id,
-            state_input=state_input,
-            publisher=publisher,
-        ),
-        name=f"orchestrator-stream-{request_id}",
+    if payload.stream:
+        async def sse_generator():
+            result: dict[str, Any] | None = None
+            try:
+                result = await _run_graph_with_stream(
+                    runtime=runtime,
+                    request_id=request_id,
+                    thread_id=thread_id,
+                    state_input=state_input,
+                    publisher=publisher,
+                )
+                answer = str((result or {}).get("answer", "") or "")
+                if answer:
+                    yield openai_chunk(
+                        id=request_id,
+                        model=str(payload.model),
+                        content=answer,
+                        request_id=request_id,
+                    )
+                yield openai_done()
+            finally:
+                await stream.close()
+
+        return StreamingResponse(
+            sse_generator(),
+            media_type="text/event-stream",
+            headers=_request_headers_out(request_id, thread_id),
+        )
+
+    result = await runtime.graph.ainvoke(
+        state_input,
+        config={"configurable": {"thread_id": thread_id}},
     )
 
-    async def event_gen():
-        assistant_role_sent = False
-
-        try:
-            async for event in stream.subscribe(after_seq=0):
-                if event.kind == StreamKind.LLM_TOKEN:
-                    token = str(event.data.get("token") or "")
-                    if not assistant_role_sent:
-                        assistant_role_sent = True
-                        yield openai_chunk(
-                            request_id=request_id,
-                            model=payload.model,
-                            delta={"role": "assistant"},
-                        )
-                    if token:
-                        yield openai_chunk(
-                            request_id=request_id,
-                            model=payload.model,
-                            delta={"content": token},
-                        )
-
-            with suppress(Exception):
-                await graph_task
-
-            if not assistant_role_sent:
-                yield openai_chunk(
-                    request_id=request_id,
-                    model=payload.model,
-                    delta={"role": "assistant"},
-                )
-
-            yield openai_chunk(
-                request_id=request_id,
-                model=payload.model,
-                delta={},
+    answer = str((result or {}).get("answer", "") or "")
+    completion = OpenAIChatCompletionResponse(
+        id=request_id,
+        created=int(time()),
+        model=str(payload.model),
+        choices=[
+            OpenAIChatCompletionChoice(
+                index=0,
+                message=OpenAIMessage(role="assistant", content=answer),
                 finish_reason="stop",
             )
-            yield openai_done()
-
-        except asyncio.CancelledError:
-            graph_task.cancel()
-            raise
-        finally:
-            if not graph_task.done():
-                graph_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await graph_task
-
-    return StreamingResponse(
-        event_gen(),
-        media_type="text/event-stream",
-        headers=headers,
+        ],
+        metadata={
+            "thread_id": thread_id,
+            "request_id": request_id,
+        },
     )
+
+    await stream.close()
+
+    return completion

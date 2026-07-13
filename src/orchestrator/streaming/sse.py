@@ -1,33 +1,24 @@
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 
-def openai_chunk(
-    *,
-    request_id: str,
-    model: str,
-    delta: dict[str, Any],
-    created: int | None = None,
-    finish_reason: str | None = None,
-    index: int = 0,
-) -> str:
+def openai_chunk(*, id: str, model: str, content: str, request_id: str | None = None) -> str:
     payload = {
-        "id": request_id,
+        "id": id,
         "object": "chat.completion.chunk",
-        "created": created or int(time.time()),
         "model": model,
+        "request_id": request_id,
         "choices": [
             {
-                "index": index,
-                "delta": delta,
-                "finish_reason": finish_reason,
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None,
             }
         ],
     }
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 def openai_done() -> str:

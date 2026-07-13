@@ -2,115 +2,57 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..context.builder import last_user_text
-from ..graph.state import OrchestratorState
-from ..schemas import ChatMessage, ChatRole, KnowledgeRetrieveResponse
-
-
-def build_retrieval_failure_response(
-    state: OrchestratorState,
-    knowledge_result: KnowledgeRetrieveResponse,
-) -> dict[str, Any]:
-    query = last_user_text(state.get("messages", []))
-
-    retrieval_reason = (
-        knowledge_result.retrieval_reason
-        or "Knowledge retrieval did not produce a grounded result"
-    )
-
-    confidence = knowledge_result.confidence
-
-    answer = (
-        "I couldn't answer this from your indexed knowledge base.\n\n"
-        f"Query:\n{query}\n\n"
-        f"Reason:\n{retrieval_reason}\n\n"
-        "The orchestrator intentionally stopped before calling the language model "
-        "because answering without grounded knowledge could produce hallucinated information."
-    )
-
-    assistant = ChatMessage(
-        role=ChatRole.ASSISTANT,
-        content=answer,
-        metadata={
-            "grounded": False,
-            "retrieval_failed": True,
-            "retrieval_reason": retrieval_reason,
-            "confidence": confidence,
-            "intent": knowledge_result.intent,
-        },
-    )
-
-    return {
-        "answer": answer,
-        "messages": [
-            *state.get("messages", []),
-            assistant.model_dump(exclude_none=True),
-        ],
-        "used_models": state.get("used_models", []),
-        "used_tools": state.get("used_tools", []),
-        "metadata": {
-            **state.get("metadata", {}),
-            "rag_grounded": False,
-            "retrieval_reason": retrieval_reason,
-            "retrieval_confidence": confidence,
-            "retrieval_intent": knowledge_result.intent,
-        },
-    }
+from ..schemas import (
+    CoderResult,
+    ControllerPlan,
+    ControllerValidation,
+    KnowledgeRetrieveResponse,
+    ModelGenerationResponse,
+    OrchestratorResponse,
+    RouteDecision,
+    ToolResult,
+)
 
 
 def build_generation_response(
-    state: OrchestratorState,
-    generation: Any,
-    model: str,
+    *,
+    thread_id: str,
+    answer: str,
+    route: RouteDecision | None = None,
+    controller_plan: ControllerPlan | None = None,
+    controller_validation: ControllerValidation | None = None,
     knowledge_result: KnowledgeRetrieveResponse | None = None,
-) -> dict[str, Any]:
-    content = (
-        generation.content.strip()
-        if getattr(generation, "content", None)
-        else str(generation)
+    coder_result: CoderResult | None = None,
+    tool_result: ToolResult | None = None,
+    reasoning: ModelGenerationResponse | None = None,
+    used_models: list[str] | None = None,
+    used_tools: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> OrchestratorResponse:
+    return OrchestratorResponse(
+        thread_id=thread_id,
+        route=route,
+        controller_plan=controller_plan,
+        controller_validation=controller_validation,
+        answer=answer,
+        used_models=used_models or [],
+        used_tools=used_tools or [],
+        knowledge_result=knowledge_result,
+        coder_result=coder_result,
+        tool_result=tool_result,
+        reasoning=reasoning,
+        metadata=metadata or {},
     )
 
-    grounded = knowledge_result.grounded if knowledge_result else False
-    confidence = knowledge_result.confidence if knowledge_result else None
-    retrieval_reason = (
-        knowledge_result.retrieval_reason
-        if knowledge_result
-        else None
-    )
-    intent = knowledge_result.intent if knowledge_result else None
 
-    assistant = ChatMessage(
-        role=ChatRole.ASSISTANT,
-        content=content,
-        metadata={
-            "model": model,
-            "route": state.get("route", {}).get("route")
-            or state.get("route_name"),
-            "grounded": grounded,
-            "confidence": confidence,
-            "retrieval_reason": retrieval_reason,
-            "intent": intent,
-        },
+def build_retrieval_failure_response(
+    *,
+    thread_id: str,
+    message: str,
+    metadata: dict[str, Any] | None = None,
+) -> OrchestratorResponse:
+    return OrchestratorResponse(
+        thread_id=thread_id,
+        answer=message,
+        metadata=metadata or {},
     )
-
-    return {
-        "answer": assistant.content,
-        "messages": [
-            *state.get("messages", []),
-            assistant.model_dump(exclude_none=True),
-        ],
-        "used_models": list(
-            dict.fromkeys(
-                state.get("used_models", []) + [model]
-            )
-        ),
-        "used_tools": state.get("used_tools", []),
-        "metadata": {
-            **state.get("metadata", {}),
-            "generation_model": model,
-            "rag_grounded": grounded,
-            "retrieval_confidence": confidence,
-            "retrieval_reason": retrieval_reason,
-            "retrieval_intent": intent,
-        },
-    }

@@ -1,25 +1,24 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, TYPE_CHECKING
 
-from .publisher import StreamPublisher
-
-
-_current_stream: ContextVar[StreamPublisher | None] = ContextVar(
-    "current_stream",
-    default=None,
-)
+if TYPE_CHECKING:
+    from .publisher import StreamPublisher
 
 
-def get_current_stream() -> StreamPublisher | None:
+_current_stream: ContextVar[StreamPublisher | None] = ContextVar("current_stream", default=None)
+
+
+def get_current_stream():
     return _current_stream.get()
 
 
 @asynccontextmanager
-async def stream_scope(publisher: StreamPublisher):
-    token = _current_stream.set(publisher)
+async def stream_scope(stream: StreamPublisher) -> AsyncIterator[StreamPublisher]:
+    token = _current_stream.set(stream)
     try:
-        yield publisher
+        yield stream
     finally:
         _current_stream.reset(token)

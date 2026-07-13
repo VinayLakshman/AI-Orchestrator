@@ -1,26 +1,49 @@
 from __future__ import annotations
 
 from typing import Any, TypedDict
-from ..schemas import KnowledgeRetrieveResponse
+
+from ..schemas import (
+    ControllerPlan,
+    ControllerValidation,
+    CoderResult,
+    KnowledgeRetrieveResponse,
+    ModelGenerationResponse,
+    RouteDecision,
+    ToolResult,
+)
 
 
 class OrchestratorState(TypedDict, total=False):
     thread_id: str
+    request_id: str
+
     messages: list[dict[str, Any]]
-    route: dict[str, Any]
-    route_name: str
+    metadata: dict[str, Any]
 
-    vision: dict[str, Any]
+    user_text: str
+    has_images: bool
+
+    route: dict[str, Any] | RouteDecision
+    controller_plan: dict[str, Any] | ControllerPlan
+    controller_validation: dict[str, Any] | ControllerValidation
+
+    pending_steps: list[str]
+    completed_steps: list[str]
+    current_step: str
+    needs_reasoning: bool
+    requires_clarification: bool
+    clarification_question: str
+
+    knowledge_result: KnowledgeRetrieveResponse | dict[str, Any] | None
+    vision: dict[str, Any] | None
     vision_context: str
-    vision_task: str
-    vision_confidence: float
-    vision_image_hashes: list[str]
-    vision_cache_hit: bool
-
-    knowledge_result:  KnowledgeRetrieveResponse | None
+    coder_result: CoderResult | dict[str, Any] | None
+    tool_result: ToolResult | dict[str, Any] | None
+    reasoning_result: ModelGenerationResponse | dict[str, Any] | None
 
     used_models: list[str]
     used_tools: list[str]
+
     answer: str
-    metadata: dict[str, Any]
+    final_answer_ready: bool
     error: str

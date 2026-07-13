@@ -42,6 +42,7 @@ class OllamaClient:
         max_tokens: int | None = None,
         stream: bool = False,
         options: dict[str, Any] | None = None,
+        keep_alive: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model,
@@ -54,6 +55,8 @@ class OllamaClient:
             payload["options"]["temperature"] = temperature
         if max_tokens is not None:
             payload["options"]["num_predict"] = max_tokens
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
 
         return payload
 
@@ -106,6 +109,7 @@ class OllamaClient:
         max_tokens: int | None = None,
         stream: bool = False,
         options: dict[str, Any] | None = None,
+        keep_alive: str | None = None,
     ) -> ModelGenerationResponse:
         if stream:
             content = []
@@ -116,16 +120,12 @@ class OllamaClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 options=options,
+                keep_alive=keep_alive,
             ):
                 if chunk.content:
                     content.append(chunk.content)
                 final_raw = chunk.raw or final_raw
-
-            return ModelGenerationResponse(
-                model=model,
-                content="".join(content),
-                raw=final_raw,
-            )
+            return ModelGenerationResponse(model=model, content="".join(content).strip(), raw=final_raw)
 
         payload = self._build_payload(
             model,
@@ -134,16 +134,16 @@ class OllamaClient:
             max_tokens=max_tokens,
             stream=False,
             options=options,
+            keep_alive=keep_alive,
         )
 
-        client, close_client = await self._get_client(streaming=False)
-
+        client, close_client = await self._get_client()
         try:
             resp = await client.post("/api/chat", json=payload)
             resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
+            data = resp.json()
             content = self._extract_content(data)
-            return ModelGenerationResponse(model=model, content=content, raw=data)
+            return ModelGenerationResponse(model=model, content=content, raw=data if isinstance(data, dict) else {})
         finally:
             if close_client:
                 await client.aclose()
@@ -155,6 +155,7 @@ class OllamaClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         options: dict[str, Any] | None = None,
+        keep_alive: str | None = None,
     ) -> AsyncIterator[OllamaStreamChunk]:
         payload = self._build_payload(
             model,
@@ -163,42 +164,29 @@ class OllamaClient:
             max_tokens=max_tokens,
             stream=True,
             options=options,
+            keep_alive=keep_alive,
         )
 
         client, close_client = await self._get_client(streaming=True)
-
         try:
             async with client.stream("POST", "/api/chat", json=payload) as resp:
                 resp.raise_for_status()
-
                 async for line in resp.aiter_lines():
                     if not line:
                         continue
-
-                    raw_line = line.strip()
-                    if not raw_line:
+                    line = line.strip()
+                    if not line:
                         continue
-
                     try:
-                        data: dict[str, Any] = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    content = self._extract_content(data)
-                    done = bool(data.get("done", False))
-
-                    if not content and not done:
-                        # Preserve the final metadata chunk, skip empty interim chunks.
+                        data = json.loads(line)
+                    except Exception:
                         continue
 
                     yield OllamaStreamChunk(
-                        content=content,
-                        done=done,
-                        raw=data,
+                        content=self._extract_content(data),
+                        done=bool(data.get("done", False)),
+                        raw=data if isinstance(data, dict) else {},
                     )
-
-                    if done:
-                        break
         finally:
             if close_client:
                 await client.aclose()
