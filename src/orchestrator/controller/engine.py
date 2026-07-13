@@ -325,6 +325,30 @@ def _fallback_final_answer(state: dict[str, Any]) -> str:
     )
 
 
+def _extract_text_from_raw_response(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_extract_text_from_raw_response(item) for item in value]
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(value, dict):
+        for key in ("message", "response", "content", "assistant", "text"):
+            extracted = _extract_text_from_raw_response(value.get(key))
+            if extracted:
+                return extracted
+        if "choices" in value:
+            extracted = _extract_text_from_raw_response(value.get("choices"))
+            if extracted:
+                return extracted
+        if "messages" in value:
+            extracted = _extract_text_from_raw_response(value.get("messages"))
+            if extracted:
+                return extracted
+    return str(value).strip()
+
+
 def _specialist_evidence_summary(
     state: dict[str, Any],
     *,
@@ -743,7 +767,24 @@ class ControllerEngine:
         If specialist evidence exists, synthesize it into a user-facing answer.
         """
         latest_user_message = last_user_text(state.get("messages", []))
-        structured_context = self._structured_state_prompt(state)
+        plan = _coerce_plan(state.get("controller_plan"))
+        knowledge = _coerce_knowledge(state.get("knowledge_result"))
+        coder = _coerce_coder(state.get("coder_result"))
+        tool = _coerce_tool(state.get("tool_result"))
+        reasoning = _coerce_generation(state.get("reasoning_result"))
+
+        has_specialist_evidence = any(
+            [
+                knowledge and bool(knowledge.context),
+                coder and bool((coder.summary or coder.code).strip()),
+                tool and bool((tool.summary or tool.result or tool.raw_text)),
+                bool(str(state.get("vision_context", "") or "").strip()),
+                reasoning and bool(reasoning.content.strip()),
+            ]
+        )
+        structured_context = ""
+        if has_specialist_evidence and not (plan and plan.classification == "GENERAL"):
+            structured_context = self._structured_state_prompt(state)
 
         messages = [
             ChatMessage(role=ChatRole.SYSTEM, content=build_controller_final_prompt()),
@@ -765,13 +806,18 @@ class ControllerEngine:
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
         )
-        if not response.content.strip():
+        extracted = response.content.strip() or _extract_text_from_raw_response(response.raw)
+        if not extracted.strip():
             return ModelGenerationResponse(
                 model=response.model,
                 content=_fallback_final_answer(state),
                 raw=response.raw,
             )
-        return response
+        return ModelGenerationResponse(
+            model=response.model,
+            content=extracted.strip(),
+            raw=response.raw,
+        )
 
     async def reason(self, state: dict[str, Any]) -> ModelGenerationResponse:
         latest_user_message = last_user_text(state.get("messages", []))
