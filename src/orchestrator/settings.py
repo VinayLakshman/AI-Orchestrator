@@ -41,7 +41,8 @@ class Settings(BaseSettings):
     controller_temperature: float = 0.15
     reasoning_temperature: float = 0.2
     controller_max_tokens: int = 1024
-    reasoning_max_tokens: int = 1600
+    controller_final_max_tokens: int = 2048
+    reasoning_max_tokens: int = 2400
     coder_max_tokens: int = 1200
     vision_max_tokens: int = 1200
 

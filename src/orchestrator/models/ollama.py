@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -15,6 +16,16 @@ class OllamaStreamChunk(BaseModel):
     content: str
     done: bool
     raw: dict[str, Any] = Field(default_factory=dict)
+
+
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+_THINK_INLINE_RE = re.compile(r"</?think\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    cleaned = _THINK_INLINE_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def extract_assistant_text(value: Any) -> str:
@@ -37,7 +48,7 @@ def extract_assistant_text(value: Any) -> str:
             return ""
 
     if isinstance(value, str):
-        return value.strip()
+        return _strip_thinking(value)
 
     if isinstance(value, list):
         parts = [extract_assistant_text(item) for item in value]
@@ -84,6 +95,6 @@ def normalize_generation_response(model: str, value: Any) -> ModelGenerationResp
 
     return ModelGenerationResponse(
         model=model,
-        content=extract_assistant_text(value),
+        content=_strip_thinking(extract_assistant_text(value)),
         raw=raw,
     )

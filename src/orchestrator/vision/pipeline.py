@@ -16,6 +16,7 @@ from .fetcher import (
     strip_images_from_messages,
 )
 from ..models.vision import ResolvedImage, VisionAnalysis, VisionResult
+from ..models.ollama import extract_assistant_text
 from .prompts import build_vision_system_prompt, render_vision_context
 
 logger = get_logger(__name__)
@@ -45,13 +46,7 @@ class VisionPipeline:
             return {}
 
     def _parse_ollama_content(self, data: dict[str, Any]) -> str:
-        if isinstance(data.get("message"), dict):
-            content = data["message"].get("content")
-            if isinstance(content, str):
-                return content
-        if isinstance(data.get("response"), str):
-            return data["response"]
-        return ""
+        return extract_assistant_text(data)
 
     def _build_fallback_analysis(
         self,

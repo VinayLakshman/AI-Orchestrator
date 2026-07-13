@@ -508,7 +508,7 @@ class ControllerEngine:
             model=self.models.controller().name,
             messages=messages,
             temperature=self.settings.controller_temperature,
-            max_tokens=self.settings.controller_max_tokens,
+            max_tokens=self.settings.controller_final_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
             think=self.settings.controller_think,
