@@ -113,8 +113,13 @@ def _input_state_from_request(
         "reasoning_result": None,
         "pending_steps": [],
         "completed_steps": [],
+        "current_step": "",
         "needs_reasoning": False,
         "requires_clarification": False,
+        "controller_cycles": 0,
+        "specialist_executions": 0,
+        "workflow_stall_count": 0,
+        "last_progress_signature": "",
         "final_answer_ready": False,
     }
 

@@ -25,6 +25,9 @@ from .nodes import (
     make_reasoning_node,
     make_tools_node,
     make_vision_node,
+    _select_next_node,
+    _state_snapshot,
+    _log_transition,
 )
 from .state import OrchestratorState
 
@@ -98,30 +101,22 @@ def build_graph(
     builder.add_edge("prepare", "plan")
 
     def route_after_plan(state: OrchestratorState) -> str:
-        if state.get("requires_clarification"):
-            return "clarify"
-
-        pending = list(state.get("pending_steps", []) or [])
-        if pending:
-            return pending[0]
-
-        if state.get("needs_reasoning"):
-            return "reasoning"
-
-        return "finalize"
+        selected = _select_next_node(state)
+        _log_transition(
+            "route_after_plan",
+            selected_next_node=selected,
+            **_state_snapshot(state),
+        )
+        return selected
 
     def route_after_validate(state: OrchestratorState) -> str:
-        if state.get("requires_clarification"):
-            return "clarify"
-
-        pending = list(state.get("pending_steps", []) or [])
-        if pending:
-            return pending[0]
-
-        if state.get("needs_reasoning"):
-            return "reasoning"
-
-        return "finalize"
+        selected = _select_next_node(state)
+        _log_transition(
+            "route_after_validate",
+            selected_next_node=selected,
+            **_state_snapshot(state),
+        )
+        return selected
 
     builder.add_conditional_edges(
         "plan",

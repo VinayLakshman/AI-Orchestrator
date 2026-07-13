@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..clients.knowledge import KnowledgeClient
@@ -11,11 +12,15 @@ from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse
 from ..schemas import ControllerPlan, ControllerValidation, CoderResult, ToolResult
+from ..logging import get_logger
 from ..settings import Settings
 from ..streaming.context import get_current_stream
 from ..vision.fetcher import collect_latest_message_images, strip_images_from_messages
 from ..vision.pipeline import VisionPipeline
 from ..graph.state import OrchestratorState
+
+
+logger = get_logger(__name__)
 
 
 def _as_plan(value: Any) -> ControllerPlan | None:
@@ -77,20 +82,166 @@ def _step_from_pending(pending_steps: list[str] | None) -> SpecialistType | None
         return None
 
 
-def _pop_step(state: OrchestratorState, step: SpecialistType) -> dict[str, Any]:
+def _state_snapshot(state: OrchestratorState) -> dict[str, Any]:
+    return {
+        "current_step": state.get("current_step", ""),
+        "pending_steps": list(state.get("pending_steps", []) or []),
+        "completed_steps": list(state.get("completed_steps", []) or []),
+        "controller_cycles": int(state.get("controller_cycles", 0) or 0),
+        "specialist_executions": int(state.get("specialist_executions", 0) or 0),
+        "workflow_stall_count": int(state.get("workflow_stall_count", 0) or 0),
+    }
+
+
+def _log_transition(event: str, **payload: Any) -> None:
+    logger.info("%s %s", event, json.dumps(payload, sort_keys=True, default=str))
+
+
+def _merge_pending_steps(
+    pending_steps: list[str],
+    new_steps: list[SpecialistType],
+    *,
+    completed_steps: list[str],
+) -> list[str]:
+    explicit_requested = {step.value for step in new_steps}
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def add(step_name: str) -> None:
+        if step_name in seen:
+            return
+        seen.add(step_name)
+        merged.append(step_name)
+
+    for step_name in pending_steps:
+        if step_name and (step_name not in completed_steps or step_name in explicit_requested):
+            add(step_name)
+
+    for step in new_steps:
+        step_name = step.value
+        if not step_name:
+            continue
+        if step_name in seen:
+            continue
+        # Re-adding a completed step is only allowed when the controller
+        # explicitly requests it through validation.next_steps.
+        add(step_name)
+
+    return merged
+
+
+def _consume_current_step(
+    state: OrchestratorState,
+    *,
+    validation: ControllerValidation,
+    settings: Settings,
+) -> dict[str, Any]:
+    current_step = ""
+    if state.get("current_step"):
+        current_step = str(state["current_step"])
+    elif state.get("pending_steps"):
+        current_step = str(state["pending_steps"][0])
+
     pending = list(state.get("pending_steps", []) or [])
     completed = list(state.get("completed_steps", []) or [])
-    if pending and pending[0] == step.value:
-        pending.pop(0)
-    elif step.value in pending:
-        pending.remove(step.value)
-    if step.value not in completed:
-        completed.append(step.value)
-    return {
+
+    if current_step:
+        if pending and pending[0] == current_step:
+            pending.pop(0)
+        elif current_step in pending:
+            pending.remove(current_step)
+        if current_step not in completed:
+            completed.append(current_step)
+
+    if validation.next_steps:
+        pending = _merge_pending_steps(
+            pending,
+            list(validation.next_steps),
+            completed_steps=completed,
+        )
+
+    # Keep the workflow progressing only when the controller has a reason to.
+    if validation.action == ControllerAction.REASON:
+        needs_reasoning = True
+        requires_clarification = False
+    elif validation.action == ControllerAction.CLARIFY:
+        needs_reasoning = False
+        requires_clarification = True
+    elif validation.action == ControllerAction.FINALIZE:
+        needs_reasoning = False
+        requires_clarification = False
+        pending = []
+    else:
+        needs_reasoning = bool(validation.needs_reasoning or state.get("needs_reasoning", False))
+        requires_clarification = bool(state.get("requires_clarification", False))
+
+    controller_cycles = int(state.get("controller_cycles", 0) or 0) + 1
+    specialist_executions = int(state.get("specialist_executions", 0) or 0)
+
+    snapshot = {
+        "current_step": "",
         "pending_steps": pending,
         "completed_steps": completed,
-        "current_step": step.value,
+        "needs_reasoning": needs_reasoning,
+        "requires_clarification": requires_clarification,
     }
+    signature = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
+    previous_signature = str(state.get("last_progress_signature", "") or "")
+    stalled = int(state.get("workflow_stall_count", 0) or 0)
+    if signature == previous_signature:
+        stalled += 1
+    else:
+        stalled = 0
+
+    limit_hit = (
+        controller_cycles >= settings.max_controller_cycles
+        or specialist_executions >= settings.max_specialist_executions
+        or stalled >= settings.workflow_stall_limit
+    )
+
+    if limit_hit:
+        pending = []
+        needs_reasoning = False
+        requires_clarification = False
+
+    updates: dict[str, Any] = {
+        "current_step": "",
+        "pending_steps": pending,
+        "completed_steps": completed,
+        "needs_reasoning": needs_reasoning,
+        "requires_clarification": requires_clarification,
+        "controller_cycles": controller_cycles,
+        "specialist_executions": specialist_executions,
+        "workflow_stall_count": stalled,
+        "last_progress_signature": signature,
+    }
+
+    if limit_hit:
+        updates["error"] = (
+            "Workflow terminated safely after reaching a progress or execution limit."
+        )
+        updates["answer"] = updates["error"]
+        updates["final_answer_ready"] = True
+
+    return updates
+
+
+def _step_update(state: OrchestratorState, step: SpecialistType) -> dict[str, Any]:
+    return {
+        "current_step": step.value,
+        "specialist_executions": int(state.get("specialist_executions", 0) or 0) + 1,
+    }
+
+
+def _select_next_node(state: OrchestratorState) -> str:
+    pending = list(state.get("pending_steps", []) or [])
+    if pending:
+        return pending[0]
+    if state.get("needs_reasoning"):
+        return "reasoning"
+    if state.get("requires_clarification"):
+        return "clarify"
+    return "finalize"
 
 
 def _update_used_models(state: OrchestratorState, model_name: str) -> list[str]:
@@ -162,11 +313,33 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
             }
         )
 
+        _log_transition(
+            "controller_plan",
+            controller_decision=route.route.value,
+            selected_next_node=_select_next_node(
+                {
+                    **state,
+                    "pending_steps": pending_steps,
+                    "needs_reasoning": bool(plan.requires_reasoning),
+                    "requires_clarification": bool(plan.requires_clarification),
+                    "current_step": "",
+                }
+            ),
+            **_state_snapshot({
+                **state,
+                "pending_steps": pending_steps,
+                "needs_reasoning": bool(plan.requires_reasoning),
+                "requires_clarification": bool(plan.requires_clarification),
+                "current_step": "",
+            }),
+        )
+
         return {
             "controller_plan": plan.model_dump(exclude_none=True),
             "route": route.model_dump(),
             "pending_steps": pending_steps,
-            "completed_steps": [],
+            "completed_steps": list(state.get("completed_steps", []) or []),
+            "current_step": "",
             "needs_reasoning": bool(plan.requires_reasoning),
             "requires_clarification": bool(plan.requires_clarification),
             "clarification_question": plan.clarification_question or "",
@@ -179,8 +352,15 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
 def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
     async def vision_node(state: OrchestratorState) -> dict[str, Any]:
+        updates = _step_update(state, SpecialistType.VISION)
         if not settings.enable_vision:
-            return {}
+            _log_transition(
+                "specialist_complete",
+                specialist=SpecialistType.VISION.value,
+                **_state_snapshot({**state, **updates}),
+                selected_next_node="validate",
+            )
+            return updates
 
         stream = get_current_stream()
         image_refs = collect_latest_message_images(state.get("messages", []), settings.vision_max_images)
@@ -193,7 +373,14 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             cleaned = strip_images_from_messages(state.get("messages", []))
             if stream:
                 await stream.vision_finished(summary="No image attachments were found.")
-            return {"messages": cleaned}
+            updates.update({"messages": cleaned})
+            _log_transition(
+                "specialist_complete",
+                specialist=SpecialistType.VISION.value,
+                **_state_snapshot({**state, **updates}),
+                selected_next_node="validate",
+            )
+            return updates
 
         analysis = result.analysis
         vision_context = result.context_markdown
@@ -214,6 +401,7 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
         metadata["vision_task_type"] = analysis.task_type.value
 
         return {
+            **updates,
             "vision": analysis.model_dump(exclude_none=True),
             "vision_context": vision_context,
             "messages": result.cleaned_messages or state.get("messages", []),
@@ -226,13 +414,26 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
 
 def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
     async def knowledge_node(state: OrchestratorState) -> dict[str, Any]:
+        updates = _step_update(state, SpecialistType.KNOWLEDGE)
         if not settings.enable_rag:
-            return {}
+            _log_transition(
+                "specialist_complete",
+                specialist=SpecialistType.KNOWLEDGE.value,
+                **_state_snapshot({**state, **updates}),
+                selected_next_node="validate",
+            )
+            return updates
 
         stream = get_current_stream()
         query = last_user_text(state.get("messages", []))
         if not query.strip():
-            return {}
+            _log_transition(
+                "specialist_complete",
+                specialist=SpecialistType.KNOWLEDGE.value,
+                **_state_snapshot({**state, **updates}),
+                selected_next_node="validate",
+            )
+            return updates
 
         if stream:
             await stream.knowledge_started(query=query[:200])
@@ -251,10 +452,18 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
                 sources=sources,
             )
 
-        return {
+        result_payload = {
+            **updates,
             "knowledge_result": result.model_dump(exclude_none=True),
             "used_tools": _update_used_tools(state, "knowledge.retrieve"),
         }
+        _log_transition(
+            "specialist_complete",
+            specialist=SpecialistType.KNOWLEDGE.value,
+            **_state_snapshot({**state, **result_payload}),
+            selected_next_node="validate",
+        )
+        return result_payload
 
     return knowledge_node
 
@@ -293,6 +502,7 @@ def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
 
 def make_coder_node(controller: ControllerEngine, settings: Settings):
     async def coder_node(state: OrchestratorState) -> dict[str, Any]:
+        updates = _step_update(state, SpecialistType.CODER)
         stream = get_current_stream()
         if stream:
             await stream.code_started(model=settings.coder_model)
@@ -339,20 +549,30 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
         if stream:
             await stream.code_finished(result=coder_result.summary[:500])
 
-        return {
+        result_payload = {
+            **updates,
             "coder_result": coder_result.model_dump(exclude_none=True),
             "used_models": _update_used_models(state, settings.coder_model),
         }
+        _log_transition(
+            "specialist_complete",
+            specialist=SpecialistType.CODER.value,
+            **_state_snapshot({**state, **result_payload}),
+            selected_next_node="validate",
+        )
+        return result_payload
 
     return coder_node
 
 
 def make_tools_node(settings: Settings):
     async def tools_node(state: OrchestratorState) -> dict[str, Any]:
+        updates = _step_update(state, SpecialistType.TOOLS)
         plan = _as_plan(state.get("controller_plan"))
         tool_requests = list(plan.tool_requests if plan else [])
         if not tool_requests:
-            return {
+            result_payload = {
+                **updates,
                 "tool_result": ToolResult(
                     tool_name="mcp",
                     status="skipped",
@@ -361,6 +581,13 @@ def make_tools_node(settings: Settings):
                     raw_text="",
                 ).model_dump(exclude_none=True)
             }
+            _log_transition(
+                "specialist_complete",
+                specialist=SpecialistType.TOOLS.value,
+                **_state_snapshot({**state, **result_payload}),
+                selected_next_node="validate",
+            )
+            return result_payload
 
         summaries: list[str] = []
         for request in tool_requests:
@@ -368,7 +595,8 @@ def make_tools_node(settings: Settings):
                 f"{request.tool_name}: {request.description or 'no description'}"
             )
 
-        return {
+        result_payload = {
+            **updates,
             "tool_result": ToolResult(
                 tool_name="mcp",
                 status="not_configured",
@@ -381,6 +609,13 @@ def make_tools_node(settings: Settings):
             ).model_dump(exclude_none=True),
             "used_tools": _update_used_tools(state, "mcp.plan"),
         }
+        _log_transition(
+            "specialist_complete",
+            specialist=SpecialistType.TOOLS.value,
+            **_state_snapshot({**state, **result_payload}),
+            selected_next_node="validate",
+        )
+        return result_payload
 
     return tools_node
 
@@ -398,23 +633,7 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
 
         validation = await controller.validate(state, last_step=step)
 
-        pending = list(state.get("pending_steps", []) or [])
-        if validation.next_steps:
-            pending = [step.value for step in validation.next_steps] + pending
-            dedup: list[str] = []
-            for step_name in pending:
-                if step_name not in dedup:
-                    dedup.append(step_name)
-            pending = dedup
-
-        if validation.needs_reasoning:
-            needs_reasoning = True
-        else:
-            needs_reasoning = bool(state.get("needs_reasoning", False))
-
-        if validation.action == ControllerAction.CLARIFY:
-            needs_reasoning = False
-
+        updates = _consume_current_step(state, validation=validation, settings=settings)
         metadata = dict(state.get("metadata", {}) or {})
         metadata.update(
             {
@@ -423,6 +642,9 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
                 "validation_notes": validation.notes,
             }
         )
+        updates["metadata"] = metadata
+        updates["controller_validation"] = validation.model_dump(exclude_none=True)
+        updates["used_models"] = _update_used_models(state, settings.controller_model)
 
         stream = get_current_stream()
         if stream:
@@ -431,18 +653,16 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
                 issues=validation.issues,
             )
 
-        updates = {
-            "controller_validation": validation.model_dump(exclude_none=True),
-            "pending_steps": pending,
-            "needs_reasoning": needs_reasoning,
-            "requires_clarification": validation.action == ControllerAction.CLARIFY,
-            "metadata": metadata,
-            "used_models": _update_used_models(state, settings.controller_model),
-        }
+        selected_next_node = _select_next_node({**state, **updates})
+        _log_transition(
+            "controller_validated",
+            controller_decision=validation.action.value,
+            selected_next_node=selected_next_node,
+            **_state_snapshot({**state, **updates}),
+        )
 
         if validation.final_answer_ready:
             updates["final_answer_ready"] = True
-
         return updates
 
     return controller_validate_node
@@ -552,7 +772,11 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
         elif not isinstance(reasoning_result, ModelGenerationResponse):
             reasoning_result = None
 
-        if reasoning_result is not None:
+        existing_answer = str(state.get("answer", "") or "").strip()
+        if existing_answer:
+            answer = existing_answer
+            model = str(state.get("metadata", {}).get("final_model") or settings.controller_model)
+        elif reasoning_result is not None:
             answer = reasoning_result.content
             model = reasoning_result.model
         else:

@@ -26,6 +26,10 @@ class OrchestratorState(TypedDict, total=False):
     current_step: str
     needs_reasoning: bool
     requires_clarification: bool
+    controller_cycles: int
+    specialist_executions: int
+    workflow_stall_count: int
+    last_progress_signature: str
     clarification_question: str
 
     knowledge_result: KnowledgeRetrieveResponse | dict[str, Any] | None
