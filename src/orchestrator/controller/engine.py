@@ -781,7 +781,6 @@ class ControllerEngine:
             max_tokens=self.settings.controller_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
-            think=self.settings.controller_think,
         )
         extracted = extract_assistant_text(response.content) or extract_assistant_text(response.raw)
         if not extracted.strip():
