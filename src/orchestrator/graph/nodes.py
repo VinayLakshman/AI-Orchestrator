@@ -805,6 +805,7 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
             {
                 "final_model": model,
                 "final_answer_ready": True,
+                "final_answer": answer,
             }
         )
 

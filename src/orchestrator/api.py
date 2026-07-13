@@ -180,8 +180,46 @@ def _tool_from_state(state: dict[str, Any]) -> ToolResult | None:
     return None
 
 
+def _assistant_content_from_messages(state: dict[str, Any]) -> str:
+    messages = state.get("messages", []) or []
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if content is not None:
+                text = str(content).strip()
+                if text:
+                    return text
+    return ""
+
+
+def _answer_from_state(state: dict[str, Any]) -> tuple[str, str]:
+    answer = str(state.get("answer", "") or "").strip()
+    if answer:
+        return answer, "answer"
+
+    reasoning = state.get("reasoning_result")
+    if isinstance(reasoning, dict):
+        reasoning = ModelGenerationResponse.model_validate(reasoning)
+    if isinstance(reasoning, ModelGenerationResponse) and reasoning.content.strip():
+        return reasoning.content.strip(), "reasoning_result.content"
+
+    assistant_content = _assistant_content_from_messages(state)
+    if assistant_content:
+        return assistant_content, "messages[-1].content"
+
+    metadata = state.get("metadata", {}) or {}
+    if isinstance(metadata, dict):
+        final_answer = str(metadata.get("final_answer", "") or "").strip()
+        if final_answer:
+            return final_answer, "metadata.final_answer"
+
+    return "", "missing"
+
+
 def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorResponse:
-    answer = str(state.get("answer", "") or "")
+    answer, _answer_source = _answer_from_state(state)
     reasoning = state.get("reasoning_result")
     if isinstance(reasoning, dict):
         reasoning = ModelGenerationResponse.model_validate(reasoning)
@@ -362,7 +400,7 @@ async def openai_chat_completions(
         config={"configurable": {"thread_id": thread_id}},
     )
 
-    answer = str((result or {}).get("answer", "") or "")
+    answer, _answer_source = _answer_from_state(result or {})
     completion = OpenAIChatCompletionResponse(
         id=request_id,
         created=int(time()),
