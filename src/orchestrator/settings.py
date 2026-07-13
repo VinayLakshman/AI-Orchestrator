@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     max_context_messages: int = 24
     max_controller_cycles: int = 6
     max_specialist_executions: int = 12
+    max_specialist_retries: int = 1
     workflow_stall_limit: int = 2
     max_tool_rounds: int = 4
     request_timeout_s: float = 300.0

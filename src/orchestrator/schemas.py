@@ -42,6 +42,10 @@ class ControllerPlan(BaseModel):
     summary: str = ""
     complexity: Literal["low", "medium", "high"] = "medium"
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    next_specialist: SpecialistType | None = None
+    retry: bool = False
+    retry_reason: str = ""
+    complete: bool = False
 
     requires_vision: bool = False
     requires_knowledge: bool = False
@@ -82,8 +86,12 @@ class ControllerValidation(BaseModel):
     action: ControllerAction = ControllerAction.CONTINUE
     summary: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    next_specialist: SpecialistType | None = None
+    retry: bool = False
+    retry_reason: str = ""
     needs_reasoning: bool = False
     final_answer_ready: bool = False
+    complete: bool = False
     next_steps: list[SpecialistType] = Field(default_factory=list)
     fallback_to_general: bool = False
     knowledge_sufficient: bool | None = None

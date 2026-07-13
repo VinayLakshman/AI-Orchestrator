@@ -297,6 +297,41 @@ def _normalize_fallback(value: Any) -> str:
     return "general"
 
 
+def _normalize_controller_step(value: Any) -> SpecialistType | None:
+    if not value:
+        return None
+    try:
+        return SpecialistType(str(value))
+    except Exception:
+        return None
+
+
+def _infer_next_specialist(
+    classification: str,
+    *,
+    latest_user_message: str,
+    has_images: bool,
+    needs_reasoning: bool,
+    requires_clarification: bool,
+    explicit_next: SpecialistType | None = None,
+) -> SpecialistType | None:
+    if explicit_next is not None:
+        return explicit_next
+    if requires_clarification:
+        return None
+    if classification == "VISION" or has_images and _looks_vision_request(latest_user_message):
+        return SpecialistType.VISION
+    if classification == "TOOLS":
+        return SpecialistType.TOOLS
+    if classification == "CODE":
+        return SpecialistType.CODER
+    if classification == "KNOWLEDGE":
+        return SpecialistType.KNOWLEDGE
+    if needs_reasoning or classification == "REASONING":
+        return None
+    return None
+
+
 def _fallback_final_answer(state: dict[str, Any]) -> str:
     latest_user_message = last_user_text(state.get("messages", []))
     validation = _coerce_validation(state.get("controller_validation"))
@@ -514,13 +549,6 @@ class ControllerEngine:
         )
 
         parsed = _extract_json_object(response.content)
-        raw_steps = parsed.get("execution_steps", parsed.get("steps", []))
-        execution_steps = [
-            step
-            for step in (_coerce_specialist(item) for item in raw_steps)
-            if step is not None
-        ]
-        execution_steps = _unique_steps(execution_steps)
         classification = str(
             parsed.get("classification")
             or parsed.get("route")
@@ -543,71 +571,72 @@ class ControllerEngine:
         if classification not in known_classifications:
             classification = heuristic_classification
 
-        # Keep common public explanations out of the retrieval path even when
-        # the small controller over-eagerly asks for knowledge.
+        explicit_next = _normalize_controller_step(
+            parsed.get("next_specialist") or parsed.get("next_step")
+        )
+        needs_reasoning = (
+            _bool_from_any(parsed.get("needs_reasoning", parsed.get("reasoning_required", False)))
+            or classification == "REASONING"
+            or (
+                classification == "KNOWLEDGE"
+                and _looks_reasoning_request(f" {latest_user_message.lower()} ")
+            )
+        )
+        requires_clarification = classification == "CLARIFY" or _bool_from_any(
+            parsed.get("requires_clarification", False)
+        )
+        complete = _bool_from_any(parsed.get("complete", False))
+
         if heuristic_classification == "GENERAL" and classification == "KNOWLEDGE":
             classification = "GENERAL"
-            execution_steps = [step for step in execution_steps if step != SpecialistType.KNOWLEDGE]
+            explicit_next = None
+            needs_reasoning = False
+            requires_clarification = False
+            complete = True
 
         if classification == "GENERAL":
-            execution_steps = []
-        elif classification == "KNOWLEDGE" and SpecialistType.KNOWLEDGE not in execution_steps:
-            execution_steps.append(SpecialistType.KNOWLEDGE)
-        elif classification == "CODE" and SpecialistType.CODER not in execution_steps:
-            execution_steps.append(SpecialistType.CODER)
-        elif classification == "VISION" and SpecialistType.VISION not in execution_steps:
-            execution_steps.append(SpecialistType.VISION)
-        elif classification == "TOOLS" and SpecialistType.TOOLS not in execution_steps:
-            execution_steps.append(SpecialistType.TOOLS)
+            explicit_next = None
+            needs_reasoning = False
+            requires_clarification = False
+            complete = True
+        elif explicit_next is None:
+            explicit_next = _infer_next_specialist(
+                classification,
+                latest_user_message=latest_user_message,
+                has_images=bool(state.get("has_images", False)),
+                needs_reasoning=needs_reasoning,
+                requires_clarification=requires_clarification,
+            )
+            if explicit_next is None and not needs_reasoning and not requires_clarification:
+                complete = True
+
+        execution_steps = [explicit_next] if explicit_next is not None else []
 
         plan = ControllerPlan(
             classification=classification,
             intent=str(parsed.get("intent") or "").strip() or "general",
-            summary=(
-                str(parsed.get("summary") or parsed.get("explanation") or "").strip()
-                or latest_user_message[:280]
-            ),
-            complexity=_normalize_complexity(parsed.get("complexity")),
+            summary=str(parsed.get("explanation") or parsed.get("summary") or "").strip() or latest_user_message[:280],
+            complexity="medium",
             confidence=_safe_float(parsed.get("confidence"), 0.0),
-            requires_vision=SpecialistType.VISION in execution_steps or classification == "VISION",
+            next_specialist=explicit_next,
+            retry=_bool_from_any(parsed.get("retry", False)),
+            retry_reason=str(parsed.get("retry_reason") or parsed.get("reason") or "").strip(),
+            requires_vision=explicit_next == SpecialistType.VISION or classification == "VISION",
             requires_knowledge=(
-                SpecialistType.KNOWLEDGE in execution_steps or classification == "KNOWLEDGE"
+                explicit_next == SpecialistType.KNOWLEDGE or classification == "KNOWLEDGE"
             ),
-            requires_coder=SpecialistType.CODER in execution_steps or classification == "CODE",
-            requires_tools=SpecialistType.TOOLS in execution_steps or classification == "TOOLS",
-            requires_reasoning=(
-                classification == "REASONING"
-                or _bool_from_any(
-                    parsed.get("requires_reasoning", parsed.get("reasoning_required", False))
-                )
-                or (
-                    classification == "KNOWLEDGE"
-                    and _looks_reasoning_request(f" {latest_user_message.lower()} ")
-                )
-            ),
-            requires_clarification=(
-                classification == "CLARIFY"
-                or _bool_from_any(parsed.get("requires_clarification", False))
-            ),
+            requires_coder=explicit_next == SpecialistType.CODER or classification == "CODE",
+            requires_tools=explicit_next == SpecialistType.TOOLS or classification == "TOOLS",
+            requires_reasoning=needs_reasoning,
+            requires_clarification=requires_clarification,
             clarification_question=parsed.get("clarification_question"),
             tool_requests=list(parsed.get("tool_requests") or []),
             execution_steps=_unique_steps(execution_steps),
-            fallback=_normalize_fallback(parsed.get("fallback")),
+            fallback="none" if complete else "general",
             completion_condition=str(parsed.get("completion_condition") or "").strip(),
             explanation=str(parsed.get("explanation") or parsed.get("summary") or "").strip(),
+            complete=complete,
         )
-
-        if not plan.execution_steps:
-            fallback_steps: list[SpecialistType] = []
-            if plan.requires_knowledge and classification != "GENERAL":
-                fallback_steps.append(SpecialistType.KNOWLEDGE)
-            if plan.requires_vision:
-                fallback_steps.append(SpecialistType.VISION)
-            if plan.requires_coder:
-                fallback_steps.append(SpecialistType.CODER)
-            if plan.requires_tools:
-                fallback_steps.append(SpecialistType.TOOLS)
-            plan.execution_steps = _unique_steps(fallback_steps)
 
         if plan.classification == "GENERAL":
             plan.requires_knowledge = False
@@ -617,6 +646,8 @@ class ControllerEngine:
             plan.requires_reasoning = False
             plan.requires_clarification = False
             plan.execution_steps = []
+            plan.next_specialist = None
+            plan.complete = True
 
         plan.route_hint = plan_to_route(plan)
         return plan
@@ -675,11 +706,13 @@ class ControllerEngine:
         )
 
         parsed = _extract_json_object(response.content)
-        next_steps = [
-            step
-            for step in (_coerce_specialist(item) for item in parsed.get("next_steps", []))
-            if step is not None
-        ]
+        parsed_next = _normalize_controller_step(
+            parsed.get("next_specialist")
+            or parsed.get("next_step")
+            or (parsed.get("next_steps") or [None])[0]
+        )
+        plan = _coerce_plan(state.get("controller_plan"))
+        fallback_next = parsed_next or (plan.next_specialist if plan else None)
 
         action_raw = str(parsed.get("action") or "continue").strip().lower()
         if action_raw == "reasoning":
@@ -693,6 +726,26 @@ class ControllerEngine:
         knowledge_sufficient = parsed.get("knowledge_sufficient")
         if knowledge_sufficient is not None:
             knowledge_sufficient = _bool_from_any(knowledge_sufficient)
+        retry = _bool_from_any(parsed.get("retry", False))
+        retry_reason = str(parsed.get("retry_reason") or parsed.get("reason") or "").strip()
+        complete = _bool_from_any(parsed.get("complete", False))
+        needs_reasoning = (
+            action == ControllerAction.REASON
+            or _bool_from_any(parsed.get("needs_reasoning", False))
+        )
+        requires_clarification = action == ControllerAction.CLARIFY or _bool_from_any(
+            parsed.get("requires_clarification", False)
+        )
+        next_specialist = fallback_next
+        if action == ControllerAction.FINALIZE:
+            next_specialist = None
+            complete = True
+        elif action == ControllerAction.CLARIFY:
+            next_specialist = None
+        elif action == ControllerAction.REASON and next_specialist is None:
+            complete = False
+        elif next_specialist is None and not needs_reasoning:
+            complete = True
 
         if last_step == SpecialistType.KNOWLEDGE:
             sufficient = bool(evidence.get("sufficient", False))
@@ -704,32 +757,77 @@ class ControllerEngine:
             if not sufficient and request_classification == "GENERAL":
                 action = ControllerAction.FINALIZE
                 fallback_to_general = True
-                next_steps = []
+                next_specialist = None
+                needs_reasoning = False
+                complete = True
             elif (
                 not sufficient
                 and action in {ControllerAction.FINALIZE, ControllerAction.CONTINUE}
-                and not next_steps
+                and next_specialist is None
                 and not fallback_to_general
             ):
                 if _looks_reasoning_request(f" {latest_user_message.lower()} "):
                     action = ControllerAction.REASON
+                    needs_reasoning = True
                 else:
                     action = ControllerAction.CLARIFY
-                next_steps = []
+                    needs_reasoning = False
+                next_specialist = None
+                complete = False
+
+        executed_steps = {
+            str(item)
+            for item in (state.get("executed_specialists", []) or [])
+            if str(item).strip()
+        }
+        failed_steps = {
+            str(item)
+            for item in (state.get("failed_specialists", []) or [])
+            if str(item).strip()
+        }
+        retry_counts: dict[str, int] = {}
+        for key, value in (state.get("retry_counts", {}) or {}).items():
+            try:
+                retry_counts[str(key)] = int(value)
+            except Exception:
+                retry_counts[str(key)] = 0
+        if next_specialist is not None and not retry:
+            if (
+                next_specialist.value in executed_steps
+                and next_specialist.value not in failed_steps
+            ):
+                next_specialist = None
+                if needs_reasoning:
+                    action = ControllerAction.REASON
+                elif requires_clarification:
+                    action = ControllerAction.CLARIFY
+                else:
+                    action = ControllerAction.FINALIZE
+                    complete = True
+            elif (
+                next_specialist.value in failed_steps
+                and retry_counts.get(next_specialist.value, 0.0) >= float(self.settings.max_specialist_retries)
+            ):
+                next_specialist = None
+                if needs_reasoning:
+                    action = ControllerAction.REASON
+                elif requires_clarification:
+                    action = ControllerAction.CLARIFY
+                else:
+                    action = ControllerAction.FINALIZE
+                    complete = True
 
         return ControllerValidation(
             action=action,
             summary=str(parsed.get("summary") or parsed.get("reason") or "").strip(),
             confidence=_safe_float(parsed.get("confidence"), 0.0),
-            needs_reasoning=(
-                action == ControllerAction.REASON
-                or _bool_from_any(parsed.get("needs_reasoning", False))
-            ),
-            final_answer_ready=(
-                action == ControllerAction.FINALIZE
-                or _bool_from_any(parsed.get("final_answer_ready", False))
-            ),
-            next_steps=_unique_steps(next_steps),
+            next_specialist=next_specialist,
+            retry=retry,
+            retry_reason=retry_reason,
+            needs_reasoning=needs_reasoning,
+            final_answer_ready=complete or action == ControllerAction.FINALIZE,
+            complete=complete or action == ControllerAction.FINALIZE,
+            next_steps=_unique_steps([next_specialist] if next_specialist else []),
             fallback_to_general=fallback_to_general,
             knowledge_sufficient=knowledge_sufficient,
             reason=str(parsed.get("reason") or parsed.get("summary") or "").strip(),

@@ -21,6 +21,10 @@ class OrchestratorState(TypedDict, total=False):
     controller_plan: dict[str, Any] | ControllerPlan
     controller_validation: dict[str, Any] | ControllerValidation
 
+    executed_specialists: list[str]
+    pending_specialists: list[str]
+    failed_specialists: list[str]
+    retry_counts: dict[str, int]
     pending_steps: list[str]
     completed_steps: list[str]
     current_step: str
@@ -28,8 +32,14 @@ class OrchestratorState(TypedDict, total=False):
     requires_clarification: bool
     controller_cycles: int
     specialist_executions: int
+    workflow_progress: int
     workflow_stall_count: int
     last_progress_signature: str
+    last_controller_decision: str
+    last_specialist: str
+    validation_status: str
+    retry_limit: int
+    specialist_status: str
     clarification_question: str
 
     knowledge_result: KnowledgeRetrieveResponse | dict[str, Any] | None

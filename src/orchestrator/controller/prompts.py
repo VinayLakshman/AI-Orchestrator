@@ -38,28 +38,22 @@ Planning rules:
 - If images are present or the user asks about visual content, include vision.
 - If code must be written, edited, debugged, reviewed, or explained, include coder.
 - If external execution is needed, include tools.
-- Use reasoning only for complex synthesis or planning; do not use it for simple definitions.
+- Use reasoning only when the request explicitly requires deeper synthesis.
+- Choose at most one next specialist.
+- Do not repeat a specialist unless the workflow explicitly failed and a retry is requested.
+- Mark complete when no further specialist work is needed.
 - Re-plan after every specialist based on returned evidence.
 - Never assume a specialist succeeded just because it executed.
 
 Return this JSON shape:
 {
-  "classification": "GENERAL|KNOWLEDGE|CODE|VISION|TOOLS|REASONING|CLARIFY",
   "intent": "short intent label",
-  "summary": "one sentence summary of what to do",
-  "complexity": "low|medium|high",
+  "next_specialist": "knowledge|vision|coder|tools|null",
+  "retry": false,
+  "retry_reason": "",
+  "needs_reasoning": false,
+  "complete": false,
   "confidence": 0.0,
-  "requires_vision": false,
-  "requires_knowledge": false,
-  "requires_coder": false,
-  "requires_tools": false,
-  "requires_reasoning": false,
-  "requires_clarification": false,
-  "clarification_question": null,
-  "tool_requests": [],
-  "execution_steps": ["vision", "knowledge", "coder", "tools"],
-  "fallback": "general|reasoning|clarify|none",
-  "completion_condition": "what must be true before finalizing",
   "explanation": "brief routing rationale"
 }
 """.strip()
@@ -77,10 +71,10 @@ Evaluate:
 - confidence
 - result summary
 - hit count when applicable
-- whether evidence is sufficient for the user's actual request
+- whether the current request is satisfied
 
 Decide one action:
-- continue: invoke another specialist listed in next_steps
+- continue: invoke exactly one next specialist
 - finalize: the resident controller can synthesize a user-facing answer now
 - reason: escalate to the large reasoning model
 - clarify: ask the user a targeted clarification question
@@ -96,9 +90,12 @@ Return STRICT JSON ONLY with this shape:
   "action": "continue|finalize|reason|clarify",
   "summary": "brief validation summary",
   "confidence": 0.0,
+  "next_specialist": "knowledge|vision|coder|tools|null",
+  "retry": false,
+  "retry_reason": "",
   "needs_reasoning": false,
   "final_answer_ready": false,
-  "next_steps": ["knowledge", "vision", "coder", "tools"],
+  "complete": false,
   "fallback_to_general": false,
   "knowledge_sufficient": null,
   "reason": "why this action is correct",
@@ -108,9 +105,10 @@ Return STRICT JSON ONLY with this shape:
 
 Rules:
 - Re-plan based on evidence, not on the fact that a node ran.
-- Finalize when the resident controller has enough information to answer.
-- Continue only when another specialist is clearly necessary.
-- Reason only for complex synthesis or architecture work.
+- Finalize when the request is satisfied.
+- Continue only with exactly one next specialist.
+- Retry only if the current specialist explicitly failed.
+- Reason only when the request explicitly requires deeper synthesis.
 - Clarify only when the request cannot be answered without one more user detail.
 - Do not expose chain-of-thought.
 - Do not narrate analysis or internal reasoning.
@@ -126,7 +124,7 @@ Answer directly and only with the final user-facing response.
 Do not mention planning, validation, evidence, or internal control flow.
 Do not expose analysis, reasoning, or hidden deliberation.
 If the graph already has useful specialist outputs, synthesize them silently.
-If no specialists executed, answer from the user's request and general knowledge.
+If no specialists executed, answer directly from the user's request and general knowledge.
 Prefer grounded, concise, complete answers.
 If retrieval failed for common public knowledge, answer from model knowledge.
 If the answer is uncertain, say so briefly and clearly.
