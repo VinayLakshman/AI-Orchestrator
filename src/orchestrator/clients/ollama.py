@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator
 from typing import Any
 import json
@@ -137,6 +138,18 @@ class OllamaClient:
             resp.raise_for_status()
             data = resp.json()
             return normalize_generation_response(model, data)
+        except httpx.HTTPStatusError as exc:
+            response_text = ""
+            with contextlib.suppress(Exception):
+                response_text = exc.response.text
+            logger.error(
+                "ollama_request_failed model=%s status=%s response=%s payload=%s",
+                model,
+                getattr(exc.response, "status_code", "unknown"),
+                response_text[:2000],
+                json.dumps(payload, sort_keys=True, default=str),
+            )
+            raise
         finally:
             if close_client:
                 await client.aclose()
@@ -184,6 +197,18 @@ class OllamaClient:
                         done=bool(data.get("done", False)),
                         raw=data if isinstance(data, dict) else {},
                     )
+        except httpx.HTTPStatusError as exc:
+            response_text = ""
+            with contextlib.suppress(Exception):
+                response_text = exc.response.text
+            logger.error(
+                "ollama_stream_request_failed model=%s status=%s response=%s payload=%s",
+                model,
+                getattr(exc.response, "status_code", "unknown"),
+                response_text[:2000],
+                json.dumps(payload, sort_keys=True, default=str),
+            )
+            raise
         finally:
             if close_client:
                 await client.aclose()

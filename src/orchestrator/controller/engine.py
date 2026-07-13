@@ -511,7 +511,6 @@ class ControllerEngine:
             max_tokens=self.settings.controller_final_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
-            think=self.settings.controller_think,
         )
 
         parsed = _extract_json_object(response.content)
@@ -673,7 +672,6 @@ class ControllerEngine:
             max_tokens=self.settings.controller_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
-            think=self.settings.controller_think,
         )
 
         parsed = _extract_json_object(response.content)
