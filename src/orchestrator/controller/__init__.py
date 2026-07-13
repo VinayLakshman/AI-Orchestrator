@@ -1,3 +1,2 @@
-from .engine import ControllerEngine
+"""Controller layer."""
 
-__all__ = ["ControllerEngine"]

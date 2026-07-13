@@ -1,18 +1,13 @@
-from enum import Enum
-
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-class ChatRole(str, Enum):
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
-    TOOL = "tool"
+from ..common.enums import ChatRole
+from ..common.types import MessageContent
 
 class ChatMessage(BaseModel):
     role: ChatRole
-    content: str | list[dict[str, Any]]
+    content: MessageContent
     name: str | None = None
     tool_call_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)

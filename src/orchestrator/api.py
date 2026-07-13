@@ -9,13 +9,15 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .graph import OrchestratorRuntime
+from .common.constants import THREAD_ID_MAX_LENGTH
+from .graph.build import OrchestratorRuntime
+from .models.chat import ChatMessage, ChatRequest
+from .models.knowledge import KnowledgeRetrieveResponse
+from .models.ollama import ModelGenerationResponse
 from .schemas import (
     ControllerPlan,
     ControllerValidation,
     CoderResult,
-    ModelGenerationResponse,
-    KnowledgeRetrieveResponse,
     OpenAIChatCompletionChoice,
     OpenAIChatCompletionRequest,
     OpenAIChatCompletionResponse,
@@ -26,8 +28,9 @@ from .schemas import (
     RouteDecision,
     ToolResult,
 )
-from .streaming import StreamPublisher, openai_chunk, openai_done, stream_scope
-from .models.chat import ChatMessage, ChatRequest
+from .streaming.context import stream_scope
+from .streaming.publisher import StreamPublisher
+from .streaming.sse import openai_chunk, openai_done
 
 router = APIRouter(tags=["orchestrator"])
 
@@ -50,7 +53,7 @@ def _request_headers(request: Request) -> dict[str, str]:
 
 def _thread_id_from_request(payload: ChatRequest) -> str:
     if payload.thread_id:
-        return payload.thread_id[:255]
+        return payload.thread_id[:THREAD_ID_MAX_LENGTH]
     return str(uuid4())
 
 

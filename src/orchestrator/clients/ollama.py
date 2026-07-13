@@ -1,22 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from typing import Any
 import json
 
 import httpx
 
-from ..schemas import ModelGenerationResponse
+from ..models.ollama import ModelGenerationResponse, OllamaStreamChunk
 from ..settings import Settings
 from ..models.chat import ChatMessage
-
-
-@dataclass(slots=True)
-class OllamaStreamChunk:
-    content: str
-    done: bool
-    raw: dict[str, Any]
 
 
 class OllamaClient:

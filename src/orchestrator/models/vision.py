@@ -1,21 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-
-class VisionTaskType(StrEnum):
-    OCR = "ocr"
-    SCREENSHOT = "screenshot"
-    TERMINAL = "terminal"
-    CHART = "chart"
-    DIAGRAM = "diagram"
-    DOCUMENT = "document"
-    PHOTO = "photo"
-    MIXED = "mixed"
+from ..common.enums import VisionTaskType
 
 
 class VisionAnalysis(BaseModel):

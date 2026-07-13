@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..schemas import RouteDecision, RouteType
+from ..common.enums import RouteType
+from ..schemas import RouteDecision
 
 
 @dataclass(slots=True)

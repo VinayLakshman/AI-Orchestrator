@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from ..models.vision import VisionAnalysis, VisionTaskType
+from ..common.enums import VisionTaskType
+from ..models.vision import VisionAnalysis
 
 
 _TASK_GUIDANCE: dict[VisionTaskType, str] = {

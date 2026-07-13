@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 
 from .api import router as api_router
-from .graph import build_runtime
+from .graph.build import build_runtime
 from .logging import configure_logging
 from .settings import get_settings
 

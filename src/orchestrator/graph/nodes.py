@@ -2,20 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..clients import KnowledgeClient, OllamaClient
+from ..clients.knowledge import KnowledgeClient
+from ..clients.ollama import OllamaClient
+from ..common.enums import ChatRole, ControllerAction, SpecialistType
 from ..context.builder import last_user_text, render_structured_context
 from ..controller.engine import ControllerEngine, plan_to_route
-from ..schemas import (
-    ControllerAction,
-    ControllerPlan,
-    ControllerValidation,
-    CoderResult,
-    KnowledgeRetrieveResponse,
-    ModelGenerationResponse,
-    SpecialistType,
-    ToolResult,
-)
-from ..models.chat import ChatRole, ChatMessage
+from ..models.chat import ChatMessage
+from ..models.knowledge import KnowledgeRetrieveResponse
+from ..models.ollama import ModelGenerationResponse
+from ..schemas import ControllerPlan, ControllerValidation, CoderResult, ToolResult
 from ..settings import Settings
 from ..streaming.context import get_current_stream
 from ..vision.fetcher import collect_latest_message_images, strip_images_from_messages

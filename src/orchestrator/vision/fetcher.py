@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from ..models.chat import ChatRole
+from ..common.enums import ChatRole
 from ..settings import Settings
 from ..models.vision import ResolvedImage
 

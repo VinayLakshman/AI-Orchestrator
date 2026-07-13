@@ -2,15 +2,9 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
-from ..schemas import (
-    ControllerPlan,
-    ControllerValidation,
-    CoderResult,
-    KnowledgeRetrieveResponse,
-    ModelGenerationResponse,
-    RouteDecision,
-    ToolResult,
-)
+from ..models.knowledge import KnowledgeRetrieveResponse
+from ..models.ollama import ModelGenerationResponse
+from ..schemas import ControllerPlan, ControllerValidation, CoderResult, RouteDecision, ToolResult
 
 
 class OrchestratorState(TypedDict, total=False):

@@ -6,8 +6,9 @@ from typing import Any
 import httpx
 
 from ..logging import get_logger
+from ..common.enums import VisionTaskType
 from ..settings import Settings
-from .detector import infer_vision_task, VisionTaskType
+from .detector import infer_vision_task
 from .fetcher import (
     collect_latest_message_images,
     extract_latest_user_text,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..schemas import KnowledgeHit
+from ..models.knowledge import KnowledgeHit
 from ..settings import Settings
 
 

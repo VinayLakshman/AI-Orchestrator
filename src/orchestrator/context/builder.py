@@ -2,18 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..schemas import (
-    ControllerPlan,
-    ControllerValidation,
-    KnowledgeRetrieveResponse,
-    RouteDecision,
-    RouteType,
-    ToolResult,
-    CoderResult,
-)
+from ..common.enums import ChatRole, RouteType
+from ..models.chat import ChatMessage
+from ..models.knowledge import KnowledgeRetrieveResponse
+from ..schemas import ControllerPlan, ControllerValidation, CoderResult, RouteDecision, ToolResult
 from ..settings import Settings
 from ..vision.prompts import build_vision_injection_message
-from ..models.chat import ChatRole, ChatMessage
 
 def last_user_text(messages: list[dict[str, Any]] | None) -> str:
     if not messages:

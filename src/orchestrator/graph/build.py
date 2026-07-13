@@ -7,7 +7,8 @@ import httpx
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from ..clients import KnowledgeClient, OllamaClient
+from ..clients.knowledge import KnowledgeClient
+from ..clients.ollama import OllamaClient
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
 from ..settings import Settings

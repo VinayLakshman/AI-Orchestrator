@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-from ..clients.ollama import OllamaClient
+from ..common.enums import ChatRole
 from ..settings import Settings
-from ..models.chat import ChatRole, ChatMessage
+from ..models.chat import ChatMessage
 
 
 @dataclass(slots=True)
@@ -20,7 +21,7 @@ class ModelManager:
     The orchestrator references model roles, never raw model names.
     """
 
-    def __init__(self, settings: Settings, ollama_client: OllamaClient) -> None:
+    def __init__(self, settings: Settings, ollama_client: Any) -> None:
         self.settings = settings
         self.ollama_client = ollama_client
 

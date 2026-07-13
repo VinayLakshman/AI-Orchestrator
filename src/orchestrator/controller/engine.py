@@ -4,21 +4,18 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from ..clients.ollama import OllamaClient
-from ..context.builder import build_controller_messages, last_user_text, render_structured_context
-from ..models.manager import ModelManager
-from ..schemas import (
+from ..common.enums import (
+    ChatRole,
     ControllerAction,
-    ControllerPlan,
-    ControllerValidation,
-    CoderResult,
-    KnowledgeRetrieveResponse,
-    ModelGenerationResponse,
-    RouteDecision,
     RouteType,
     SpecialistType,
-    ToolResult,
 )
-from ..models.chat import ChatRole, ChatMessage
+from ..models.chat import ChatMessage
+from ..models.knowledge import KnowledgeRetrieveResponse
+from ..models.ollama import ModelGenerationResponse
+from ..context.builder import build_controller_messages, last_user_text, render_structured_context
+from ..models.manager import ModelManager
+from ..schemas import ControllerPlan, ControllerValidation, CoderResult, RouteDecision, ToolResult
 from ..settings import Settings
 from .prompts import (
     build_controller_final_prompt,

@@ -1,4 +1,2 @@
-from .knowledge import KnowledgeClient
-from .ollama import OllamaClient
+"""External service clients."""
 
-__all__ = ["KnowledgeClient", "OllamaClient"]

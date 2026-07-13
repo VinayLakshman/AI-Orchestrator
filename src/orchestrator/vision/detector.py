@@ -1,17 +1,6 @@
 from __future__ import annotations
 
-from enum import StrEnum
-
-
-class VisionTaskType(StrEnum):
-    OCR = "ocr"
-    SCREENSHOT = "screenshot"
-    TERMINAL = "terminal"
-    CHART = "chart"
-    DIAGRAM = "diagram"
-    DOCUMENT = "document"
-    PHOTO = "photo"
-    MIXED = "mixed"
+from ..common.enums import VisionTaskType
 
 
 def infer_vision_task(user_text: str) -> VisionTaskType:

@@ -1,40 +1,14 @@
 from __future__ import annotations
 
-from enum import Enum, StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .common.enums import ControllerAction, RouteType, SpecialistType
+from .models.knowledge import KnowledgeRetrieveResponse
+from .models.ollama import ModelGenerationResponse
 from .models.vision import VisionAnalysis
-from .models.chat import ChatMessage
-class RouteType(str, Enum):
-    GENERAL = "general"
-    VISION = "vision"
-    CODE = "code"
-    RAG = "rag"
-    TOOLS = "tools"
-    MULTI_STEP = "multi_step"
-    CLARIFY = "clarify"
 
-
-class ToolType(str, Enum):
-    MCP = "mcp"
-    KNOWLEDGE = "knowledge"
-    OLLAMA = "ollama"
-
-
-class SpecialistType(StrEnum):
-    KNOWLEDGE = "knowledge"
-    VISION = "vision"
-    CODER = "coder"
-    TOOLS = "tools"
-
-
-class ControllerAction(StrEnum):
-    CONTINUE = "continue"
-    FINALIZE = "finalize"
-    REASON = "reason"
-    CLARIFY = "clarify"
 
 class RouteDecision(BaseModel):
     route: RouteType
@@ -83,56 +57,6 @@ class ControllerValidation(BaseModel):
     next_steps: list[SpecialistType] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
     notes: str = ""
-
-
-class KnowledgeRetrieveRequest(BaseModel):
-    question: str
-    top_k: int = 6
-    candidate_limit: int = 12
-    neighbor_window: int = 1
-
-
-class KnowledgeHit(BaseModel):
-    repository: str
-    branch: str
-    commit: str
-    path: str
-    language: str
-    chunk_index: int
-    chunk_count: int
-    score: float | None = None
-    content: str
-
-
-class KnowledgeRetrieveResponse(BaseModel):
-    question: str
-    intent: str
-    embedding_time: float
-    search_time: float
-    rerank_time: float
-    expansion_time: float
-    total_time: float
-    context: str | None = None
-    grounded: bool = False
-    confidence: float = 0.0
-    retrieval_reason: str = ""
-    primary_hits: list[KnowledgeHit] = Field(default_factory=list)
-    expanded_hits: list[KnowledgeHit] = Field(default_factory=list)
-
-
-class ModelGenerationRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    temperature: float | None = None
-    max_tokens: int | None = None
-    stream: bool = False
-    options: dict[str, Any] = Field(default_factory=dict)
-
-
-class ModelGenerationResponse(BaseModel):
-    model: str
-    content: str
-    raw: dict[str, Any] = Field(default_factory=dict)
 
 
 class CoderResult(BaseModel):

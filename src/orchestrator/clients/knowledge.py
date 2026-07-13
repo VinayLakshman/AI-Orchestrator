@@ -4,10 +4,7 @@ from typing import Any
 
 import httpx
 
-from ..schemas import (
-    KnowledgeRetrieveRequest,
-    KnowledgeRetrieveResponse,
-)
+from ..models.knowledge import KnowledgeRetrieveRequest, KnowledgeRetrieveResponse
 from ..settings import Settings
 
 

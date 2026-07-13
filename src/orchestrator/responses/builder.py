@@ -2,16 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..schemas import (
-    CoderResult,
-    ControllerPlan,
-    ControllerValidation,
-    KnowledgeRetrieveResponse,
-    ModelGenerationResponse,
-    OrchestratorResponse,
-    RouteDecision,
-    ToolResult,
-)
+from ..models.knowledge import KnowledgeRetrieveResponse
+from ..models.ollama import ModelGenerationResponse
+from ..schemas import CoderResult, ControllerPlan, ControllerValidation, OrchestratorResponse, RouteDecision, ToolResult
 
 
 def build_generation_response(
