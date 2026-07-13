@@ -5,9 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .vision.models import VisionAnalysis
-
-
+from .models.vision import VisionAnalysis
+from .models.chat import ChatMessage
 class RouteType(str, Enum):
     GENERAL = "general"
     VISION = "vision"
@@ -36,32 +35,6 @@ class ControllerAction(StrEnum):
     FINALIZE = "finalize"
     REASON = "reason"
     CLARIFY = "clarify"
-
-
-class ChatRole(str, Enum):
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
-    TOOL = "tool"
-
-
-class ChatMessage(BaseModel):
-    role: ChatRole
-    content: str | list[dict[str, Any]]
-    name: str | None = None
-    tool_call_id: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ChatRequest(BaseModel):
-    messages: list[ChatMessage]
-    thread_id: str | None = None
-    model: str | None = None
-    stream: bool = True
-    temperature: float | None = None
-    max_tokens: int | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
 
 class RouteDecision(BaseModel):
     route: RouteType

@@ -7,8 +7,6 @@ from ..clients.ollama import OllamaClient
 from ..context.builder import build_controller_messages, last_user_text, render_structured_context
 from ..models.manager import ModelManager
 from ..schemas import (
-    ChatMessage,
-    ChatRole,
     ControllerAction,
     ControllerPlan,
     ControllerValidation,
@@ -20,6 +18,7 @@ from ..schemas import (
     SpecialistType,
     ToolResult,
 )
+from ..models.chat import ChatRole, ChatMessage
 from ..settings import Settings
 from .prompts import (
     build_controller_final_prompt,

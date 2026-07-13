@@ -7,8 +7,9 @@ import json
 
 import httpx
 
-from ..schemas import ChatMessage, ModelGenerationResponse
+from ..schemas import ModelGenerationResponse
 from ..settings import Settings
+from ..models.chat import ChatMessage
 
 
 @dataclass(slots=True)

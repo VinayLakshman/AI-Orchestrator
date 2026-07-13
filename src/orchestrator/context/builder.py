@@ -3,20 +3,17 @@ from __future__ import annotations
 from typing import Any
 
 from ..schemas import (
-    ChatMessage,
-    ChatRole,
     ControllerPlan,
     ControllerValidation,
     KnowledgeRetrieveResponse,
     RouteDecision,
     RouteType,
-    SpecialistType,
     ToolResult,
     CoderResult,
 )
 from ..settings import Settings
 from ..vision.prompts import build_vision_injection_message
-
+from ..models.chat import ChatRole, ChatMessage
 
 def last_user_text(messages: list[dict[str, Any]] | None) -> str:
     if not messages:

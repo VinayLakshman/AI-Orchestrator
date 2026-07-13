@@ -6,9 +6,9 @@ from typing import Any
 
 import httpx
 
-from ..schemas import ChatRole
+from ..models.chat import ChatRole
 from ..settings import Settings
-from .models import ResolvedImage
+from ..models.vision import ResolvedImage
 
 
 def collect_latest_message_images(messages: list[dict[str, Any]] | None, max_images: int) -> list[str]:

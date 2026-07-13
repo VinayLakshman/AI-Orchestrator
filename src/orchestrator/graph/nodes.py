@@ -6,23 +6,21 @@ from ..clients import KnowledgeClient, OllamaClient
 from ..context.builder import last_user_text, render_structured_context
 from ..controller.engine import ControllerEngine, plan_to_route
 from ..schemas import (
-    ChatMessage,
-    ChatRole,
     ControllerAction,
     ControllerPlan,
     ControllerValidation,
     CoderResult,
     KnowledgeRetrieveResponse,
     ModelGenerationResponse,
-    RouteDecision,
-    RouteType,
     SpecialistType,
     ToolResult,
 )
+from ..models.chat import ChatRole, ChatMessage
 from ..settings import Settings
 from ..streaming.context import get_current_stream
 from ..vision.fetcher import collect_latest_message_images, strip_images_from_messages
 from ..vision.pipeline import VisionPipeline
+from ..graph.state import OrchestratorState
 
 
 def _as_plan(value: Any) -> ControllerPlan | None:

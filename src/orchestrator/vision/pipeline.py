@@ -6,7 +6,6 @@ from typing import Any
 import httpx
 
 from ..logging import get_logger
-from ..schemas import ChatMessage
 from ..settings import Settings
 from .detector import infer_vision_task, VisionTaskType
 from .fetcher import (
@@ -15,7 +14,7 @@ from .fetcher import (
     resolve_image_ref,
     strip_images_from_messages,
 )
-from .models import ResolvedImage, VisionAnalysis, VisionResult
+from ..models.vision import ResolvedImage, VisionAnalysis, VisionResult
 from .prompts import build_vision_system_prompt, render_vision_context
 
 logger = get_logger(__name__)

@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..clients.ollama import OllamaClient
-from ..schemas import ChatMessage, ChatRole
 from ..settings import Settings
+from ..models.chat import ChatRole, ChatMessage
 
 
 @dataclass(slots=True)

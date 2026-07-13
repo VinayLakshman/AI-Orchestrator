@@ -11,8 +11,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .graph import OrchestratorRuntime
 from .schemas import (
-    ChatMessage,
-    ChatRequest,
     ControllerPlan,
     ControllerValidation,
     CoderResult,
@@ -26,11 +24,10 @@ from .schemas import (
     OpenAIModelListResponse,
     OrchestratorResponse,
     RouteDecision,
-    SpecialistType,
     ToolResult,
 )
-from .settings import get_settings
-from .streaming import StreamKind, StreamPublisher, openai_chunk, openai_done, stream_scope
+from .streaming import StreamPublisher, openai_chunk, openai_done, stream_scope
+from .models.chat import ChatMessage, ChatRequest
 
 router = APIRouter(tags=["orchestrator"])
 
