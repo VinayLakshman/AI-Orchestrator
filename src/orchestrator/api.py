@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from .common.constants import THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
@@ -31,8 +31,9 @@ from .schemas import (
     ToolResult,
 )
 from .streaming.context import stream_scope
+from .streaming.models import StreamKind
 from .streaming.publisher import StreamPublisher
-from .streaming.sse import openai_chunk, openai_done
+from .streaming.sse import _openai_chunk, _openai_done
 
 router = APIRouter(tags=["orchestrator"])
 
@@ -44,13 +45,14 @@ def get_runtime(request: Request) -> OrchestratorRuntime:
     return runtime
 
 
-def _request_headers(request: Request) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    for key in ("authorization", "cookie"):
-        value = request.headers.get(key)
-        if value:
-            headers[key] = value
-    return headers
+def _request_headers(request_id: str, thread_id: str) -> dict[str, str]:
+    return {
+        "cache-control": "no-cache",
+        "connection": "keep-alive",
+        "x-accel-buffering": "no",
+        "x-orchestrator-request-id": request_id,
+        "x-orchestrator-thread-id": thread_id,
+    }
 
 
 def _thread_id_from_request(payload: ChatRequest) -> str:
@@ -279,17 +281,20 @@ async def _run_graph_with_stream(
     publisher: StreamPublisher,
 ) -> dict[str, Any]:
     async with stream_scope(publisher):
-        await publisher.graph_started()
+        await publisher.graph_started(route_hint=state_input.get("metadata", {}).get("requested_model"))
         try:
             result = await runtime.graph.ainvoke(
                 state_input,
                 config={"configurable": {"thread_id": thread_id}},
             )
-            await publisher.graph_finished(route=(result.get("route") or {}).get("route") if isinstance(result.get("route"), dict) else None)
+            route_name = result.get("route_name") or result.get("route", {}).get("route")
+            await publisher.graph_finished(route=route_name)
             return result
         except Exception as exc:
             await publisher.graph_failed(str(exc))
             raise
+        finally:
+            await runtime.stream_hub.close(request_id)
 
 
 def _request_headers_out(request_id: str, thread_id: str) -> dict[str, str]:
@@ -387,6 +392,7 @@ async def openai_chat_completions(
     request_id = str(uuid4())
     normalized_request = normalize_openai_request(payload)
     thread_id = str(uuid4())
+
     state_input = _input_state_from_normalized_request(
         normalized_request,
         request,
@@ -398,32 +404,88 @@ async def openai_chat_completions(
     publisher = StreamPublisher(stream)
 
     if payload.stream:
+        graph_task = asyncio.create_task(
+            _run_graph_with_stream(
+                runtime=runtime,
+                request_id=request_id,
+                thread_id=thread_id,
+                state_input=state_input,
+                publisher=publisher,
+            ),
+            name=f"orchestrator-stream-{request_id}",
+        )
+
         async def sse_generator():
+            role_sent = False
+            token_seen = False
             result: dict[str, Any] | None = None
+
             try:
-                result = await _run_graph_with_stream(
-                    runtime=runtime,
-                    request_id=request_id,
-                    thread_id=thread_id,
-                    state_input=state_input,
-                    publisher=publisher,
-                )
-                answer = str((result or {}).get("answer", "") or "")
-                if answer:
-                    yield openai_chunk(
-                        id=request_id,
-                        model=str(payload.model),
-                        content=answer,
+                async for event in stream.subscribe(after_seq=0):
+                    if event.kind != StreamKind.LLM_TOKEN:
+                        continue
+
+                    token = str(event.data.get("token") or "")
+                    if not token:
+                        continue
+
+                    token_seen = True
+
+                    if not role_sent:
+                        role_sent = True
+                        yield _openai_chunk(
+                            request_id=request_id,
+                            model=str(payload.model),
+                            role="assistant",
+                        )
+
+                    yield _openai_chunk(
                         request_id=request_id,
+                        model=str(payload.model),
+                        content=token,
                     )
-                yield openai_done()
+
+                # The stream is closed by _run_graph_with_stream() once the graph finishes.
+                with suppress(Exception):
+                    result = await graph_task
+
+                # Fallback: if the graph produced a final answer but no token events were emitted,
+                # send the answer as a single assistant chunk.
+                if not token_seen:
+                    answer = str((result or {}).get("answer", "") or "")
+                    if answer:
+                        if not role_sent:
+                            yield _openai_chunk(
+                                request_id=request_id,
+                                model=str(payload.model),
+                                role="assistant",
+                            )
+                        yield _openai_chunk(
+                            request_id=request_id,
+                            model=str(payload.model),
+                            content=answer,
+                        )
+
+                yield _openai_chunk(
+                    request_id=request_id,
+                    model=str(payload.model),
+                    finish_reason="stop",
+                )
+                yield _openai_done()
+
+            except asyncio.CancelledError:
+                graph_task.cancel()
+                raise
             finally:
-                await stream.close()
+                if not graph_task.done():
+                    graph_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await graph_task
 
         return StreamingResponse(
             sse_generator(),
             media_type="text/event-stream",
-            headers=_request_headers_out(request_id, thread_id),
+            headers=_request_headers(request_id, thread_id),
         )
 
     result = await runtime.graph.ainvoke(
@@ -450,5 +512,4 @@ async def openai_chat_completions(
     )
 
     await stream.close()
-
     return completion
