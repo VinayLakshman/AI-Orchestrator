@@ -355,16 +355,9 @@ def _build_conversation_history(
     role_sequence = _message_sequence(raw_messages)
 
     latest_user_index: int | None = None
-
     for index in range(len(raw_messages) - 1, -1, -1):
         message = raw_messages[index]
-
-        role = (
-            message.role
-            if isinstance(message, ChatMessage)
-            else message.get("role")
-        )
-
+        role = message.role if isinstance(message, ChatMessage) else message.get("role")
         if role == ChatRole.USER.value:
             latest_user_index = index
             break
@@ -374,32 +367,23 @@ def _build_conversation_history(
 
     latest_user_text = _message_content_text(raw_messages[latest_user_index])
 
-    # Preserve the complete conversation.
-    history_messages = raw_messages
+    # Only keep messages BEFORE the active user turn.
+    history_messages = list(raw_messages[:latest_user_index])
 
     history_token_count = sum(
-        _message_token_count(message)
-        for message in history_messages
+        _message_token_count(message) for message in history_messages
     )
 
     truncated = False
-
-    while (
-        history_messages
-        and history_token_count > CONVERSATION_HISTORY_TOKEN_BUDGET
-    ):
+    while history_messages and history_token_count > CONVERSATION_HISTORY_TOKEN_BUDGET:
         history_messages.pop(0)
-
         history_token_count = sum(
-            _message_token_count(message)
-            for message in history_messages
+            _message_token_count(message) for message in history_messages
         )
-
         truncated = True
 
     history_chat_messages = [
-        ChatMessage.model_validate(message)
-        for message in history_messages
+        ChatMessage.model_validate(message) for message in history_messages
     ]
 
     conversation_info = {
@@ -409,16 +393,11 @@ def _build_conversation_history(
         "latest_user_message_length": len(latest_user_text),
         "history_token_count": history_token_count,
         "truncation_occurred": truncated,
-        "latest_user_survived_truncation": latest_user_index >= (
-            len(raw_messages) - len(history_chat_messages)
-        ),
+        "latest_user_survived_truncation": True,
+        "history_message_count": len(history_chat_messages),
     }
 
-    return (
-        history_chat_messages,
-        latest_user_text,
-        conversation_info,
-    )
+    return history_chat_messages, latest_user_text, conversation_info
 
 
 def last_user_text(messages: list[dict[str, Any]] | None) -> str:
