@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from orchestrator.streaming.publisher import StreamPublisher
+
 from ..clients.ollama import OllamaClient
 from ..common.enums import (
     ChatRole,
@@ -967,8 +969,12 @@ class ControllerEngine:
             ),
         )
         return validation
-
-    async def finalize(self, state: dict[str, Any]) -> ModelGenerationResponse:
+    
+    async def finalize(
+                self,
+                state: dict[str, Any],
+                publisher: StreamPublisher | None = None,
+            ) -> ModelGenerationResponse:
         """
         Produce a final answer with the resident controller.
         If specialist evidence exists, synthesize it into a user-facing answer.
@@ -998,26 +1004,66 @@ class ControllerEngine:
             ),
         )
 
-        response = await self.ollama.chat(
-            model=self.models.controller().name,
-            messages=messages,
-            temperature=self.settings.controller_finalize_temperature,
-            max_tokens=self.settings.controller_finalize_max_tokens,
-            stream=False,
-            keep_alive=self.settings.controller_keep_alive,
-        )
-        extracted = extract_assistant_text(response.content) or extract_assistant_text(response.raw)
-        if not extracted.strip():
+        model_name = self.models.controller().name
+
+        try:
+            if publisher is not None:
+                await publisher.llm_started(model=model_name)
+
+                content_parts: list[str] = []
+                final_raw: dict[str, Any] = {}
+
+                async for chunk in self.ollama.stream_chat(
+                    model=model_name,
+                    messages=messages,
+                    temperature=self.settings.controller_finalize_temperature,
+                    max_tokens=self.settings.controller_finalize_max_tokens,
+                    keep_alive=self.settings.controller_keep_alive,
+                ):
+                    if chunk.content:
+                        content_parts.append(chunk.content)
+                        await publisher.llm_token(chunk.content)
+                    final_raw = chunk.raw or final_raw
+
+                extracted = extract_assistant_text("".join(content_parts)) or extract_assistant_text(final_raw)
+                if not extracted.strip():
+                    extracted = _fallback_final_answer(state)
+
+                await publisher.llm_finished()
+
+                return ModelGenerationResponse(
+                    model=model_name,
+                    content=extracted.strip(),
+                    raw=final_raw,
+                )
+
+            response = await self.ollama.chat(
+                model=model_name,
+                messages=messages,
+                temperature=self.settings.controller_finalize_temperature,
+                max_tokens=self.settings.controller_finalize_max_tokens,
+                stream=False,
+                keep_alive=self.settings.controller_keep_alive,
+            )
+
+            extracted = extract_assistant_text(response.content) or extract_assistant_text(response.raw)
+            if not extracted.strip():
+                return ModelGenerationResponse(
+                    model=response.model,
+                    content=_fallback_final_answer(state),
+                    raw=response.raw,
+                )
+
             return ModelGenerationResponse(
                 model=response.model,
-                content=_fallback_final_answer(state),
+                content=extracted.strip(),
                 raw=response.raw,
             )
-        return ModelGenerationResponse(
-            model=response.model,
-            content=extracted.strip(),
-            raw=response.raw,
-        )
+
+        except Exception as exc:
+            if publisher is not None:
+                await publisher.error(str(exc), stage="finalize")
+            raise
 
     async def reason(self, state: dict[str, Any]) -> ModelGenerationResponse:
         latest_user_message = last_user_text(state.get("messages", []))

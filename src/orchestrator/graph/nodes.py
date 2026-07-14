@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from orchestrator.controller.engine import ControllerEngine
+
 from ..clients.knowledge import KnowledgeClient
 from ..common.enums import ChatRole, ControllerAction, SpecialistType
 from ..context.builder import last_user_text, render_structured_context
@@ -948,15 +950,9 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
             answer = extract_assistant_text(existing_answer)
             model = str(state.get("metadata", {}).get("final_model") or settings.controller_model)
         else:
-            if stream:
-                await stream.llm_started(model=settings.controller_model)
-
-            generation = await controller.finalize(state)
+            generation = await controller.finalize(state, publisher=stream)
             model = generation.model
             answer = extract_assistant_text(generation.content) or extract_assistant_text(generation.raw)
-
-            if stream:
-                await stream.llm_finished()
 
         if not answer.strip():
             answer = (
