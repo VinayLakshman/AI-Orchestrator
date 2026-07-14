@@ -104,7 +104,7 @@ def _input_state_from_normalized_request(
 ) -> dict[str, Any]:
     metadata = {
         **(normalized.metadata or {}),
-        "request_headers": _request_headers(request),
+        "request_headers": _request_headers(request_id, thread_id),
     }
     if request_id:
         metadata["request_id"] = request_id
