@@ -19,6 +19,7 @@ from ..context.builder import (
     render_request_context,
     render_structured_context,
 )
+from ..logging import get_logger
 from ..models.manager import ModelManager
 from ..schemas import (
     ControllerPlan,
@@ -35,6 +36,53 @@ from .prompts import (
     build_controller_plan_prompt,
     build_controller_validation_prompt,
     build_reasoning_prompt,
+)
+
+
+logger = get_logger(__name__)
+
+_REPOSITORY_TOKENS = (
+    "repository",
+    "repo",
+    "codebase",
+    "project",
+    "my orchestrator",
+    "my knowledge service",
+    "knowledge service",
+    "homelab",
+    "proxmox",
+    "docker compose",
+    "compose",
+    "config",
+    "configuration",
+    "docs",
+    "documentation",
+    "history",
+    "implementation",
+)
+_CODE_TOKENS = (
+    "write code",
+    "implement",
+    "refactor",
+    "debug",
+    "fix ",
+    "review code",
+    "generate code",
+    "code ",
+    "function",
+    "class ",
+    "python",
+    "typescript",
+    "javascript",
+)
+_REASONING_TOKENS = (
+    "architecture",
+    "synthesize",
+    "multi-document",
+    "tradeoff",
+    "trade-off",
+    "deep reasoning",
+    "design plan",
 )
 
 
@@ -137,16 +185,163 @@ def _routing_hints_from_state(state: dict[str, Any]) -> RoutingHints:
     return _coerce_routing_hints(state.get("routing_hints"))
 
 
-def _classification_from_hints(hints: RoutingHints) -> str:
-    scores = {
-        "KNOWLEDGE": hints.repository_likelihood,
-        "CODE": hints.code_likelihood,
-        "VISION": hints.vision_likelihood,
+def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
+    request = _coerce_request(state.get("normalized_request"))
+    hints = _routing_hints_from_state(state)
+    metadata = dict((request.metadata if request else state.get("metadata", {})) or {})
+    text = (request.user_query if request else last_user_text(state.get("messages", []))) or ""
+    lower = text.lower()
+    attachments = list(request.attachments if request else state.get("attachments", []) or [])
+    def attachment_type(item: Any) -> str:
+        if isinstance(item, dict):
+            return str(item.get("attachment_type") or item.get("type") or "").lower()
+        return str(getattr(item, "attachment_type", "") or "").lower()
+
+    has_images = bool(metadata.get("has_images", False)) or any(attachment_type(item) == "image" for item in attachments)
+    has_files = bool(metadata.get("has_files", False)) or any(
+        attachment_type(item) not in {"", "image"} for item in attachments
+    )
+    repository_request = hints.repository_likelihood >= 0.55 or any(token in lower for token in _REPOSITORY_TOKENS)
+    code_request = hints.code_likelihood >= 0.55 or any(token in lower for token in _CODE_TOKENS)
+    reasoning_request = any(token in lower for token in _REASONING_TOKENS)
+    vision_request = has_images or has_files or hints.vision_likelihood >= 0.45
+    if vision_request:
+        classification = "VISION"
+    elif repository_request:
+        classification = "KNOWLEDGE"
+    elif code_request:
+        classification = "CODE"
+    elif reasoning_request:
+        classification = "REASONING"
+    else:
+        classification = "GENERAL"
+    return {
+        "request": request,
+        "metadata": metadata,
+        "text": text,
+        "hints": hints,
+        "has_images": has_images,
+        "has_files": has_files,
+        "repository_request": repository_request,
+        "code_request": code_request,
+        "reasoning_request": reasoning_request,
+        "vision_request": vision_request,
+        "classification": classification,
     }
-    classification, score = max(scores.items(), key=lambda item: item[1])
-    if score < 0.45:
-        return "GENERAL"
-    return classification
+
+
+def _specialist_allowed_for_profile(profile: dict[str, Any], specialist: SpecialistType | None) -> bool:
+    if specialist is None:
+        return False
+    if specialist == SpecialistType.VISION:
+        return bool(profile.get("vision_request"))
+    if specialist == SpecialistType.KNOWLEDGE:
+        return bool(profile.get("repository_request"))
+    if specialist == SpecialistType.CODER:
+        return bool(profile.get("code_request"))
+    if specialist == SpecialistType.REASONING:
+        return bool(profile.get("reasoning_request") or profile.get("repository_request") or profile.get("code_request"))
+    if specialist == SpecialistType.CLARIFY:
+        return True
+    if specialist == SpecialistType.TOOLS:
+        return False
+    return False
+
+
+def _profile_next_specialist(profile: dict[str, Any]) -> SpecialistType | None:
+    classification = str(profile.get("classification") or "GENERAL")
+    if classification == "VISION":
+        return SpecialistType.VISION
+    if classification == "KNOWLEDGE":
+        return SpecialistType.KNOWLEDGE
+    if classification == "CODE":
+        return SpecialistType.CODER
+    if classification == "REASONING":
+        return SpecialistType.REASONING
+    return None
+
+
+def _answer_quality(confidence: float, *, sufficient: bool, hit_count: int | None = None) -> str:
+    if sufficient and confidence >= 0.8:
+        return "high"
+    if sufficient or confidence >= 0.5:
+        return "medium"
+    if hit_count == 0:
+        return "low"
+    return "low"
+
+
+def _status_from_sufficient(sufficient: bool) -> str:
+    return "success" if sufficient else "failed"
+
+
+def _plan_summary_for_profile(profile: dict[str, Any]) -> str:
+    classification = str(profile.get("classification") or "GENERAL")
+    text = str(profile.get("text") or "").strip()
+    if classification == "VISION":
+        return "Use Vision because the request includes attachments that require visual understanding."
+    if classification == "KNOWLEDGE":
+        return "Use Knowledge first because the request is repository, project, or codebase specific."
+    if classification == "CODE":
+        return "Use Coder because the request asks for code generation or code work."
+    if classification == "REASONING":
+        return "Use Reasoning because the request explicitly needs deeper synthesis."
+    if classification == "GENERAL":
+        return "Answer directly from general knowledge."
+    if text:
+        return text[:280]
+    return "Answer directly."
+
+
+def _validation_summary_for_state(
+    *,
+    last_step: SpecialistType | None,
+    evidence: dict[str, Any],
+    fallback_to_general: bool,
+    retry: bool,
+    next_specialist: SpecialistType | None,
+) -> str:
+    if retry and last_step is not None:
+        return f"Retrying {last_step.value} after a failed execution."
+    if fallback_to_general:
+        return "Knowledge was insufficient for a common-knowledge question, so the controller will answer directly."
+    if next_specialist is not None:
+        return f"Continue with {next_specialist.value} based on explicit specialist evidence."
+    if evidence.get("sufficient"):
+        return f"{last_step.value if last_step else 'Specialist'} evidence is sufficient; finalize the response."
+    return "Finalize the response."
+
+
+def _recommended_next_for_profile(
+    profile: dict[str, Any],
+    *,
+    last_step: SpecialistType | None,
+    evidence_sufficient: bool,
+) -> SpecialistType | None:
+    if evidence_sufficient:
+        if last_step == SpecialistType.KNOWLEDGE:
+            if profile.get("code_request"):
+                return SpecialistType.CODER
+            if profile.get("reasoning_request"):
+                return SpecialistType.REASONING
+        if last_step == SpecialistType.CODER and profile.get("repository_request") and profile.get("reasoning_request"):
+            return SpecialistType.REASONING
+        return None
+    if not profile.get("repository_request") and not profile.get("code_request") and not profile.get("vision_request"):
+        return None
+    if last_step == SpecialistType.KNOWLEDGE:
+        if profile.get("code_request"):
+            return SpecialistType.CODER
+        if profile.get("repository_request"):
+            return SpecialistType.REASONING if profile.get("reasoning_request") else None
+    if last_step == SpecialistType.CODER:
+        if profile.get("repository_request") and not profile.get("code_request"):
+            return SpecialistType.KNOWLEDGE
+        if profile.get("repository_request") and profile.get("reasoning_request"):
+            return SpecialistType.REASONING
+    if last_step == SpecialistType.VISION:
+        return None
+    return None
 
 
 def _coerce_generation(value: Any) -> ModelGenerationResponse | None:
@@ -221,31 +416,6 @@ def _normalize_controller_step(value: Any) -> SpecialistType | None:
         return None
 
 
-def _infer_next_specialist(
-    classification: str,
-    *,
-    needs_reasoning: bool,
-    requires_clarification: bool,
-    routing_hints: RoutingHints,
-    explicit_next: SpecialistType | None = None,
-) -> SpecialistType | None:
-    if explicit_next is not None:
-        return explicit_next
-    if requires_clarification:
-        return SpecialistType.CLARIFY
-    if classification == "VISION" or routing_hints.vision_likelihood >= 0.45:
-        return SpecialistType.VISION
-    if classification == "TOOLS":
-        return SpecialistType.TOOLS
-    if classification == "CODE" or routing_hints.code_likelihood >= 0.55:
-        return SpecialistType.CODER
-    if classification == "KNOWLEDGE" or routing_hints.repository_likelihood >= 0.55:
-        return SpecialistType.KNOWLEDGE
-    if needs_reasoning or classification == "REASONING":
-        return SpecialistType.REASONING
-    return None
-
-
 def _fallback_final_answer(state: dict[str, Any]) -> str:
     latest_user_message = last_user_text(state.get("messages", []))
     validation = _coerce_validation(state.get("controller_validation"))
@@ -280,13 +450,17 @@ def _specialist_evidence_summary(
     last_step: SpecialistType | None,
     settings: Settings,
 ) -> dict[str, Any]:
+    profile = _request_profile(state)
     step = last_step.value if last_step else "unknown"
     summary: dict[str, Any] = {
         "specialist_type": step,
-        "execution_status": "unknown",
+        "status": "unknown",
         "confidence": 0.0,
         "result_summary": "",
         "hit_count": None,
+        "answer_quality": "low",
+        "needs_additional_specialist": False,
+        "recommended_next_specialist": None,
         "sufficient": False,
     }
 
@@ -295,7 +469,7 @@ def _specialist_evidence_summary(
         if knowledge is None:
             summary.update(
                 {
-                    "execution_status": "missing_result",
+                    "status": "failed",
                     "result_summary": "Knowledge retrieval did not return a result.",
                     "hit_count": 0,
                 }
@@ -308,12 +482,16 @@ def _specialist_evidence_summary(
             and hit_count >= settings.knowledge_min_hits
             and knowledge.confidence >= settings.knowledge_min_score
         )
+        recommended_next = _recommended_next_for_profile(profile, last_step=last_step, evidence_sufficient=sufficient)
         summary.update(
             {
-                "execution_status": "ok" if hit_count else "no_documents",
+                "status": _status_from_sufficient(sufficient),
                 "confidence": knowledge.confidence,
                 "result_summary": knowledge.retrieval_reason or (knowledge.context or "")[:400],
                 "hit_count": hit_count,
+                "answer_quality": _answer_quality(knowledge.confidence, sufficient=sufficient, hit_count=hit_count),
+                "needs_additional_specialist": bool(recommended_next),
+                "recommended_next_specialist": recommended_next.value if recommended_next else None,
                 "sufficient": sufficient,
             }
         )
@@ -324,17 +502,21 @@ def _specialist_evidence_summary(
         if coder is None:
             summary.update(
                 {
-                    "execution_status": "missing_result",
+                    "status": "failed",
                     "result_summary": "Coder returned no result.",
                 }
             )
             return summary
         sufficient = bool((coder.summary or coder.code or "").strip())
+        recommended_next = _recommended_next_for_profile(profile, last_step=last_step, evidence_sufficient=sufficient)
         summary.update(
             {
-                "execution_status": "ok" if sufficient else "empty_result",
+                "status": _status_from_sufficient(sufficient),
                 "confidence": coder.confidence,
                 "result_summary": coder.summary or coder.code[:400],
+                "answer_quality": _answer_quality(coder.confidence, sufficient=sufficient),
+                "needs_additional_specialist": bool(recommended_next),
+                "recommended_next_specialist": recommended_next.value if recommended_next else None,
                 "sufficient": sufficient,
             }
         )
@@ -345,7 +527,7 @@ def _specialist_evidence_summary(
         if tool is None:
             summary.update(
                 {
-                    "execution_status": "missing_result",
+                    "status": "failed",
                     "result_summary": "Tool step returned no result.",
                 }
             )
@@ -353,9 +535,12 @@ def _specialist_evidence_summary(
         sufficient = tool.status == "ok" and bool((tool.summary or tool.result or tool.raw_text))
         summary.update(
             {
-                "execution_status": tool.status,
+                "status": tool.status,
                 "confidence": 1.0 if sufficient else 0.0,
                 "result_summary": tool.summary or str(tool.result)[:400],
+                "answer_quality": _answer_quality(1.0 if sufficient else 0.0, sufficient=sufficient),
+                "needs_additional_specialist": False,
+                "recommended_next_specialist": None,
                 "sufficient": sufficient,
             }
         )
@@ -365,9 +550,12 @@ def _specialist_evidence_summary(
         vision_context = str(state.get("vision_context", "") or "").strip()
         summary.update(
             {
-                "execution_status": "ok" if vision_context else "empty_result",
+                "status": _status_from_sufficient(bool(vision_context)),
                 "confidence": 1.0 if vision_context else 0.0,
                 "result_summary": vision_context[:400],
+                "answer_quality": _answer_quality(1.0 if vision_context else 0.0, sufficient=bool(vision_context)),
+                "needs_additional_specialist": False,
+                "recommended_next_specialist": None,
                 "sufficient": bool(vision_context),
             }
         )
@@ -462,6 +650,7 @@ class ControllerEngine:
         knowledge_result = _coerce_knowledge(state.get("knowledge_result"))
         coder_result = _coerce_coder(state.get("coder_result"))
         tool_result = _coerce_tool(state.get("tool_result"))
+        profile = _request_profile(state)
 
         messages = build_controller_messages(
             system_prompt=build_controller_plan_prompt(),
@@ -488,15 +677,30 @@ class ControllerEngine:
         )
 
         parsed = _extract_json_object(response.content)
-        hints = _routing_hints_from_state(state)
-        hint_classification = _classification_from_hints(hints)
-        classification = str(
+        parsed_classification = str(
             parsed.get("classification")
             or parsed.get("route")
             or parsed.get("category")
             or ""
         ).strip().upper()
-        known_classifications = {
+        deterministic_next = _profile_next_specialist(profile)
+        classification = str(profile.get("classification") or "GENERAL")
+        explicit_next = deterministic_next
+        complete = explicit_next is None
+        needs_reasoning = explicit_next == SpecialistType.REASONING
+        requires_clarification = False
+        pending_specialists = [explicit_next] if explicit_next is not None else []
+
+        if classification == "GENERAL":
+            complete = True
+            explicit_next = None
+            pending_specialists = []
+            needs_reasoning = False
+        elif explicit_next is None:
+            complete = True
+
+        rejected_reasons: list[str] = []
+        if parsed_classification and parsed_classification not in {
             "GENERAL",
             "KNOWLEDGE",
             "CODE",
@@ -504,65 +708,35 @@ class ControllerEngine:
             "TOOLS",
             "REASONING",
             "CLARIFY",
-        }
-        if classification not in known_classifications:
-            classification = hint_classification
-        elif classification == "GENERAL" and hint_classification != "GENERAL":
-            classification = hint_classification
-
-        explicit_next = _normalize_controller_step(
-            parsed.get("next_specialist") or parsed.get("next_step")
-        )
-        needs_reasoning = (
-            _bool_from_any(parsed.get("needs_reasoning", parsed.get("reasoning_required", False)))
-            or classification == "REASONING"
-        )
-        requires_clarification = classification == "CLARIFY" or _bool_from_any(parsed.get("requires_clarification", False))
-        complete = _bool_from_any(parsed.get("complete", False))
-
-        if hint_classification == "GENERAL" and classification == "KNOWLEDGE":
-            classification = "GENERAL"
-            explicit_next = None
-            needs_reasoning = False
-            requires_clarification = False
-            complete = True
-
-        if classification == "GENERAL":
-            explicit_next = None
-            needs_reasoning = False
-            requires_clarification = False
-            complete = True
-        elif explicit_next is None:
-            explicit_next = _infer_next_specialist(
-                classification,
-                needs_reasoning=needs_reasoning,
-                requires_clarification=requires_clarification,
-                routing_hints=hints,
-            )
-            if explicit_next is None and not needs_reasoning and not requires_clarification:
-                complete = True
-
-        pending_specialists = [explicit_next] if explicit_next is not None and not complete else []
+        }:
+            rejected_reasons.append(f"invalid_classification={parsed_classification}")
+        elif parsed_classification and parsed_classification != classification:
+            rejected_reasons.append(f"model_classification={parsed_classification}")
+        parsed_next = _normalize_controller_step(parsed.get("next_specialist") or parsed.get("next_step"))
+        if parsed_next is not None and parsed_next != explicit_next:
+            rejected_reasons.append(f"model_next={parsed_next.value}")
+        if parsed.get("pending_specialists"):
+            rejected_reasons.append("model_pending_specialists_ignored")
 
         plan = ControllerPlan(
             classification=classification,
-            intent=str(parsed.get("intent") or "").strip() or "general",
-            summary=str(parsed.get("explanation") or parsed.get("summary") or "").strip() or latest_user_message[:280],
+            intent=f"{classification.lower()} request",
+            summary=_plan_summary_for_profile(profile),
             complexity="medium",
             confidence=_safe_float(parsed.get("confidence"), 0.0),
             action=ControllerAction.FINALIZE if complete else ControllerAction.CONTINUE,
             complete=complete,
             next_specialist=explicit_next,
             pending_specialists=_unique_steps(pending_specialists),
-            retry=_bool_from_any(parsed.get("retry", False)),
-            retry_reason=str(parsed.get("retry_reason") or parsed.get("reason") or "").strip(),
+            retry=False,
+            retry_reason="",
             needs_reasoning=needs_reasoning,
             final_answer_ready=complete,
-            clarification_question=parsed.get("clarification_question"),
-            fallback_to_general=classification == "GENERAL" or _bool_from_any(parsed.get("fallback_to_general", False)),
+            clarification_question=None,
+            fallback_to_general=classification == "GENERAL",
             knowledge_sufficient=None,
-            completion_condition=str(parsed.get("completion_condition") or "").strip(),
-            explanation=str(parsed.get("explanation") or parsed.get("summary") or "").strip(),
+            completion_condition="Finalize when the planned specialist evidence is sufficient.",
+            explanation=_plan_summary_for_profile(profile),
         )
 
         if plan.classification == "GENERAL":
@@ -575,6 +749,28 @@ class ControllerEngine:
             plan.fallback_to_general = True
 
         plan.route_hint = plan_to_route(plan)
+
+        logger.debug(
+            "controller_plan_decision %s",
+            json.dumps(
+                {
+                    "classification": plan.classification,
+                    "selected_next_specialist": plan.next_specialist.value if plan.next_specialist else None,
+                    "complete": plan.complete,
+                    "request_evidence": {
+                        "has_images": profile.get("has_images", False),
+                        "has_files": profile.get("has_files", False),
+                        "repository_request": profile.get("repository_request", False),
+                        "code_request": profile.get("code_request", False),
+                        "reasoning_request": profile.get("reasoning_request", False),
+                        "vision_request": profile.get("vision_request", False),
+                    },
+                    "rejected_model_signals": rejected_reasons,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+        )
         return plan
 
     async def validate(
@@ -587,6 +783,7 @@ class ControllerEngine:
         step_text = last_step.value if last_step else "unknown"
         state_summary = self._structured_state_prompt(state)
         evidence = _specialist_evidence_summary(state, last_step=last_step, settings=self.settings)
+        profile = _request_profile(state)
 
         validation_messages = [
             ChatMessage(
@@ -636,73 +833,125 @@ class ControllerEngine:
         )
 
         parsed = _extract_json_object(response.content)
-        hints = _routing_hints_from_state(state)
-        parsed_next = _normalize_controller_step(
-            parsed.get("next_specialist")
-            or parsed.get("next_step")
-            or (parsed.get("pending_specialists") or [None])[0]
-        )
         plan = _coerce_plan(state.get("execution_plan") or state.get("controller_plan"))
-        fallback_next = parsed_next or (plan.next_specialist if plan else None)
+        request_classification = str(profile.get("classification") or "GENERAL")
+        confidence = _safe_float(parsed.get("confidence"), 0.0)
+        knowledge_sufficient: bool | None = evidence.get("sufficient") if last_step == SpecialistType.KNOWLEDGE else None
+        fallback_to_general = False
+        retry = False
+        needs_reasoning = False
+        requires_clarification = False
+        complete = True
+        action = ControllerAction.FINALIZE
+        next_specialist: SpecialistType | None = None
 
-        action_raw = str(parsed.get("action") or "continue").strip().lower()
-        if action_raw == "reasoning":
-            action_raw = "reason"
-        try:
-            action = ControllerAction(action_raw)
-        except Exception:
+        current_status = str(evidence.get("status") or "").strip().lower()
+        candidate = _normalize_controller_step(evidence.get("recommended_next_specialist"))
+        candidate_allowed = _specialist_allowed_for_profile(profile, candidate)
+        candidate_is_new = candidate is not None and candidate.value not in _current_executed_steps(state)
+        needs_additional_specialist = bool(evidence.get("needs_additional_specialist", False))
+
+        retry_counts: dict[str, int] = {}
+        for key, value in (state.get("retry_counts", {}) or {}).items():
+            try:
+                retry_counts[str(key)] = int(value)
+            except Exception:
+                retry_counts[str(key)] = 0
+
+        if last_step is not None and current_status == "failed" and retry_counts.get(last_step.value, 0) < self.settings.max_specialist_retries:
+            retry = True
+            next_specialist = last_step
             action = ControllerAction.CONTINUE
-
-        fallback_to_general = _bool_from_any(parsed.get("fallback_to_general", False))
-        knowledge_sufficient = parsed.get("knowledge_sufficient")
-        if knowledge_sufficient is not None:
-            knowledge_sufficient = _bool_from_any(knowledge_sufficient)
-        retry = _bool_from_any(parsed.get("retry", False))
-        retry_reason = str(parsed.get("retry_reason") or parsed.get("reason") or "").strip()
-        complete = _bool_from_any(parsed.get("complete", False))
-        needs_reasoning = action == ControllerAction.REASON or _bool_from_any(
-            parsed.get("needs_reasoning", False)
-        )
-        requires_clarification = action == ControllerAction.CLARIFY
-        next_specialist = fallback_next
-        if action == ControllerAction.FINALIZE:
-            next_specialist = None
-            complete = True
-        elif action == ControllerAction.CLARIFY:
-            next_specialist = SpecialistType.CLARIFY
-        elif action == ControllerAction.REASON:
-            next_specialist = SpecialistType.REASONING
-        elif next_specialist is None and not needs_reasoning:
-            complete = True
-
-        if last_step == SpecialistType.KNOWLEDGE:
+            complete = False
+            retry_reason = retry_reason or "specialist failed; retrying once"
+        elif last_step == SpecialistType.KNOWLEDGE:
             sufficient = bool(evidence.get("sufficient", False))
             knowledge_sufficient = sufficient
-            request_classification = _classification_from_hints(hints)
-            if not sufficient and request_classification == "GENERAL":
-                action = ControllerAction.FINALIZE
-                fallback_to_general = True
-                next_specialist = None
-                needs_reasoning = False
-                complete = True
-            elif (
-                not sufficient
-                and action in {ControllerAction.FINALIZE, ControllerAction.CONTINUE}
-                and next_specialist is None
-                and not fallback_to_general
-            ):
-                if request_classification == "KNOWLEDGE" or hints.repository_likelihood >= 0.55:
+            if needs_additional_specialist and candidate_allowed and candidate_is_new:
+                next_specialist = candidate
+                complete = False
+                if candidate == SpecialistType.REASONING:
                     action = ControllerAction.REASON
                     needs_reasoning = True
-                else:
+                elif candidate == SpecialistType.CLARIFY:
                     action = ControllerAction.CLARIFY
-                    needs_reasoning = False
+                    requires_clarification = True
+                else:
+                    action = ControllerAction.CONTINUE
+            elif not sufficient and request_classification == "GENERAL":
+                fallback_to_general = True
+            elif candidate is not None and not candidate_allowed:
+                fallback_to_general = request_classification == "GENERAL"
+        elif last_step == SpecialistType.CODER:
+            sufficient = bool(evidence.get("sufficient", False))
+            if needs_additional_specialist and candidate_allowed and candidate_is_new:
+                next_specialist = candidate
                 complete = False
-                next_specialist = (
-                    SpecialistType.REASONING
-                    if action == ControllerAction.REASON
-                    else SpecialistType.CLARIFY
+                if candidate == SpecialistType.REASONING:
+                    action = ControllerAction.REASON
+                    needs_reasoning = True
+                elif candidate == SpecialistType.CLARIFY:
+                    action = ControllerAction.CLARIFY
+                    requires_clarification = True
+                else:
+                    action = ControllerAction.CONTINUE
+            elif not sufficient and request_classification == "GENERAL":
+                fallback_to_general = True
+        elif last_step == SpecialistType.VISION:
+            sufficient = bool(evidence.get("sufficient", False))
+            if needs_additional_specialist and candidate_allowed and candidate_is_new:
+                next_specialist = candidate
+                complete = False
+                action = ControllerAction.CONTINUE if candidate not in {SpecialistType.REASONING, SpecialistType.CLARIFY} else (
+                    ControllerAction.REASON if candidate == SpecialistType.REASONING else ControllerAction.CLARIFY
                 )
+                needs_reasoning = candidate == SpecialistType.REASONING
+                requires_clarification = candidate == SpecialistType.CLARIFY
+        elif candidate_allowed and candidate_is_new:
+            next_specialist = candidate
+            complete = False
+            if candidate == SpecialistType.REASONING:
+                action = ControllerAction.REASON
+                needs_reasoning = True
+            elif candidate == SpecialistType.CLARIFY:
+                action = ControllerAction.CLARIFY
+                requires_clarification = True
+            else:
+                action = ControllerAction.CONTINUE
+
+        if next_specialist is None and not fallback_to_general and not retry and not needs_reasoning and not requires_clarification:
+            complete = True
+
+        if fallback_to_general:
+            action = ControllerAction.FINALIZE
+            next_specialist = None
+            complete = True
+            needs_reasoning = False
+            requires_clarification = False
+
+        if candidate is not None and not candidate_allowed:
+            logger.debug(
+                "controller_validation_rejected_candidate %s",
+                json.dumps(
+                    {
+                        "last_step": last_step.value if last_step else None,
+                        "candidate": candidate.value,
+                        "reason": "candidate not justified by request evidence",
+                        "request_classification": request_classification,
+                    },
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+
+        summary = _validation_summary_for_state(
+            last_step=last_step,
+            evidence=evidence,
+            fallback_to_general=fallback_to_general,
+            retry=retry,
+            next_specialist=next_specialist,
+        )
+        retry_reason = summary if retry else ""
 
         executed_steps = {
             str(item)
@@ -714,12 +963,6 @@ class ControllerEngine:
             for item in (state.get("failed_specialists", []) or [])
             if str(item).strip()
         }
-        retry_counts: dict[str, int] = {}
-        for key, value in (state.get("retry_counts", {}) or {}).items():
-            try:
-                retry_counts[str(key)] = int(value)
-            except Exception:
-                retry_counts[str(key)] = 0
         if next_specialist is not None and not retry:
             if (
                 next_specialist.value in executed_steps
@@ -751,11 +994,12 @@ class ControllerEngine:
                     complete = True
 
         pending_specialists = [next_specialist] if next_specialist is not None and not complete else []
+        summary = summary or ("Retrying specialist after failure." if retry else "Validation complete.")
 
-        return ControllerValidation(
+        validation = ControllerValidation(
             action=action,
-            summary=str(parsed.get("summary") or parsed.get("reason") or "").strip(),
-            confidence=_safe_float(parsed.get("confidence"), 0.0),
+            summary=summary,
+            confidence=confidence,
             complete=complete or action == ControllerAction.FINALIZE,
             next_specialist=next_specialist,
             pending_specialists=_unique_steps(pending_specialists),
@@ -765,11 +1009,29 @@ class ControllerEngine:
             final_answer_ready=complete or action == ControllerAction.FINALIZE,
             fallback_to_general=fallback_to_general,
             knowledge_sufficient=knowledge_sufficient,
-            reason=str(parsed.get("reason") or parsed.get("summary") or "").strip(),
-            issues=[str(item) for item in (parsed.get("issues") or []) if str(item).strip()],
-            notes=str(parsed.get("notes") or "").strip(),
+            reason=summary,
+            issues=[],
+            notes="",
             classification=(plan.classification if plan else "GENERAL"),
         )
+
+        logger.debug(
+            "controller_validation_decision %s",
+            json.dumps(
+                {
+                    "last_step": step_text,
+                    "action": validation.action.value,
+                    "selected_next_specialist": validation.next_specialist.value if validation.next_specialist else None,
+                    "retry": validation.retry,
+                    "fallback_to_general": validation.fallback_to_general,
+                    "evidence": evidence,
+                    "request_classification": request_classification,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        return validation
 
     async def finalize(self, state: dict[str, Any]) -> ModelGenerationResponse:
         """

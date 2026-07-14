@@ -29,17 +29,17 @@ Planning rules:
 - Do not expose reasoning, analysis, or internal control flow.
 - Prefer GENERAL whenever the controller can answer directly.
 - Use the supplied request metadata and routing hints as evidence.
-- Do not try to detect images, files, URLs, code blocks, or repository keywords yourself.
-- Use KNOWLEDGE only for project-specific or indexed information.
-- Use CODE only for writing, editing, debugging, or explaining code.
-- Use VISION only when image understanding is required.
-- Use TOOLS only when external execution is required.
-- Use REASONING only when the request explicitly needs synthesis.
+- Never invent a specialist or schedule one that is not justified by the request.
+- Use KNOWLEDGE first for repository, project, codebase, homelab, config, docs, or history questions.
+- Use CODE for code generation, review, refactor, debugging, or explanation.
+- Use VISION only when the request includes an image or document attachment that requires visual understanding.
+- Use TOOLS only when external execution is explicitly required.
+- Use REASONING only when the request explicitly needs deeper synthesis.
 - Choose at most one next step.
 - Do not repeat a step unless retry is explicitly requested after failure.
 - Mark complete when no further work is needed.
 - Re-plan after every specialist result.
-- Do not expand the workflow beyond the supplied request metadata and routing hints.
+- Do not expand the workflow beyond the supplied request metadata, routing hints, and specialist evidence.
 
 Return this JSON shape:
 {
@@ -68,6 +68,9 @@ Evaluate:
 - confidence
 - result summary
 - hit count when applicable
+- answer_quality
+- needs_additional_specialist
+- recommended_next_specialist
 - whether the current request is satisfied
 
 Decide one action:
@@ -79,6 +82,10 @@ Decide one action:
 Knowledge fallback:
 - If retrieval is weak for common world knowledge, set fallback_to_general true and action finalize.
 - If retrieval is weak for project-specific material, choose reason or clarify.
+- If the current specialist did not explicitly indicate missing information, do not invoke a different specialist.
+- Never switch to an unrelated specialist without deterministic evidence from the request or the specialist result.
+- Vision may only be selected when attachment metadata proves an image or document is present.
+- Knowledge may not be skipped for repository-specific questions.
 
 Return STRICT JSON ONLY with this shape:
 {
