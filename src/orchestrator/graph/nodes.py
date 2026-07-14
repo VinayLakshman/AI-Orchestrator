@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable
+from typing import Any
 
 from ..clients.knowledge import KnowledgeClient
 from ..common.enums import ChatRole, ControllerAction, SpecialistType
 from ..context.builder import last_user_text, render_structured_context
-from ..controller.engine import ControllerEngine, plan_to_route
+from ..controller.shared import (
+    current_execution_plan as _current_execution_plan,
+    current_executed_steps as _current_executed_steps,
+    current_failed_steps as _current_failed_steps,
+    current_pending_steps as _current_pending_steps,
+    has_finalize_path as _has_finalize_path,
+    normalize_specialist as _normalize_specialist,
+    plan_to_route,
+    retry_counts_from_state as _retry_counts_from_state,
+    step_from_pending as _step_from_pending,
+    unique_specialist_values as _unique_specialist_values,
+)
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse, extract_assistant_text
@@ -70,83 +81,6 @@ def _as_tool(value: Any) -> ToolResult | None:
     if isinstance(value, dict):
         return ToolResult.model_validate(value)
     return None
-
-
-def _current_execution_plan(state: OrchestratorState) -> ControllerPlan | None:
-    value = state.get("execution_plan") or state.get("controller_validation") or state.get("controller_plan")
-    return _as_plan(value)
-
-
-def _step_from_pending(pending_steps: list[str] | None) -> SpecialistType | None:
-    if not pending_steps:
-        return None
-    try:
-        return SpecialistType(pending_steps[0])
-    except Exception:
-        return None
-
-
-def _normalize_specialist(value: Any) -> SpecialistType | None:
-    if not value:
-        return None
-    try:
-        return SpecialistType(str(value))
-    except Exception:
-        return None
-
-
-def _unique_specialist_values(values: Iterable[Any]) -> list[str]:
-    seen: set[str] = set()
-    normalized: list[str] = []
-    for value in values:
-        step = _normalize_specialist(value)
-        if step is None:
-            continue
-        if step.value in seen:
-            continue
-        seen.add(step.value)
-        normalized.append(step.value)
-    return normalized
-
-
-def _retry_counts_from_state(state: OrchestratorState) -> dict[str, int]:
-    raw = state.get("retry_counts", {}) or {}
-    counts: dict[str, int] = {}
-    if isinstance(raw, dict):
-        for key, value in raw.items():
-            step = _normalize_specialist(key)
-            if step is None:
-                continue
-            try:
-                counts[step.value] = max(0, int(value))
-            except Exception:
-                counts[step.value] = 0
-    return counts
-
-
-def _current_pending_steps(state: OrchestratorState) -> list[str]:
-    plan = _current_execution_plan(state)
-    if plan and plan.pending_specialists:
-        return _unique_specialist_values(plan.pending_specialists)
-    pending = list(state.get("pending_specialists", []) or [])
-    if not pending:
-        pending = list(state.get("pending_steps", []) or [])
-    return _unique_specialist_values(pending)
-
-
-def _current_executed_steps(state: OrchestratorState) -> list[str]:
-    return _unique_specialist_values(state.get("executed_specialists", []) or [])
-
-
-def _current_failed_steps(state: OrchestratorState) -> list[str]:
-    return _unique_specialist_values(state.get("failed_specialists", []) or [])
-
-
-def _has_finalize_path(state: OrchestratorState) -> bool:
-    plan = _current_execution_plan(state)
-    if plan is not None:
-        return bool(plan.complete)
-    return not _current_pending_steps(state) and not bool(state.get("needs_reasoning")) and not bool(state.get("requires_clarification"))
 
 
 def _pending_update(step: SpecialistType | None) -> list[str]:

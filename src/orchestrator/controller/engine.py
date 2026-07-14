@@ -8,7 +8,6 @@ from ..clients.ollama import OllamaClient
 from ..common.enums import (
     ChatRole,
     ControllerAction,
-    RouteType,
     SpecialistType,
 )
 from ..models.chat import ChatMessage
@@ -27,19 +26,17 @@ from ..schemas import (
     ControllerValidation,
     CoderResult,
     NormalizedRequest,
-    RouteDecision,
     RoutingHints,
     ToolResult,
 )
 from ..settings import Settings
+from .shared import current_executed_steps, plan_to_route
 from .prompts import (
     build_controller_final_prompt,
     build_controller_plan_prompt,
     build_controller_validation_prompt,
     build_reasoning_prompt,
 )
-
-from ..graph.nodes import _current_executed_steps
 
 
 logger = get_logger(__name__)
@@ -567,35 +564,6 @@ def _specialist_evidence_summary(
     return summary
 
 
-def plan_to_route(plan: ControllerPlan) -> RouteDecision:
-    has_steps = bool(plan.pending_specialists)
-    if plan.complete:
-        route = RouteType.GENERAL
-    elif plan.next_specialist == SpecialistType.CLARIFY:
-        route = RouteType.CLARIFY
-    elif plan.next_specialist == SpecialistType.VISION:
-        route = RouteType.VISION
-    elif plan.next_specialist == SpecialistType.CODER:
-        route = RouteType.CODE
-    elif plan.next_specialist == SpecialistType.KNOWLEDGE:
-        route = RouteType.RAG
-    elif plan.next_specialist == SpecialistType.TOOLS:
-        route = RouteType.TOOLS
-    else:
-        route = RouteType.MULTI_STEP if has_steps else RouteType.GENERAL
-
-    return RouteDecision(
-        route=route,
-        confidence=plan.confidence,
-        reason=plan.summary or plan.intent or "Controller plan",
-        needs_vision=plan.next_specialist == SpecialistType.VISION,
-        needs_rag=plan.next_specialist == SpecialistType.KNOWLEDGE,
-        needs_tools=plan.next_specialist == SpecialistType.TOOLS,
-        needs_code=plan.next_specialist == SpecialistType.CODER,
-        needs_planning=has_steps and not plan.complete,
-    )
-
-
 @dataclass(slots=True)
 class ControllerEngine:
     settings: Settings
@@ -837,7 +805,7 @@ class ControllerEngine:
         current_status = str(evidence.get("status") or "").strip().lower()
         candidate = _normalize_controller_step(evidence.get("recommended_next_specialist"))
         candidate_allowed = _specialist_allowed_for_profile(profile, candidate)
-        candidate_is_new = candidate is not None and candidate.value not in _current_executed_steps(state)
+        candidate_is_new = candidate is not None and candidate.value not in current_executed_steps(state)
         needs_additional_specialist = bool(evidence.get("needs_additional_specialist", False))
 
         retry_counts: dict[str, int] = {}
