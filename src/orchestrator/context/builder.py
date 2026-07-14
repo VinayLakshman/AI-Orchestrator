@@ -353,29 +353,72 @@ def _build_conversation_history(
         raise ValueError("Conversation is empty")
 
     role_sequence = _message_sequence(raw_messages)
-    if role_sequence[-1] != ChatRole.USER.value:
-        raise ValueError("Latest conversation message must be a user message")
 
-    latest_user_text = _message_content_text(raw_messages[-1])
-    history_messages = raw_messages[:-1]
-    history_token_count = sum(_message_token_count(message) for message in history_messages)
+    latest_user_index: int | None = None
+
+    for index in range(len(raw_messages) - 1, -1, -1):
+        message = raw_messages[index]
+
+        role = (
+            message.role
+            if isinstance(message, ChatMessage)
+            else message.get("role")
+        )
+
+        if role == ChatRole.USER.value:
+            latest_user_index = index
+            break
+
+    if latest_user_index is None:
+        raise ValueError("Conversation contains no user message")
+
+    latest_user_text = _message_content_text(raw_messages[latest_user_index])
+
+    # Preserve the complete conversation.
+    history_messages = raw_messages
+
+    history_token_count = sum(
+        _message_token_count(message)
+        for message in history_messages
+    )
+
     truncated = False
 
-    while history_messages and history_token_count > CONVERSATION_HISTORY_TOKEN_BUDGET:
+    while (
+        history_messages
+        and history_token_count > CONVERSATION_HISTORY_TOKEN_BUDGET
+    ):
         history_messages.pop(0)
-        history_token_count = sum(_message_token_count(message) for message in history_messages)
+
+        history_token_count = sum(
+            _message_token_count(message)
+            for message in history_messages
+        )
+
         truncated = True
 
-    history_chat_messages = [ChatMessage.model_validate(message) for message in history_messages]
+    history_chat_messages = [
+        ChatMessage.model_validate(message)
+        for message in history_messages
+    ]
+
     conversation_info = {
         "total_message_count": len(raw_messages),
         "role_sequence": role_sequence,
+        "latest_user_index": latest_user_index,
         "latest_user_message_length": len(latest_user_text),
         "history_token_count": history_token_count,
         "truncation_occurred": truncated,
-        "latest_user_survived_truncation": True,
+        "latest_user_survived_truncation": latest_user_index >= (
+            len(raw_messages) - len(history_chat_messages)
+        ),
     }
-    return history_chat_messages, latest_user_text, conversation_info
+
+    return (
+        history_chat_messages,
+        latest_user_text,
+        conversation_info,
+    )
 
 
 def last_user_text(messages: list[dict[str, Any]] | None) -> str:
