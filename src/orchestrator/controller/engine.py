@@ -16,6 +16,7 @@ from ..models.ollama import ModelGenerationResponse, extract_assistant_text, nor
 from ..context.builder import (
     build_controller_messages,
     build_finalize_context,
+    build_finalizer_messages,
     last_user_text,
     estimate_text_tokens,
     render_request_context,
@@ -738,48 +739,23 @@ class ControllerEngine:
         *,
         last_step: SpecialistType | None = None,
     ) -> ControllerValidation:
-        latest_user_message = last_user_text(state.get("messages", []))
         step_text = last_step.value if last_step else "unknown"
         state_summary = self._structured_state_prompt(state)
         evidence = _specialist_evidence_summary(state, last_step=last_step, settings=self.settings)
         profile = _request_profile(state)
 
-        validation_messages = [
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                content=build_controller_validation_prompt(),
+        validation_messages = build_controller_messages(
+            system_prompt=build_controller_validation_prompt(),
+            messages=self._state_messages(state),
+            request_context=self._request_context(state),
+            structured_context=(
+                "Current state summary:\n\n"
+                f"{state_summary or 'No structured context yet.'}"
             ),
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "normalized_request"},
-                content=self._request_context(state) or "No normalized request context available.",
+            additional_context=(
+                f"Last specialist step: {step_text}\n\n"
+                f"Specialist evidence summary:\n{evidence}"
             ),
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "state_summary"},
-                content=(
-                    "Current state summary:\n\n"
-                    f"{state_summary or 'No structured context yet.'}"
-                ),
-            ),
-        ]
-
-        if latest_user_message:
-            validation_messages.append(
-                ChatMessage(
-                    role=ChatRole.USER,
-                    content=f"Latest user request:\n{latest_user_message}",
-                )
-            )
-
-        validation_messages.append(
-            ChatMessage(
-                role=ChatRole.USER,
-                content=(
-                    f"Last specialist step: {step_text}\n\n"
-                    f"Specialist evidence summary:\n{evidence}"
-                ),
-            )
         )
 
         response = await self.ollama.chat(
@@ -1001,14 +977,11 @@ class ControllerEngine:
         context_json = json.dumps(finalizer_context, separators=(",", ":"), ensure_ascii=False).strip()
         finalizer_prompt = build_controller_final_prompt()
 
-        messages = [
-            ChatMessage(role=ChatRole.SYSTEM, content=finalizer_prompt),
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "finalize_context"},
-                content=context_json or '{"question":"","sources":[]}',
-            ),
-        ]
+        messages = build_finalizer_messages(
+            system_prompt=finalizer_prompt,
+            messages=self._state_messages(state),
+            evidence_context=context_json or '{"question":"","sources":[]}',
+        )
 
         prompt_tokens = estimate_text_tokens(finalizer_prompt)
         context_tokens = estimate_text_tokens(context_json)

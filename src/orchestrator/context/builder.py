@@ -20,6 +20,7 @@ from ..schemas import (
 logger = get_logger(__name__)
 
 FINALIZE_CONTEXT_TOKEN_BUDGET = 700
+CONVERSATION_HISTORY_TOKEN_BUDGET = 2400
 FINALIZE_SOURCE_ORDER = {
     "knowledge": 0,
     "coder": 1,
@@ -304,6 +305,77 @@ def _coerce_generation(value: Any) -> ModelGenerationResponse | None:
         except Exception:
             return None
     return None
+
+
+def _message_role(message: dict[str, Any] | ChatMessage) -> str:
+    if isinstance(message, ChatMessage):
+        return str(message.role.value)
+    return str(message.get("role") or "")
+
+
+def _message_content_text(message: dict[str, Any] | ChatMessage) -> str:
+    content: Any
+    if isinstance(message, ChatMessage):
+        content = message.content
+    else:
+        content = message.get("content")
+
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                for key in ("text", "content", "url"):
+                    value = part.get(key)
+                    if isinstance(value, str) and value.strip():
+                        parts.append(value.strip())
+                        break
+        return "\n".join(parts).strip()
+    if content is None:
+        return ""
+    return str(content).strip()
+
+
+def _message_token_count(message: dict[str, Any] | ChatMessage) -> int:
+    return estimate_text_tokens(_message_content_text(message))
+
+
+def _message_sequence(messages: list[dict[str, Any] | ChatMessage]) -> list[str]:
+    return [_message_role(message) for message in messages]
+
+
+def _build_conversation_history(
+    messages: list[dict[str, Any] | ChatMessage] | None,
+) -> tuple[list[ChatMessage], str, dict[str, Any]]:
+    raw_messages = list(messages or [])
+    if not raw_messages:
+        raise ValueError("Conversation is empty")
+
+    role_sequence = _message_sequence(raw_messages)
+    if role_sequence[-1] != ChatRole.USER.value:
+        raise ValueError("Latest conversation message must be a user message")
+
+    latest_user_text = _message_content_text(raw_messages[-1])
+    history_messages = raw_messages[:-1]
+    history_token_count = sum(_message_token_count(message) for message in history_messages)
+    truncated = False
+
+    while history_messages and history_token_count > CONVERSATION_HISTORY_TOKEN_BUDGET:
+        history_messages.pop(0)
+        history_token_count = sum(_message_token_count(message) for message in history_messages)
+        truncated = True
+
+    history_chat_messages = [ChatMessage.model_validate(message) for message in history_messages]
+    conversation_info = {
+        "total_message_count": len(raw_messages),
+        "role_sequence": role_sequence,
+        "latest_user_message_length": len(latest_user_text),
+        "history_token_count": history_token_count,
+        "truncation_occurred": truncated,
+        "latest_user_survived_truncation": True,
+    }
+    return history_chat_messages, latest_user_text, conversation_info
 
 
 def last_user_text(messages: list[dict[str, Any]] | None) -> str:
@@ -601,15 +673,10 @@ def build_controller_messages(
     system_prompt: str,
     messages: list[dict[str, Any]] | None = None,
     request_context: str = "",
-    vision_context: str = "",
-    knowledge_result: KnowledgeRetrieveResponse | None = None,
-    coder_result: CoderResult | None = None,
-    tool_result: ToolResult | None = None,
-    reasoning_result: ModelGenerationResponse | None = None,
-    controller_plan: ControllerPlan | None = None,
-    controller_validation: ControllerValidation | None = None,
-    latest_user_message: str | None = None,
+    structured_context: str = "",
+    additional_context: str = "",
 ) -> list[ChatMessage]:
+    history_messages, latest_user_message, conversation_info = _build_conversation_history(messages)
     outgoing: list[ChatMessage] = [ChatMessage(role=ChatRole.SYSTEM, content=system_prompt)]
 
     if request_context:
@@ -621,15 +688,6 @@ def build_controller_messages(
             )
         )
 
-    structured_context = render_structured_context(
-        vision_context=vision_context,
-        knowledge_result=knowledge_result,
-        coder_result=coder_result,
-        tool_result=tool_result,
-        reasoning_result=reasoning_result,
-        controller_plan=controller_plan,
-        controller_validation=controller_validation,
-    )
     if structured_context:
         outgoing.append(
             ChatMessage(
@@ -639,9 +697,34 @@ def build_controller_messages(
             )
         )
 
-    outgoing.extend(_state_messages_to_chat_messages(messages))
+    if additional_context:
+        outgoing.append(
+            ChatMessage(
+                role=ChatRole.SYSTEM,
+                metadata={"source": "additional_context"},
+                content=additional_context,
+            )
+        )
 
-    if latest_user_message and last_user_text(messages) != latest_user_message:
-        outgoing.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
+    outgoing.extend(history_messages)
+    outgoing.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
+
+    logger.debug(
+        "conversation_assembly %s",
+        json.dumps(conversation_info, sort_keys=True, default=str),
+    )
 
     return outgoing
+
+
+def build_finalizer_messages(
+    *,
+    system_prompt: str,
+    messages: list[dict[str, Any]] | None = None,
+    evidence_context: str = "",
+) -> list[ChatMessage]:
+    return build_controller_messages(
+        system_prompt=system_prompt,
+        messages=messages,
+        structured_context=evidence_context,
+    )
