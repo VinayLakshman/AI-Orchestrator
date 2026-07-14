@@ -150,49 +150,6 @@ def _has_finalize_path(state: OrchestratorState) -> bool:
     return not _current_pending_steps(state) and not bool(state.get("needs_reasoning")) and not bool(state.get("requires_clarification"))
 
 
-def _workflow_signature(state: OrchestratorState) -> str:
-    plan = _current_execution_plan(state)
-    snapshot = {
-        "current_step": str(state.get("current_step", "") or ""),
-        "execution_plan": plan.model_dump(exclude_none=True) if plan else {},
-        "pending_specialists": _current_pending_steps(state),
-        "executed_specialists": _current_executed_steps(state),
-        "failed_specialists": _current_failed_steps(state),
-        "retry_counts": _retry_counts_from_state(state),
-        "completed_steps": list(state.get("completed_steps", []) or []),
-        "needs_reasoning": bool(state.get("needs_reasoning", False)),
-        "requires_clarification": bool(state.get("requires_clarification", False)),
-        "validation_status": str(state.get("validation_status", "") or ""),
-        "last_controller_decision": str(state.get("last_controller_decision", "") or ""),
-        "last_specialist": str(state.get("last_specialist", "") or ""),
-    }
-    return json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _can_schedule_specialist(
-    state: OrchestratorState,
-    specialist: SpecialistType,
-    *,
-    retry: bool = False,
-) -> bool:
-    step = specialist.value
-    executed = set(_current_executed_steps(state))
-    failed = set(_current_failed_steps(state))
-    completed = set(str(item) for item in (state.get("completed_steps", []) or []))
-    retry_counts = _retry_counts_from_state(state)
-
-    if retry:
-        return step in failed and retry_counts.get(step, 0) < max(1, int(state.get("retry_limit", 1) or 1))
-
-    if step in completed:
-        return False
-    if step in executed and step not in failed:
-        return False
-    if retry_counts.get(step, 0) >= max(1, int(state.get("retry_limit", 1) or 1)):
-        return False
-    return True
-
-
 def _pending_update(step: SpecialistType | None) -> list[str]:
     return [step.value] if step is not None else []
 
@@ -478,21 +435,27 @@ def _update_used_tools(state: OrchestratorState, tool_name: str) -> list[str]:
 
 def make_prepare_node(settings: Settings):
     async def prepare_node(state: OrchestratorState) -> dict[str, Any]:
-        messages = state.get("messages", []) or []
-        user_text = last_user_text(messages)
-        image_refs = collect_latest_message_images(messages, settings.vision_max_images)
+        messages = list(state.get("messages", []) or [])
+        original_messages = list(state.get("original_messages", messages) or [])
+        controller_messages = list(state.get("controller_messages", messages) or [])
+        user_text = last_user_text(controller_messages)
 
         metadata = dict(state.get("metadata", {}) or {})
-        metadata.setdefault("has_images", bool(image_refs))
+        metadata.setdefault("has_images", bool(metadata.get("has_images", False)))
         metadata.setdefault("user_text", user_text)
 
         return {
             "user_text": user_text,
-            "has_images": bool(image_refs),
+            "has_images": bool(metadata.get("has_images", False)),
             "metadata": metadata,
             "used_models": list(state.get("used_models", []) or []),
             "used_tools": list(state.get("used_tools", []) or []),
-            "messages": messages,
+            "messages": controller_messages,
+            "controller_messages": controller_messages,
+            "original_messages": original_messages,
+            "normalized_request": state.get("normalized_request"),
+            "routing_hints": dict(state.get("routing_hints", {}) or {}),
+            "attachments": list(state.get("attachments", []) or []),
             "execution_plan": None,
             "controller_plan": None,
             "controller_validation": None,
@@ -600,14 +563,15 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             return updates
 
         stream = get_current_stream()
-        image_refs = collect_latest_message_images(state.get("messages", []), settings.vision_max_images)
+        vision_messages = list(state.get("original_messages") or state.get("messages", []) or [])
+        image_refs = collect_latest_message_images(vision_messages, settings.vision_max_images)
         if stream and image_refs:
             await stream.vision_started(image_count=len(image_refs))
 
-        result = await vision_pipeline.process(state)
+        result = await vision_pipeline.process({**state, "messages": vision_messages})
 
         if result is None:
-            cleaned = strip_images_from_messages(state.get("messages", []))
+            cleaned = strip_images_from_messages(vision_messages)
             if stream:
                 await stream.vision_finished(summary="No image attachments were found.")
             updates.update({"messages": cleaned, "specialist_status": "failed"})
@@ -641,7 +605,7 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             **updates,
             "vision": analysis.model_dump(exclude_none=True),
             "vision_context": vision_context,
-            "messages": result.cleaned_messages or state.get("messages", []),
+            "messages": result.cleaned_messages or vision_messages,
             "metadata": metadata,
             "used_models": _update_used_models(state, analysis.source_model or settings.vision_model),
             "specialist_status": "success" if vision_context or analysis.summary else "failed",

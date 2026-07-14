@@ -28,6 +28,27 @@ class ToolRequest(BaseModel):
     description: str = ""
 
 
+class NormalizedAttachment(BaseModel):
+    attachment_type: str
+    placeholder: str
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class RoutingHints(BaseModel):
+    repository_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
+    code_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
+    vision_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class NormalizedRequest(BaseModel):
+    original_messages: list[dict[str, Any]] = Field(default_factory=list)
+    controller_messages: list[dict[str, Any]] = Field(default_factory=list)
+    user_query: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    routing_hints: RoutingHints = Field(default_factory=RoutingHints)
+    attachments: list[NormalizedAttachment] = Field(default_factory=list)
+
+
 class ExecutionPlan(BaseModel):
     classification: Literal[
         "GENERAL",

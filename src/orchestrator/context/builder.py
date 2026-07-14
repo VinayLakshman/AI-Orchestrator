@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..common.enums import ChatRole, RouteType
+from ..common.enums import ChatRole
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse
-from ..schemas import ControllerPlan, ControllerValidation, CoderResult, RouteDecision, ToolResult
-from ..settings import Settings
-from ..vision.prompts import build_vision_injection_message
+from ..schemas import (
+    ControllerPlan,
+    ControllerValidation,
+    CoderResult,
+    NormalizedRequest,
+    ToolResult,
+)
 
 def last_user_text(messages: list[dict[str, Any]] | None) -> str:
     if not messages:
@@ -101,10 +105,47 @@ def render_structured_context(
     return "\n".join(parts).strip()
 
 
+def render_request_context(request: NormalizedRequest | dict[str, Any] | None) -> str:
+    if request is None:
+        return ""
+    if isinstance(request, dict):
+        try:
+            request = NormalizedRequest.model_validate(request)
+        except Exception:
+            return ""
+
+    parts = [
+        "# Normalized Request",
+        f"- User query: {request.user_query or ''}",
+        f"- Message count: {request.metadata.get('message_count', 0)}",
+        f"- Has images: {bool(request.metadata.get('has_images', False))}",
+        f"- Has files: {bool(request.metadata.get('has_files', False))}",
+        f"- Attachment types: {', '.join(request.metadata.get('attachment_types', [])) or 'none'}",
+        f"- Contains URLs: {bool(request.metadata.get('contains_urls', False))}",
+        f"- Contains code blocks: {bool(request.metadata.get('contains_code_blocks', False))}",
+        f"- Estimated prompt tokens: {request.metadata.get('estimated_prompt_tokens', 0)}",
+        "",
+        "## Routing Hints",
+        f"- repository_likelihood: {request.routing_hints.repository_likelihood:.2f}",
+        f"- code_likelihood: {request.routing_hints.code_likelihood:.2f}",
+        f"- vision_likelihood: {request.routing_hints.vision_likelihood:.2f}",
+        "",
+    ]
+
+    if request.attachments:
+        parts.append("## Attachments")
+        for attachment in request.attachments[:8]:
+            parts.append(f"- {attachment.attachment_type}: {attachment.placeholder}")
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
 def build_controller_messages(
     *,
     system_prompt: str,
     messages: list[dict[str, Any]] | None = None,
+    request_context: str = "",
     vision_context: str = "",
     knowledge_result: KnowledgeRetrieveResponse | None = None,
     coder_result: CoderResult | None = None,
@@ -115,6 +156,15 @@ def build_controller_messages(
     latest_user_message: str | None = None,
 ) -> list[ChatMessage]:
     outgoing: list[ChatMessage] = [ChatMessage(role=ChatRole.SYSTEM, content=system_prompt)]
+
+    if request_context:
+        outgoing.append(
+            ChatMessage(
+                role=ChatRole.SYSTEM,
+                metadata={"source": "normalized_request"},
+                content=request_context,
+            )
+        )
 
     structured_context = render_structured_context(
         vision_context=vision_context,
@@ -140,54 +190,3 @@ def build_controller_messages(
         outgoing.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
 
     return outgoing
-
-
-def resolve_system_prompt_for_route(decision: RouteDecision) -> str:
-    # Backward compatibility: keep the old API surface available.
-    if decision.route == RouteType.VISION:
-        return "You are a dedicated vision assistant."
-    if decision.route == RouteType.CODE:
-        return "You are a dedicated coding assistant."
-    if decision.route == RouteType.RAG:
-        return "You are a grounded retrieval assistant."
-    if decision.route == RouteType.TOOLS:
-        return "You are a tool execution assistant."
-    if decision.route == RouteType.CLARIFY:
-        return "You are a clarification assistant."
-    return "You are a general assistant."
-
-
-def select_model_for_route(
-    settings: Settings,
-    decision: RouteDecision,
-) -> str:
-    if decision.route == RouteType.VISION:
-        return settings.vision_model
-    if decision.route == RouteType.CODE:
-        return settings.coder_model
-    if decision.route in (RouteType.RAG, RouteType.TOOLS, RouteType.MULTI_STEP):
-        return settings.controller_model
-    return settings.controller_model
-
-
-def build_generation_messages(
-    *,
-    system_prompt: str,
-    messages: list[dict[str, Any]] | None = None,
-    vision_context: str = "",
-    knowledge_result: KnowledgeRetrieveResponse | None = None,
-    mcp_context: str = "",
-    memory_context: str = "",
-    latest_user_message: str | None = None,
-) -> list[ChatMessage]:
-    return build_controller_messages(
-        system_prompt=system_prompt,
-        messages=messages,
-        vision_context=vision_context,
-        knowledge_result=knowledge_result,
-        latest_user_message=latest_user_message,
-    )
-
-
-def build_vision_injection_block(context_markdown: str, user_text: str = "") -> str:
-    return build_vision_injection_message(context_markdown, user_text)

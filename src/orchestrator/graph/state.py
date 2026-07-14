@@ -4,7 +4,15 @@ from typing import Any, TypedDict
 
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse
-from ..schemas import ControllerPlan, ControllerValidation, CoderResult, ExecutionPlan, RouteDecision, ToolResult
+from ..schemas import (
+    ControllerPlan,
+    ControllerValidation,
+    CoderResult,
+    ExecutionPlan,
+    NormalizedRequest,
+    RouteDecision,
+    ToolResult,
+)
 
 
 class OrchestratorState(TypedDict, total=False):
@@ -12,7 +20,12 @@ class OrchestratorState(TypedDict, total=False):
     request_id: str
 
     messages: list[dict[str, Any]]
+    controller_messages: list[dict[str, Any]]
+    original_messages: list[dict[str, Any]]
     metadata: dict[str, Any]
+    normalized_request: dict[str, Any] | NormalizedRequest
+    routing_hints: dict[str, Any]
+    attachments: list[dict[str, Any]]
 
     user_text: str
     has_images: bool

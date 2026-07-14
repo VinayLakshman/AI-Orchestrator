@@ -28,6 +28,8 @@ Planning rules:
 - Return STRICT JSON ONLY.
 - Do not expose reasoning, analysis, or internal control flow.
 - Prefer GENERAL whenever the controller can answer directly.
+- Use the supplied request metadata and routing hints as evidence.
+- Do not try to detect images, files, URLs, code blocks, or repository keywords yourself.
 - Use KNOWLEDGE only for project-specific or indexed information.
 - Use CODE only for writing, editing, debugging, or explaining code.
 - Use VISION only when image understanding is required.
@@ -37,6 +39,7 @@ Planning rules:
 - Do not repeat a step unless retry is explicitly requested after failure.
 - Mark complete when no further work is needed.
 - Re-plan after every specialist result.
+- Do not expand the workflow beyond the supplied request metadata and routing hints.
 
 Return this JSON shape:
 {

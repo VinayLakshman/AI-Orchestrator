@@ -132,7 +132,7 @@ class VisionPipeline:
             )
 
     async def process(self, state: dict[str, Any]) -> VisionResult | None:
-        messages = state.get("messages", []) or []
+        messages = state.get("original_messages") or state.get("messages", []) or []
         metadata = state.get("metadata", {}) or {}
         request_headers = metadata.get("request_headers", {}) or {}
 

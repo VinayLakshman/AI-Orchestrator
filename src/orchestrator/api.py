@@ -11,14 +11,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .common.constants import THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
-from .models.chat import ChatMessage, ChatRequest
+from .models.chat import ChatRequest
 from .models.knowledge import KnowledgeRetrieveResponse
 from .models.ollama import ModelGenerationResponse, extract_assistant_text
+from .request_normalizer import normalize_openai_request
 from .schemas import (
     ControllerPlan,
     ControllerValidation,
     CoderResult,
-    ExecutionPlan,
+    NormalizedRequest,
     OpenAIChatCompletionChoice,
     OpenAIChatCompletionRequest,
     OpenAIChatCompletionResponse,
@@ -58,24 +59,18 @@ def _thread_id_from_request(payload: ChatRequest) -> str:
     return str(uuid4())
 
 
-def _to_chat_request(
-    payload: OpenAIChatCompletionRequest,
-    thread_id: str | None = None,
-) -> ChatRequest:
-    messages = [
-        ChatMessage(
-            role=msg.role,  # ChatRole-compatible string works here
-            content=msg.content,
-            name=msg.name,
-            tool_call_id=msg.tool_call_id,
-        )
-        for msg in payload.messages
-    ]
-
-    return ChatRequest(
-        messages=messages,
-        thread_id=thread_id,
-        model=payload.model,
+def _openai_request_from_chat_request(payload: ChatRequest) -> OpenAIChatCompletionRequest:
+    return OpenAIChatCompletionRequest(
+        model=payload.model or "orchestrator",
+        messages=[
+            OpenAIMessage(
+                role=message.role,
+                content=message.content,
+                name=message.name,
+                tool_call_id=message.tool_call_id,
+            )
+            for message in payload.messages
+        ],
         stream=payload.stream,
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
@@ -89,20 +84,37 @@ def _input_state_from_request(
     *,
     request_id: str | None = None,
 ) -> dict[str, Any]:
+    normalized_request = normalize_openai_request(_openai_request_from_chat_request(payload))
+    return _input_state_from_normalized_request(
+        normalized_request,
+        request,
+        thread_id=_thread_id_from_request(payload),
+        request_id=request_id,
+    )
+
+
+def _input_state_from_normalized_request(
+    normalized: NormalizedRequest,
+    request: Request,
+    *,
+    thread_id: str,
+    request_id: str | None = None,
+) -> dict[str, Any]:
     metadata = {
-        **payload.metadata,
-        "requested_model": payload.model,
-        "requested_stream": payload.stream,
-        "temperature": payload.temperature,
-        "max_tokens": payload.max_tokens,
+        **(normalized.metadata or {}),
         "request_headers": _request_headers(request),
     }
     if request_id:
         metadata["request_id"] = request_id
 
     return {
-        "thread_id": _thread_id_from_request(payload),
-        "messages": [message.model_dump(exclude_none=True) for message in payload.messages],
+        "thread_id": thread_id,
+        "messages": [message for message in normalized.controller_messages],
+        "controller_messages": [message for message in normalized.controller_messages],
+        "original_messages": [message for message in normalized.original_messages],
+        "normalized_request": normalized.model_dump(exclude_none=True),
+        "routing_hints": normalized.routing_hints.model_dump(exclude_none=True),
+        "attachments": [attachment.model_dump(exclude_none=True) for attachment in normalized.attachments],
         "metadata": metadata,
         "used_models": [],
         "used_tools": [],
@@ -373,9 +385,14 @@ async def openai_chat_completions(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ):
     request_id = str(uuid4())
-    thread_id = _thread_id_from_request(_to_chat_request(payload))
-    chat_request = _to_chat_request(payload, thread_id=thread_id)
-    state_input = _input_state_from_request(chat_request, request, request_id=request_id)
+    normalized_request = normalize_openai_request(payload)
+    thread_id = str(uuid4())
+    state_input = _input_state_from_normalized_request(
+        normalized_request,
+        request,
+        thread_id=thread_id,
+        request_id=request_id,
+    )
 
     stream = runtime.stream_hub.get_or_create(request_id, conversation_id=thread_id)
     publisher = StreamPublisher(stream)
