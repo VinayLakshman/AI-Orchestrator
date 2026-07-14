@@ -15,7 +15,9 @@ from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse, extract_assistant_text, normalize_generation_response
 from ..context.builder import (
     build_controller_messages,
+    build_finalize_context,
     last_user_text,
+    estimate_text_tokens,
     render_request_context,
     render_structured_context,
 )
@@ -995,37 +997,33 @@ class ControllerEngine:
         Produce a final answer with the resident controller.
         If specialist evidence exists, synthesize it into a user-facing answer.
         """
-        latest_user_message = last_user_text(state.get("messages", []))
-        plan = _coerce_plan(state.get("execution_plan") or state.get("controller_plan"))
-        knowledge = _coerce_knowledge(state.get("knowledge_result"))
-        coder = _coerce_coder(state.get("coder_result"))
-        tool = _coerce_tool(state.get("tool_result"))
-        reasoning = _coerce_generation(state.get("reasoning_result"))
-
-        has_specialist_evidence = any(
-            [
-                knowledge and bool(knowledge.context),
-                coder and bool((coder.summary or coder.code).strip()),
-                tool and bool((tool.summary or tool.result or tool.raw_text)),
-                bool(str(state.get("vision_context", "") or "").strip()),
-                reasoning and bool(reasoning.content.strip()),
-            ]
-        )
-        structured_context = ""
-        if has_specialist_evidence and not (plan and plan.classification == "GENERAL"):
-            structured_context = self._structured_state_prompt(state)
+        finalizer_context = build_finalize_context(state)
+        context_json = json.dumps(finalizer_context, separators=(",", ":"), ensure_ascii=False).strip()
+        finalizer_prompt = build_controller_final_prompt()
 
         messages = [
-            ChatMessage(role=ChatRole.SYSTEM, content=build_controller_final_prompt()),
+            ChatMessage(role=ChatRole.SYSTEM, content=finalizer_prompt),
             ChatMessage(
                 role=ChatRole.SYSTEM,
-                metadata={"source": "structured_context"},
-                content=structured_context or "No structured context available.",
+                metadata={"source": "finalize_context"},
+                content=context_json or '{"question":"","sources":[]}',
             ),
         ]
 
-        if latest_user_message:
-            messages.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
+        prompt_tokens = estimate_text_tokens(finalizer_prompt)
+        context_tokens = estimate_text_tokens(context_json)
+        logger.debug(
+            "finalizer_context %s",
+            json.dumps(
+                {
+                    "finalizer_prompt_tokens": prompt_tokens,
+                    "finalizer_context_tokens": context_tokens,
+                    "finalizer_sources": len(finalizer_context.get("sources", []) or []),
+                },
+                sort_keys=True,
+                default=str,
+            ),
+        )
 
         response = await self.ollama.chat(
             model=self.models.controller().name,

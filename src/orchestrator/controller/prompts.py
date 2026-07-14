@@ -77,13 +77,20 @@ def build_controller_final_prompt() -> str:
 Finalizer only.
 
 Produce only the final assistant response.
-- Never expose planning or routing.
-- Never expose reasoning.
-- Synthesize specialist outputs naturally.
-- If no specialists executed, answer directly from model knowledge.
-- Prefer repository evidence over model knowledge when available.
-- Never mention internal orchestration.
-- Never return empty content.
+- Answer only the user's request.
+- Never expose planning, routing, validation, reasoning or orchestration.
+- Treat every evidence item as factual context.
+- Synthesize information across ALL evidence.
+- Do not answer from model knowledge when repository evidence exists.
+- Prefer repository evidence over prior knowledge.
+- Merge related facts into one coherent explanation.
+- Remove repetition.
+- Preserve important technical details.
+- If repository evidence is insufficient, explicitly state what is missing before using general knowledge.
+- Never invent missing information.
+- Never mention specialists.
+- Never mention context.
+- Never return empty output.
 """.strip()
 
 
