@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -37,6 +38,8 @@ from .prompts import (
     build_controller_validation_prompt,
     build_reasoning_prompt,
 )
+
+from ..graph.nodes import _current_executed_steps
 
 
 logger = get_logger(__name__)
@@ -645,33 +648,19 @@ class ControllerEngine:
         )
 
     async def plan(self, state: dict[str, Any]) -> ControllerPlan:
-        latest_user_message = last_user_text(state.get("messages", []))
-        vision_context = state.get("vision_context", "")
-        knowledge_result = _coerce_knowledge(state.get("knowledge_result"))
-        coder_result = _coerce_coder(state.get("coder_result"))
-        tool_result = _coerce_tool(state.get("tool_result"))
         profile = _request_profile(state)
 
         messages = build_controller_messages(
             system_prompt=build_controller_plan_prompt(),
             messages=self._state_messages(state),
             request_context=self._request_context(state),
-            vision_context=vision_context,
-            knowledge_result=(
-                knowledge_result
-                if isinstance(knowledge_result, KnowledgeRetrieveResponse)
-                else None
-            ),
-            coder_result=coder_result if isinstance(coder_result, CoderResult) else None,
-            tool_result=tool_result if isinstance(tool_result, ToolResult) else None,
-            latest_user_message=latest_user_message,
         )
 
         response = await self.ollama.chat(
             model=self.models.controller().name,
             messages=messages,
-            temperature=self.settings.controller_temperature,
-            max_tokens=self.settings.controller_final_max_tokens,
+            temperature=self.settings.controller_plan_temperature,
+            max_tokens=self.settings.controller_plan_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
         )
@@ -826,8 +815,8 @@ class ControllerEngine:
         response = await self.ollama.chat(
             model=self.models.controller().name,
             messages=validation_messages,
-            temperature=0.05,
-            max_tokens=self.settings.controller_max_tokens,
+            temperature=self.settings.controller_validate_temperature,
+            max_tokens=self.settings.controller_validate_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
         )
@@ -863,7 +852,7 @@ class ControllerEngine:
             next_specialist = last_step
             action = ControllerAction.CONTINUE
             complete = False
-            retry_reason = retry_reason or "specialist failed; retrying once"
+            retry_reason = "specialist failed; retrying once"
         elif last_step == SpecialistType.KNOWLEDGE:
             sufficient = bool(evidence.get("sufficient", False))
             knowledge_sufficient = sufficient
@@ -1073,8 +1062,8 @@ class ControllerEngine:
         response = await self.ollama.chat(
             model=self.models.controller().name,
             messages=messages,
-            temperature=self.settings.controller_temperature,
-            max_tokens=self.settings.controller_max_tokens,
+            temperature=self.settings.controller_finalize_temperature,
+            max_tokens=self.settings.controller_finalize_max_tokens,
             stream=False,
             keep_alive=self.settings.controller_keep_alive,
         )

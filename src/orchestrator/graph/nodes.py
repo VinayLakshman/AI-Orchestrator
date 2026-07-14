@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Iterable
 
 from ..clients.knowledge import KnowledgeClient
-from ..clients.ollama import OllamaClient
 from ..common.enums import ChatRole, ControllerAction, SpecialistType
 from ..context.builder import last_user_text, render_structured_context
 from ..controller.engine import ControllerEngine, plan_to_route

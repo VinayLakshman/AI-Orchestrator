@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..common.enums import ChatRole
@@ -114,31 +115,23 @@ def render_request_context(request: NormalizedRequest | dict[str, Any] | None) -
         except Exception:
             return ""
 
-    parts = [
-        "# Normalized Request",
-        f"- User query: {request.user_query or ''}",
-        f"- Message count: {request.metadata.get('message_count', 0)}",
-        f"- Has images: {bool(request.metadata.get('has_images', False))}",
-        f"- Has files: {bool(request.metadata.get('has_files', False))}",
-        f"- Attachment types: {', '.join(request.metadata.get('attachment_types', [])) or 'none'}",
-        f"- Contains URLs: {bool(request.metadata.get('contains_urls', False))}",
-        f"- Contains code blocks: {bool(request.metadata.get('contains_code_blocks', False))}",
-        f"- Estimated prompt tokens: {request.metadata.get('estimated_prompt_tokens', 0)}",
-        "",
-        "## Routing Hints",
-        f"- repository_likelihood: {request.routing_hints.repository_likelihood:.2f}",
-        f"- code_likelihood: {request.routing_hints.code_likelihood:.2f}",
-        f"- vision_likelihood: {request.routing_hints.vision_likelihood:.2f}",
-        "",
-    ]
-
-    if request.attachments:
-        parts.append("## Attachments")
-        for attachment in request.attachments[:8]:
-            parts.append(f"- {attachment.attachment_type}: {attachment.placeholder}")
-        parts.append("")
-
-    return "\n".join(parts).strip()
+    payload = {
+        "query": request.user_query or "",
+        "metadata": {
+            "message_count": int(request.metadata.get("message_count", 0) or 0),
+            "images": int(request.metadata.get("image_count", 0) or 0),
+            "files": int(len([item for item in request.attachments if item.attachment_type != "image"])),
+            "urls": int(bool(request.metadata.get("contains_urls", False))),
+            "code_blocks": int(bool(request.metadata.get("contains_code_blocks", False))),
+            "estimated_tokens": int(request.metadata.get("estimated_prompt_tokens", 0) or 0),
+        },
+        "routing_hints": {
+            "repository": round(float(request.routing_hints.repository_likelihood), 2),
+            "code": round(float(request.routing_hints.code_likelihood), 2),
+            "vision": round(float(request.routing_hints.vision_likelihood), 2),
+        },
+    }
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
 def build_controller_messages(

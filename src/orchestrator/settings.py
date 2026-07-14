@@ -38,10 +38,13 @@ class Settings(BaseSettings):
     reasoning_keep_alive: str = "15m"
     controller_model_think: bool = False
     reasoning_model_think: bool = True
-    controller_temperature: float = 0.15
+    controller_plan_temperature: float = 0.05
+    controller_validate_temperature: float = 0.0
+    controller_finalize_temperature: float = 0.15
     reasoning_temperature: float = 0.2
-    controller_max_tokens: int = 1024
-    controller_final_max_tokens: int = 3072
+    controller_plan_max_tokens: int = 256
+    controller_validate_max_tokens: int = 128
+    controller_finalize_max_tokens: int = 1200
     reasoning_max_tokens: int = 4096
     coder_max_tokens: int = 1200
     vision_max_tokens: int = 1200
@@ -90,6 +93,18 @@ class Settings(BaseSettings):
     @property
     def general_model(self) -> str:
         return self.controller_model
+
+    @property
+    def controller_temperature(self) -> float:
+        return self.controller_plan_temperature
+
+    @property
+    def controller_max_tokens(self) -> int:
+        return self.controller_plan_max_tokens
+
+    @property
+    def controller_final_max_tokens(self) -> int:
+        return self.controller_finalize_max_tokens
 
     @property
     def controller_think(self) -> bool:
