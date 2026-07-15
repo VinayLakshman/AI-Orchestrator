@@ -425,7 +425,13 @@ async def openai_chat_completions(
                     if event.kind != StreamKind.LLM_TOKEN:
                         continue
 
-                    token = str(event.data.get("token") or "")
+                    payload_data = event.payload or {}
+                    token = str(
+                        payload_data.get("token")
+                        or payload_data.get("content")
+                        or payload_data.get("text")
+                        or ""
+                    )
                     if not token:
                         continue
 
@@ -445,12 +451,9 @@ async def openai_chat_completions(
                         content=token,
                     )
 
-                # The stream is closed by _run_graph_with_stream() once the graph finishes.
                 with suppress(Exception):
                     result = await graph_task
 
-                # Fallback: if the graph produced a final answer but no token events were emitted,
-                # send the answer as a single assistant chunk.
                 if not token_seen:
                     answer = str((result or {}).get("answer", "") or "")
                     if answer:

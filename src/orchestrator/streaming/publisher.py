@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .hub import RequestEventStream
-from .models import StreamKind
+from .models import StreamEvent, StreamKind
 
 
 class StreamPublisher:
@@ -67,8 +67,14 @@ class StreamPublisher:
     async def llm_finished(self) -> None:
         await self._emit(StreamKind.LLM_FINISHED)
 
-    async def llm_token(self, token: str) -> None:
-        await self._emit(StreamKind.LLM_TOKEN, token=token)
+    async def llm_token(self, token: str) -> StreamEvent:
+        return await self.emit(
+            kind=StreamKind.LLM_TOKEN,
+            stage="generation",
+            message="Generated token.",
+            status="progress",
+            data={"token": token},
+        )
 
     async def error(self, error: str, *, stage: str | None = None) -> None:
         await self._emit(StreamKind.ERROR, error=error, stage=stage)
