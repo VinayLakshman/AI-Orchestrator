@@ -67,5 +67,8 @@ class StreamPublisher:
     async def llm_finished(self) -> None:
         await self._emit(StreamKind.LLM_FINISHED)
 
+    async def llm_token(self, token: str) -> None:
+        await self._emit(StreamKind.LLM_TOKEN, token=token)
+
     async def error(self, error: str, *, stage: str | None = None) -> None:
         await self._emit(StreamKind.ERROR, error=error, stage=stage)

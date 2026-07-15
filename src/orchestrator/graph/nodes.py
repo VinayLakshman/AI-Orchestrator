@@ -858,7 +858,7 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
                 if chunk.content:
                     content_parts.append(chunk.content)
                     if stream:
-                        await stream.reasoning_token(chunk.content)
+                        await stream.llm_token(chunk.content)
                 final_raw = chunk.raw or final_raw
 
             generation = ModelGenerationResponse(

@@ -31,6 +31,7 @@ class StreamKind(StrEnum):
 
     LLM_STARTED = "llm_started"
     LLM_FINISHED = "llm_finished"
+    LLM_TOKEN = "llm_token"
 
     ERROR = "error"
 
