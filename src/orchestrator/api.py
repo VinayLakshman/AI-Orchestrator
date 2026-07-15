@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from orchestrator.logging import get_logger
 
 from .common.constants import THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
@@ -36,6 +37,7 @@ from .streaming.publisher import StreamPublisher
 from .streaming.sse import _openai_chunk, _openai_done
 
 router = APIRouter(tags=["orchestrator"])
+logger = get_logger(__name__)
 
 
 def get_runtime(request: Request) -> OrchestratorRuntime:
@@ -280,13 +282,16 @@ async def _run_graph_with_stream(
     state_input: dict[str, Any],
     publisher: StreamPublisher,
 ) -> dict[str, Any]:
+    logger.debug("GRAPH: entered _run_graph_with_stream")
     async with stream_scope(publisher):
         await publisher.graph_started(route_hint=state_input.get("metadata", {}).get("requested_model"))
         try:
+            logger.debug("GRAPH: invoking graph")
             result = await runtime.graph.ainvoke(
                 state_input,
                 config={"configurable": {"thread_id": thread_id}},
             )
+            logger.debug("GRAPH: graph finished")
             route_name = result.get("route_name") or result.get("route", {}).get("route")
             await publisher.graph_finished(route=route_name)
             return result
@@ -294,6 +299,7 @@ async def _run_graph_with_stream(
             await publisher.graph_failed(str(exc))
             raise
         finally:
+            logger.debug("GRAPH: closing stream")
             await runtime.stream_hub.close(request_id)
 
 
@@ -404,6 +410,7 @@ async def openai_chat_completions(
     publisher = StreamPublisher(stream)
 
     if payload.stream:
+        logger.debug("SSE: creating graph task")
         graph_task = asyncio.create_task(
             _run_graph_with_stream(
                 runtime=runtime,
@@ -414,14 +421,23 @@ async def openai_chat_completions(
             ),
             name=f"orchestrator-stream-{request_id}",
         )
+        logger.debug("SSE: graph task created")
 
         async def sse_generator():
             role_sent = False
             token_seen = False
             result: dict[str, Any] | None = None
 
+            logger.debug("SSE: generator started")
+
             try:
+                logger.debug("SSE: subscribing")
                 async for event in stream.subscribe(after_seq=0):
+                    logger.debug(
+                        "SSE: event kind=%s payload=%s",
+                        event.kind,
+                        event.payload,
+                    )
                     if event.kind != StreamKind.LLM_TOKEN:
                         continue
 
@@ -450,6 +466,7 @@ async def openai_chat_completions(
                         model=str(payload.model),
                         content=token,
                     )
+                logger.debug("SSE: subscription finished")
 
                 with suppress(Exception):
                     result = await graph_task

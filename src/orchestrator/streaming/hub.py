@@ -4,9 +4,11 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
+from orchestrator.logging import get_logger
+
 from .models import StreamEvent, StreamKind
 
-
+logger = get_logger(__name__)
 @dataclass
 class RequestEventStream:
     request_id: str
@@ -17,6 +19,11 @@ class RequestEventStream:
     _cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
     async def publish(self, kind: StreamKind, **payload: Any) -> StreamEvent:
+        logger.debug(
+            "STREAM: publish kind=%s payload=%s",
+            kind,
+            payload,
+        )
         async with self._cond:
             self._seq += 1
             event = StreamEvent(
@@ -48,6 +55,7 @@ class RequestEventStream:
                     break
 
     async def close(self) -> None:
+        logger.debug("STREAM: close")
         async with self._cond:
             self._closed = True
             self._cond.notify_all()
