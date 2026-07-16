@@ -12,6 +12,7 @@ from ..clients.searxng import SearXNGClient
 from ..clients.ollama import OllamaClient
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
+from ..logging import get_logger
 from ..settings import Settings
 from ..specialists.web import WebSpecialist
 from ..streaming.hub import StreamHub
@@ -36,6 +37,7 @@ from .state import OrchestratorState
 
 
 CheckpointerKind = Literal["memory", "sqlite"]
+logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -44,12 +46,44 @@ class OrchestratorRuntime:
     model_manager: ModelManager
     controller: ControllerEngine
     knowledge_client: KnowledgeClient
-    searxng_client: SearXNGClient
     ollama_client: OllamaClient
     vision_pipeline: VisionPipeline
     stream_hub: StreamHub
     graph: Any
     checkpointer: Any
+    searxng_client: SearXNGClient | None = None
+
+    def validate_dependencies(self) -> None:
+        required = {
+            "settings": self.settings,
+            "model_manager": self.model_manager,
+            "controller": self.controller,
+            "knowledge_client": self.knowledge_client,
+            "ollama_client": self.ollama_client,
+            "vision_pipeline": self.vision_pipeline,
+            "stream_hub": self.stream_hub,
+            "graph": self.graph,
+            "checkpointer": self.checkpointer,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise RuntimeError(f"Runtime dependency registration incomplete: {', '.join(missing)}")
+        if self.settings.web_search_enabled and self.searxng_client is None:
+            raise RuntimeError(
+                "WEB_SEARCH_ENABLED is true but the SearXNG client was not registered"
+            )
+
+    async def close(self) -> None:
+        """Close runtime-owned transports exactly once."""
+        clients = [self.ollama_client.client, self.knowledge_client.client]
+        if self.searxng_client is not None:
+            clients.append(self.searxng_client.client)
+        closed: set[int] = set()
+        for client in clients:
+            if client is None or id(client) in closed:
+                continue
+            closed.add(id(client))
+            await client.aclose()
 
 
 def build_checkpointer(settings: Settings) -> tuple[Any, CheckpointerKind]:
@@ -84,7 +118,7 @@ def build_graph(
     plan_node = make_controller_plan_node(controller, settings)
     vision_node = make_vision_node(vision_pipeline, settings)
     knowledge_node = make_knowledge_node(knowledge_client, settings)
-    web_node = make_web_node(WebSpecialist(searxng_client or SearXNGClient(settings)), settings)
+    web_node = make_web_node(WebSpecialist(searxng_client), settings)
     coder_node = make_coder_node(controller, settings)
     tools_node = make_tools_node(settings)
     validate_node = make_controller_validate_node(controller, settings)
@@ -172,6 +206,7 @@ def build_graph(
 
 
 async def build_runtime(settings: Settings) -> OrchestratorRuntime:
+    logger.info("registering runtime dependencies")
     ollama_http = httpx.AsyncClient(
         base_url=settings.ollama_base_url,
         timeout=settings.request_timeout_s,
@@ -183,8 +218,13 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
 
     ollama_client = OllamaClient(settings=settings, client=ollama_http)
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
-    web_http = httpx.AsyncClient(base_url=settings.web_search_url, timeout=settings.web_search_timeout_s)
-    searxng_client = SearXNGClient(settings=settings, client=web_http)
+    searxng_client: SearXNGClient | None = None
+    if settings.web_search_enabled:
+        web_http = httpx.AsyncClient(
+            base_url=settings.web_search_url,
+            timeout=settings.web_search_timeout_s,
+        )
+        searxng_client = SearXNGClient(settings=settings, client=web_http)
     model_manager = ModelManager(settings=settings, ollama_client=ollama_client)
     controller = ControllerEngine(settings=settings, ollama=ollama_client, models=model_manager)
     vision_pipeline = VisionPipeline(settings=settings, client=ollama_http)
@@ -199,7 +239,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         vision_pipeline=vision_pipeline,
     )
 
-    return OrchestratorRuntime(
+    runtime = OrchestratorRuntime(
         settings=settings,
         model_manager=model_manager,
         controller=controller,
@@ -209,4 +249,13 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         stream_hub=stream_hub,
         graph=graph,
         checkpointer=checkpointer,
+        searxng_client=searxng_client,
     )
+    runtime.validate_dependencies()
+    logger.info(
+        "runtime dependency registration complete web_search=%s knowledge=%s vision=%s",
+        runtime.searxng_client is not None,
+        settings.enable_rag,
+        settings.enable_vision,
+    )
+    return runtime

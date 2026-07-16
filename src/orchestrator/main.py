@@ -35,6 +35,38 @@ async def lifespan(app: FastAPI):
     )
 
     runtime = await build_runtime(settings)
+    enabled = ["coder", "reasoning"]
+    disabled: list[str] = []
+    if settings.mcp_enabled:
+        enabled.append("tools")
+    else:
+        disabled.append("tools")
+    if settings.enable_rag:
+        enabled.append("knowledge")
+    else:
+        disabled.append("knowledge")
+    if settings.enable_vision:
+        enabled.append("vision")
+    else:
+        disabled.append("vision")
+    if settings.web_search_enabled:
+        enabled.append("web")
+    else:
+        disabled.append("web")
+    logger.info("runtime dependencies registered enabled_specialists=%s disabled_specialists=%s", enabled, disabled)
+    logger.debug(
+        "runtime dependency map settings=%s model_manager=%s controller=%s knowledge_client=%s searxng_client=%s ollama_client=%s vision_pipeline=%s stream_hub=%s graph=%s checkpointer=%s",
+        type(runtime.settings).__name__,
+        type(runtime.model_manager).__name__,
+        type(runtime.controller).__name__,
+        type(runtime.knowledge_client).__name__,
+        type(runtime.searxng_client).__name__ if runtime.searxng_client else None,
+        type(runtime.ollama_client).__name__,
+        type(runtime.vision_pipeline).__name__,
+        type(runtime.stream_hub).__name__,
+        type(runtime.graph).__name__,
+        type(runtime.checkpointer).__name__,
+    )
     app.state.runtime = runtime
 
     # Keep the resident controller loaded before serving traffic.
@@ -49,9 +81,7 @@ async def lifespan(app: FastAPI):
         cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
-        await runtime.ollama_client.client.aclose()  # type: ignore[union-attr]
-        await runtime.knowledge_client.client.aclose()  # type: ignore[union-attr]
-        await runtime.searxng_client.client.aclose()  # type: ignore[union-attr]
+        await runtime.close()
 
 
 settings = get_settings()

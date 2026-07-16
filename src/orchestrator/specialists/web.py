@@ -7,7 +7,7 @@ from ..models.web import WebSearchResult
 class WebSpecialist:
     """Coordinates web evidence retrieval without generating or summarizing prose."""
 
-    def __init__(self, client: SearXNGClient) -> None:
+    def __init__(self, client: SearXNGClient | None = None) -> None:
         self.client = client
 
     async def retrieve(
@@ -20,6 +20,11 @@ class WebSpecialist:
         normalized = normalize_query(query)
         if cached is not None and cached.query == normalized:
             return cached
+        if self.client is None:
+            return WebSearchResult(
+                query=normalized,
+                error="web search dependency is unavailable",
+            )
         return await self.client.search(normalized, max_results=max_results)
 
 
