@@ -441,7 +441,7 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
         plan = await controller.plan(state)
         route = plan_to_route(plan)
-        pending_steps = _pending_update(plan.next_specialist) if not plan.complete else []
+        pending_steps = [step.value for step in (plan.pending_specialists or [])] if not plan.complete else []
 
         if stream:
             await stream.controller_plan(intent=plan.intent, steps=pending_steps)
@@ -461,8 +461,8 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
         _log_transition(
             "controller_plan",
-            controller_decision="finalize" if plan.complete else (plan.next_specialist.value if plan.next_specialist else "finalize"),
-            selected_next_node="finalize" if plan.complete else (plan.next_specialist.value if plan.next_specialist else "finalize"),
+            controller_decision="finalize" if plan.complete else (pending_steps[0] if pending_steps else (plan.next_specialist.value if plan.next_specialist else "finalize")),
+            selected_next_node="finalize" if plan.complete else (pending_steps[0] if pending_steps else (plan.next_specialist.value if plan.next_specialist else "finalize")),
             **_state_snapshot({
                 **state,
                 "execution_plan": plan.model_dump(exclude_none=True),
@@ -476,6 +476,7 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
         plan_payload = plan.model_dump(exclude_none=True)
         plan_payload["pending_specialists"] = pending_steps
+        plan_payload["execution_queue"] = pending_steps
         return {
             "execution_plan": plan_payload,
             "controller_plan": plan_payload,

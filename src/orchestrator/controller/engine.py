@@ -47,16 +47,6 @@ from .shared import current_executed_steps, plan_to_route
 
 logger = get_logger(__name__)
 
-_SPECIALIST_ORDER: tuple[SpecialistType, ...] = (
-    SpecialistType.VISION,
-    SpecialistType.KNOWLEDGE,
-    SpecialistType.WEB,
-    SpecialistType.TOOLS,
-    SpecialistType.CODER,
-    SpecialistType.REASONING,
-    SpecialistType.CLARIFY,
-)
-
 
 def _coerce_knowledge(value: Any) -> KnowledgeRetrieveResponse | None:
     if value is None:
@@ -219,6 +209,10 @@ def _unique_steps(steps: Iterable[SpecialistType]) -> list[SpecialistType]:
 
 
 def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    Normalize request structure only.
+    Do not infer routing here.
+    """
     request = _coerce_request(state.get("normalized_request"))
     hints = _routing_hints_from_state(state)
     metadata = dict((request.metadata if request else state.get("metadata", {})) or {})

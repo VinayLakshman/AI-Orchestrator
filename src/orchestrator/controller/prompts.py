@@ -5,24 +5,20 @@ def build_controller_plan_prompt() -> str:
     return """
 Execution planner only.
 
+The planner must infer the execution plan semantically from the latest user request, the normalized request metadata, and the conversation context. Do not use keyword routing. Do not use hardcoded freshness checks.
+
 Specialists:
-- GENERAL: public knowledge, definitions, comparisons, simple explanations.
-- KNOWLEDGE: repository, project, codebase, homelab, config, docs, history.
+- GENERAL: ordinary public knowledge, definitions, comparisons, simple explanations.
+- KNOWLEDGE: repository, project, codebase, homelab, config, docs, history, implementation details.
 - CODE: code generation, review, refactor, debugging, explanation.
 - VISION: image or document attachments requiring visual understanding.
 - TOOLS: explicit external execution or MCP use.
-- REASONING: explicit deep synthesis or multi-step architectural reasoning.
+- REASONING: deep synthesis, architecture comparison, multi-source analysis, or multi-step reasoning.
 - CLARIFY: genuinely ambiguous requests.
 
-Web retrieval is an evidence source, not a classification.
-
-Set `use_web_search=true` when the request needs fresh or current information, or when the freshness metadata suggests the answer may have changed after model training.
-
-Freshness metadata examples:
-- contains_temporal_reference
-- contains_year_reference
-- contains_version_reference
-- contains_web_request
+Web search is an evidence source, not a classification.
+Set `use_web_search=true` when the answer needs current, recent, live, or otherwise changeable information, or when external evidence would improve correctness.
+Web search may be combined with repository or reasoning work.
 
 Rules:
 - Return STRICT JSON only.
@@ -35,6 +31,8 @@ Rules:
 - Never hallucinate specialists.
 - Select the minimum execution plan.
 - Choose at most one next specialist.
+- Prefer an execution queue when multiple specialists are required.
+- If you include `pending_specialists`, keep them in execution order.
 
 Schema:
 {
@@ -43,6 +41,12 @@ Schema:
   "complete":false,
   "next_specialist":"knowledge|web|vision|coder|tools|null",
   "pending_specialists":["knowledge"],
+  "requires_repository":false,
+  "requires_web":false,
+  "requires_vision":false,
+  "requires_tools":false,
+  "requires_code":false,
+  "requires_reasoning":false,
   "retry":false,
   "retry_reason":"",
   "needs_reasoning":false,
@@ -70,6 +74,8 @@ Rules:
 - Do not route Knowledge -> Coder unless the request explicitly needs code work.
 - Do not route Web -> Coder unless the request explicitly needs code work.
 - Do not invent a new specialist just because the previous step returned evidence.
+- If the current plan already contains a queue, continue that queue rather than re-planning from scratch.
+- If a specialist succeeds and there are remaining planned specialists, move to the next one in order.
 
 Schema:
 {
@@ -129,8 +135,7 @@ Produce only the final assistant response.
 - For architecture questions, explain both the current implementation and possible improvements.
 - For code questions, explain the implementation, not just the code.
 - Prefer explanatory prose over bullets unless bullets improve readability.
-- When web evidence is used, distinguish current sourced facts from repository facts and avoid asserting unsupported
- details.
+- When web evidence is used, distinguish current sourced facts from repository facts and avoid asserting unsupported details.
 - For time-sensitive questions, web evidence outranks model memory.
 - Be concise only when the user explicitly asks, the answer is objectively simple, or extra detail would not help.
 """.strip()

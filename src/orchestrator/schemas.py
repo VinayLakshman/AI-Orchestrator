@@ -68,6 +68,7 @@ class ExecutionPlan(BaseModel):
     complete: bool = False
     next_specialist: SpecialistType | None = None
     pending_specialists: list[SpecialistType] = Field(default_factory=list)
+    execution_queue: list[SpecialistType] = Field(default_factory=list)
     retry: bool = False
     retry_reason: str = ""
     needs_reasoning: bool = False
