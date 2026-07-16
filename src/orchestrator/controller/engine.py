@@ -215,20 +215,28 @@ def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
     text = (request.user_query if request else last_user_text(state.get("messages", []))) or ""
     lower = text.lower()
     attachments = list(request.attachments if request else state.get("attachments", []) or [])
+
     def attachment_type(item: Any) -> str:
         if isinstance(item, dict):
             return str(item.get("attachment_type") or item.get("type") or "").lower()
         return str(getattr(item, "attachment_type", "") or "").lower()
 
-    has_images = bool(metadata.get("has_images", False)) or any(attachment_type(item) == "image" for item in attachments)
+    has_images = bool(metadata.get("has_images", False)) or any(
+        attachment_type(item) == "image" for item in attachments
+    )
     has_files = bool(metadata.get("has_files", False)) or any(
         attachment_type(item) not in {"", "image"} for item in attachments
     )
-    repository_request = hints.repository_likelihood >= 0.55 or any(token in lower for token in _REPOSITORY_TOKENS)
-    code_request = hints.code_likelihood >= 0.55 or any(token in lower for token in _CODE_TOKENS)
+
+    repository_request = hints.repository_likelihood >= 0.55 or any(
+        token in lower for token in _REPOSITORY_TOKENS
+    )
+    code_request = hints.code_likelihood >= 0.55 or any(
+        token in lower for token in _CODE_TOKENS
+    )
     reasoning_request = any(token in lower for token in _REASONING_TOKENS)
-    web_search_request = any(token in lower for token in _WEB_TOKENS)
     vision_request = has_images or has_files or hints.vision_likelihood >= 0.45
+
     if vision_request:
         classification = "VISION"
     elif repository_request:
@@ -239,8 +247,7 @@ def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
         classification = "REASONING"
     else:
         classification = "GENERAL"
-    if vision_request or code_request:
-        web_search_request = False
+
     return {
         "request": request,
         "metadata": metadata,
@@ -253,7 +260,6 @@ def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
         "reasoning_request": reasoning_request,
         "vision_request": vision_request,
         "classification": classification,
-        "use_web_search": web_search_request,
     }
 
 
@@ -287,8 +293,6 @@ def _profile_next_specialist(profile: dict[str, Any]) -> SpecialistType | None:
         return SpecialistType.CODER
     if classification == "REASONING":
         return SpecialistType.REASONING
-    if profile.get("use_web_search"):
-        return SpecialistType.WEB
     return None
 
 
@@ -692,17 +696,22 @@ class ControllerEngine:
             or parsed.get("category")
             or ""
         ).strip().upper()
+
         deterministic_next = _profile_next_specialist(profile)
         classification = str(profile.get("classification") or "GENERAL")
+
+        planner_use_web_search = bool(parsed.get("use_web_search", False) and self.settings.web_search_enabled)
+
         explicit_next = deterministic_next
-        if explicit_next is None and profile.get("use_web_search") and self.settings.web_search_enabled:
+        if explicit_next is None and planner_use_web_search:
             explicit_next = SpecialistType.WEB
+
         complete = explicit_next is None
         needs_reasoning = explicit_next == SpecialistType.REASONING
         requires_clarification = False
         pending_specialists = [explicit_next] if explicit_next is not None else []
 
-        if classification == "GENERAL" and not profile.get("use_web_search"):
+        if classification == "GENERAL" and not planner_use_web_search:
             complete = True
             explicit_next = None
             pending_specialists = []
@@ -744,11 +753,11 @@ class ControllerEngine:
             needs_reasoning=needs_reasoning,
             final_answer_ready=complete,
             clarification_question=None,
-            fallback_to_general=classification == "GENERAL" and not profile.get("use_web_search"),
+            fallback_to_general=classification == "GENERAL" and not planner_use_web_search,
             knowledge_sufficient=None,
             completion_condition="Finalize when the planned specialist evidence is sufficient.",
             explanation=_plan_summary_for_profile(profile),
-            use_web_search=bool(profile.get("use_web_search") and self.settings.web_search_enabled),
+            use_web_search=planner_use_web_search,
         )
 
         if plan.classification == "GENERAL" and not plan.use_web_search:
