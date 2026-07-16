@@ -8,6 +8,7 @@ from orchestrator.streaming.publisher import StreamPublisher
 
 from ..clients.ollama import OllamaClient
 from ..common.enums import ChatRole, ControllerAction, SpecialistType
+from ..common.utils import _extract_json_object
 from ..context.builder import (
     build_controller_messages,
     build_finalize_context,
