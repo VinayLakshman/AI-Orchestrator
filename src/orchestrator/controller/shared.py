@@ -93,31 +93,52 @@ def has_finalize_path(state: dict[str, Any]) -> bool:
 
 
 def plan_to_route(plan: ControllerPlan) -> RouteDecision:
-    has_steps = bool(plan.pending_specialists)
+    pending = list(plan.pending_specialists or [])
+
     if plan.complete:
         route = RouteType.GENERAL
-    elif plan.next_specialist == SpecialistType.CLARIFY:
-        route = RouteType.CLARIFY
-    elif plan.next_specialist == SpecialistType.VISION:
-        route = RouteType.VISION
-    elif plan.next_specialist == SpecialistType.CODER:
-        route = RouteType.CODE
-    elif plan.next_specialist == SpecialistType.KNOWLEDGE:
-        route = RouteType.RAG
-    elif plan.next_specialist == SpecialistType.WEB:
+
+    elif len(pending) > 1:
+        route = RouteType.MULTI_STEP
+
+    elif not pending:
         route = RouteType.GENERAL
-    elif plan.next_specialist == SpecialistType.TOOLS:
-        route = RouteType.TOOLS
+
     else:
-        route = RouteType.MULTI_STEP if has_steps else RouteType.GENERAL
+        specialist = pending[0]
+
+        if specialist == SpecialistType.KNOWLEDGE:
+            route = RouteType.RAG
+
+        elif specialist == SpecialistType.VISION:
+            route = RouteType.VISION
+
+        elif specialist == SpecialistType.CODER:
+            route = RouteType.CODE
+
+        elif specialist == SpecialistType.TOOLS:
+            route = RouteType.TOOLS
+
+        elif specialist == SpecialistType.CLARIFY:
+            route = RouteType.CLARIFY
+
+        elif specialist in (
+            SpecialistType.WEB,
+            SpecialistType.REASONING,
+        ):
+            route = RouteType.MULTI_STEP
+
+        else:
+            route = RouteType.GENERAL
 
     return RouteDecision(
         route=route,
         confidence=plan.confidence,
-        reason=plan.summary or plan.intent or "Controller plan",
-        needs_vision=plan.next_specialist == SpecialistType.VISION,
-        needs_rag=plan.next_specialist == SpecialistType.KNOWLEDGE,
-        needs_tools=plan.next_specialist == SpecialistType.TOOLS,
-        needs_code=plan.next_specialist == SpecialistType.CODER,
-        needs_planning=has_steps and not plan.complete,
+        reason=plan.summary,
+        needs_rag=SpecialistType.KNOWLEDGE in pending,
+        needs_vision=SpecialistType.VISION in pending,
+        needs_code=SpecialistType.CODER in pending,
+        needs_tools=SpecialistType.TOOLS in pending,
+        needs_planning=len(pending) > 1,
+        candidate_models=[],
     )

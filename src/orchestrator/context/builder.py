@@ -483,6 +483,25 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
     removed_duplicates = 0
     input_tokens = estimate_text_tokens(question)
 
+    web_value = state.get("web_search_result")
+    if web_value:
+        try:
+            web = web_value if isinstance(web_value, WebSearchResult) else WebSearchResult.model_validate(web_value)
+        except Exception:
+            web = None
+        if web and web.results:
+            evidence = []
+            for item in web.results[:8]:
+                evidence.append({
+                    "title": _truncate(item.title, 140),
+                    "url": _truncate(item.url, 240),
+                    "snippet": _truncate(item.snippet, 280),
+                    "engine": _truncate(item.engine, 60),
+                })
+            sources.append({"type": "web", "query": _truncate(web.query, 240), "evidence": evidence})
+            raw_evidence_count += len(evidence)
+            logger.info("results_used=%d source=web", len(evidence))
+
     knowledge = _coerce_knowledge(state.get("knowledge_result"))
     if knowledge is not None:
         primary_hits = list(knowledge.primary_hits or [])
@@ -569,25 +588,6 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
             if filtered_extended:
                 sources.extend(filtered_extended[:3])
             raw_evidence_count += len(filtered_extended)
-
-    web_value = state.get("web_search_result")
-    if web_value:
-        try:
-            web = web_value if isinstance(web_value, WebSearchResult) else WebSearchResult.model_validate(web_value)
-        except Exception:
-            web = None
-        if web and web.results:
-            evidence = []
-            for item in web.results[:8]:
-                evidence.append({
-                    "title": _truncate(item.title, 140),
-                    "url": _truncate(item.url, 240),
-                    "snippet": _truncate(item.snippet, 280),
-                    "engine": _truncate(item.engine, 60),
-                })
-            sources.append({"type": "web", "query": _truncate(web.query, 240), "evidence": evidence})
-            raw_evidence_count += len(evidence)
-            logger.info("results_used=%d source=web", len(evidence))
 
     vision_context = _normalize_text(str(state.get("vision_context", "") or ""))
     vision = state.get("vision")

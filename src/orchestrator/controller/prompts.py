@@ -14,7 +14,15 @@ Specialists:
 - REASONING: explicit deep synthesis or multi-step architectural reasoning.
 - CLARIFY: genuinely ambiguous requests.
 
-Web retrieval is an evidence source, not a classification. Set `use_web_search=true` when the user asks for current, recent, latest, live, time-sensitive, or internet-dependent information, or when repository/model knowledge is insufficient and fresh evidence is needed. Never use it for ordinary general knowledge, repository-only questions, coding, vision, or non-current explanations.
+Web retrieval is an evidence source, not a classification.
+
+Set `use_web_search=true` when the request needs fresh or current information, or when the freshness metadata suggests the answer may have changed after model training.
+
+Freshness metadata examples:
+- contains_temporal_reference
+- contains_year_reference
+- contains_version_reference
+- contains_web_request
 
 Rules:
 - Return STRICT JSON only.
@@ -33,7 +41,7 @@ Schema:
   "intent":"...",
   "classification":"GENERAL|KNOWLEDGE|CODE|VISION|TOOLS|REASONING|CLARIFY",
   "complete":false,
-  "next_specialist":"knowledge|vision|coder|tools|null",
+  "next_specialist":"knowledge|web|vision|coder|tools|null",
   "pending_specialists":["knowledge"],
   "retry":false,
   "retry_reason":"",
@@ -54,11 +62,14 @@ Rules:
 - The latest user message is the only active instruction.
 - Previous conversation is context only.
 - Return STRICT JSON only.
-- Decide only: finalize, retry same specialist, or invoke one justified additional specialist.
+- Decide only: finalize, retry the same specialist, or continue with one justified next specialist.
 - Never introduce unrelated specialists.
 - Never answer the user.
 - Use request evidence and specialist evidence only.
 - Web evidence is retrieval-only. Use it when live evidence is required; do not expose raw results.
+- Do not route Knowledge -> Coder unless the request explicitly needs code work.
+- Do not route Web -> Coder unless the request explicitly needs code work.
+- Do not invent a new specialist just because the previous step returned evidence.
 
 Schema:
 {
@@ -66,7 +77,7 @@ Schema:
   "summary":"...",
   "confidence":0.0,
   "complete":false,
-  "next_specialist":"knowledge|vision|coder|tools|null",
+  "next_specialist":"knowledge|web|vision|coder|tools|null",
   "pending_specialists":["knowledge"],
   "retry":false,
   "retry_reason":"",
@@ -118,7 +129,9 @@ Produce only the final assistant response.
 - For architecture questions, explain both the current implementation and possible improvements.
 - For code questions, explain the implementation, not just the code.
 - Prefer explanatory prose over bullets unless bullets improve readability.
-- When web evidence is used, distinguish current sourced facts from repository facts and avoid asserting unsupported details.
+- When web evidence is used, distinguish current sourced facts from repository facts and avoid asserting unsupported
+ details.
+- For time-sensitive questions, web evidence outranks model memory.
 - Be concise only when the user explicitly asks, the answer is objectively simple, or extra detail would not help.
 """.strip()
 
