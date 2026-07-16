@@ -67,7 +67,23 @@ class OllamaClient:
         return payload
 
     def _extract_content(self, data: dict[str, Any]) -> str:
-        return extract_assistant_text(data)
+        """
+        Extract a single streamed token from an Ollama streaming response.
+
+        This intentionally performs no normalization or whitespace stripping.
+        Streaming must preserve the model output exactly.
+        """
+        message = data.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+
+        content = data.get("response")
+        if isinstance(content, str):
+            return content
+
+        return ""
 
     def _log_request(self, *, model: str, think: bool | None) -> None:
         logger.debug(

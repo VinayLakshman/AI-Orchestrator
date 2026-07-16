@@ -64,86 +64,35 @@ def _dedupe_text_items(values: list[str]) -> tuple[list[str], int]:
         deduped.append(item)
     return deduped, removed
 
-
-def _question_terms(question: str) -> set[str]:
-    tokens = {
-        token.lower()
-        for token in re.findall(r"[a-zA-Z0-9_][a-zA-Z0-9_\-]+", question or "")
-        if len(token) >= 3
-    }
-    stopwords = {
-        "what",
-        "when",
-        "where",
-        "which",
-        "that",
-        "this",
-        "with",
-        "from",
-        "your",
-        "about",
-        "into",
-        "how",
-        "why",
-        "are",
-        "was",
-        "the",
-        "and",
-        "for",
-        "use",
-        "used",
-        "does",
-        "did",
-        "can",
-        "could",
-        "would",
-        "should",
-        "please",
-    }
-    return {token for token in tokens if token not in stopwords}
-
-
-def _content_relevance(question_terms: set[str], content: str) -> float:
-    if not question_terms:
-        return 1.0 if content.strip() else 0.0
-    content_terms = {
-        token.lower()
-        for token in re.findall(r"[a-zA-Z0-9_][a-zA-Z0-9_\-]+", content or "")
-        if len(token) >= 3
-    }
-    if not content_terms:
-        return 0.0
-    overlap = len(question_terms & content_terms)
-    return overlap / max(1, len(question_terms))
-
-
 def _collect_hit_evidence(
     hits: list[Any],
     *,
-    question_terms: set[str],
     max_items: int,
     max_chars: int,
-) -> tuple[list[str], list[str], list[str], int]:
-    evidence: list[str] = []
-    repositories: list[str] = []
-    extra: list[str] = []
-    ignored = 0
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
 
     for hit in hits[:max_items]:
         content = _truncate(getattr(hit, "content", "") or "", max_chars)
         if not content:
             continue
-        relevance = _content_relevance(question_terms, content)
-        if question_terms and relevance < 0.15:
-            ignored += 1
-            continue
-        evidence.append(content)
-        repository = _normalize_text(getattr(hit, "repository", "") or "")
-        if repository:
-            repositories.append(repository)
-        extra.append(_truncate(content, max_chars))
 
-    return evidence, repositories, extra, ignored
+        score = getattr(hit, "score", None)
+        source: dict[str, Any] = {
+            "type": "knowledge",
+            "repository": _truncate(getattr(hit, "repository", "") or "", 80),
+            "branch": _truncate(getattr(hit, "branch", "") or "", 40),
+            "commit": _truncate(getattr(hit, "commit", "") or "", 16),
+            "path": _truncate(getattr(hit, "path", "") or "", 180),
+            "language": _truncate(getattr(hit, "language", "") or "", 32),
+            "chunk_index": getattr(hit, "chunk_index", None),
+            "chunk_count": getattr(hit, "chunk_count", None),
+            "score": round(float(score), 4) if score is not None else None,
+            "evidence": [content],
+        }
+        sources.append(source)
+
+    return sources
 
 
 def _compact_lines(text: str | None, *, max_items: int, max_chars: int) -> list[str]:
@@ -518,8 +467,9 @@ def render_request_context(request: NormalizedRequest | dict[str, Any] | None) -
 def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
     state = dict(state or {})
     request = _coerce_request(state.get("normalized_request"))
-    question = _normalize_text(request.user_query if request else last_user_text(state.get("messages", [])))
-    question_terms = _question_terms(question)
+    question = _normalize_text(
+        request.user_query if request else last_user_text(state.get("messages", []))
+    )
 
     sources: list[dict[str, Any]] = []
     raw_evidence_count = 0
@@ -530,42 +480,88 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
     if knowledge is not None:
         primary_hits = list(knowledge.primary_hits or [])
         extended_hits = list(knowledge.expanded_hits or [])
-        primary_evidence, primary_repos, _, primary_ignored = _collect_hit_evidence(
+
+        # Prefer the synthesized knowledge-service context first.
+        knowledge_context = _normalize_text(str(knowledge.context or ""))
+        if knowledge_context:
+            summary = _truncate(knowledge_context, 1200)
+            if summary:
+                sources.append(
+                    {
+                        "type": "knowledge_summary",
+                        "repository": _truncate(
+                            ", ".join(
+                                dict.fromkeys(
+                                    [
+                                        _normalize_text(getattr(hit, "repository", "") or "")
+                                        for hit in (primary_hits + extended_hits)
+                                        if _normalize_text(getattr(hit, "repository", "") or "")
+                                    ]
+                                )
+                            ),
+                            80,
+                        ),
+                        "confidence": round(float(knowledge.confidence or 0.0), 2),
+                        "grounded": bool(knowledge.grounded),
+                        "retrieval_reason": _truncate(str(knowledge.retrieval_reason or ""), 180),
+                        "summary": summary,
+                    }
+                )
+                raw_evidence_count += 1
+                input_tokens += estimate_text_tokens(summary)
+
+        primary_sources = _collect_hit_evidence(
             primary_hits,
-            question_terms=question_terms,
             max_items=6,
             max_chars=240,
         )
-        extended_evidence, extended_repos, _, extended_ignored = _collect_hit_evidence(
+        extended_sources = _collect_hit_evidence(
             extended_hits,
-            question_terms=question_terms,
             max_items=4,
             max_chars=180,
         )
-        raw_evidence_count += len(primary_evidence) + len(extended_evidence)
-        removed_duplicates += primary_ignored + extended_ignored
 
-        primary_evidence, removed = _dedupe_text_items(primary_evidence)
+        # Dedupe by the actual text evidence only; metadata stays attached.
+        primary_texts, removed = _dedupe_text_items(
+            [item["evidence"][0] for item in primary_sources if item.get("evidence")]
+        )
         removed_duplicates += removed
-        extended_evidence, removed = _dedupe_text_items(extended_evidence)
+
+        extended_texts, removed = _dedupe_text_items(
+            [item["evidence"][0] for item in extended_sources if item.get("evidence")]
+        )
         removed_duplicates += removed
 
-        if not primary_evidence and extended_evidence:
-            primary_evidence, extended_evidence = extended_evidence[:3], []
+        if primary_texts:
+            filtered_primary: list[dict[str, Any]] = []
+            seen_texts: set[str] = set()
+            for item in primary_sources:
+                text = item["evidence"][0]
+                key = _normalize_text(text).lower()
+                if key in seen_texts or key not in {t.lower() for t in primary_texts}:
+                    continue
+                seen_texts.add(key)
+                filtered_primary.append(item)
+            sources.extend(filtered_primary[:5])
+            raw_evidence_count += len(filtered_primary)
 
-        if primary_evidence:
-            sources.append(
-                {
-                    "type": "knowledge",
-                    "repository": _truncate(
-                        ", ".join(dict.fromkeys(primary_repos or extended_repos)),
-                        80,
-                    ),
-                    "confidence": round(float(knowledge.confidence or 0.0), 2),
-                    "evidence": primary_evidence[:5],
-                    "extended_evidence": extended_evidence[:3],
-                }
-            )
+        if extended_texts:
+            filtered_extended: list[dict[str, Any]] = []
+            seen_texts = {
+                _normalize_text(item["evidence"][0]).lower()
+                for item in sources
+                if isinstance(item.get("evidence"), list) and item["evidence"]
+            }
+            for item in extended_sources:
+                text = item["evidence"][0]
+                key = _normalize_text(text).lower()
+                if key in seen_texts or key not in {t.lower() for t in extended_texts}:
+                    continue
+                seen_texts.add(key)
+                filtered_extended.append(item)
+            if filtered_extended:
+                sources.extend(filtered_extended[:3])
+                raw_evidence_count += len(filtered_extended)
 
     vision_context = _normalize_text(str(state.get("vision_context", "") or ""))
     vision = state.get("vision")
@@ -587,14 +583,17 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
         sources.append(
             {
                 "type": "vision",
-                "confidence": round(float((vision or {}).get("confidence", 0.0) if isinstance(vision, dict) else 0.0), 2),
+                "confidence": round(
+                    float((vision or {}).get("confidence", 0.0) if isinstance(vision, dict) else 0.0),
+                    2,
+                ),
                 "observations": deduped_vision[:6],
             }
         )
 
     coder = _coerce_coder(state.get("coder_result"))
     if coder is not None:
-        coder_evidence = []
+        coder_evidence: list[str] = []
         summary = _truncate(coder.summary, 180)
         code_snippet = _truncate(coder.code, 360)
         if summary:
@@ -625,7 +624,10 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
             input_tokens += estimate_text_tokens(tool.summary)
             raw_evidence_count += 1
         if tool.result:
-            compact_result = _truncate(json.dumps(tool.result, ensure_ascii=False, separators=(",", ":")), 220)
+            compact_result = _truncate(
+                json.dumps(tool.result, ensure_ascii=False, separators=(",", ":")),
+                220,
+            )
             if compact_result:
                 tool_evidence.append(compact_result)
                 input_tokens += estimate_text_tokens(compact_result)
@@ -633,13 +635,14 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
         deduped_tool, removed = _dedupe_text_items(tool_evidence)
         removed_duplicates += removed
         if deduped_tool:
-            payload = {
-                "type": "tool",
-                "tool_name": _truncate(tool.tool_name or "tool", 80),
-                "status": _truncate(tool.status or "ok", 40),
-                "evidence": deduped_tool[:4],
-            }
-            sources.append(payload)
+            sources.append(
+                {
+                    "type": "tool",
+                    "tool_name": _truncate(tool.tool_name or "tool", 80),
+                    "status": _truncate(tool.status or "ok", 40),
+                    "evidence": deduped_tool[:4],
+                }
+            )
 
     reasoning = _coerce_generation(state.get("reasoning_result"))
     if reasoning is not None and reasoning.content:
@@ -665,7 +668,10 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
         "question": question,
         "sources": sources,
     }
-    context, trimmed_sources = _fit_context_to_budget(context, budget_tokens=FINALIZE_CONTEXT_TOKEN_BUDGET)
+    context, trimmed_sources = _fit_context_to_budget(
+        context,
+        budget_tokens=FINALIZE_CONTEXT_TOKEN_BUDGET,
+    )
     rendered = json.dumps(context, separators=(",", ":"), ensure_ascii=False).strip()
 
     logger.debug(
