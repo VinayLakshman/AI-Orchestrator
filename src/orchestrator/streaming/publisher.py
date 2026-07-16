@@ -37,6 +37,15 @@ class StreamPublisher:
     async def knowledge_finished(self, *, documents: int, sources: list[str]) -> None:
         await self._emit(StreamKind.KNOWLEDGE_FINISHED, documents=documents, sources=sources)
 
+    async def web_search_started(self, *, query: str) -> None:
+        await self._emit(StreamKind.WEB_SEARCH_STARTED, query=query)
+
+    async def web_search_finished(self, *, results: int, search_time_ms: int) -> None:
+        await self._emit(StreamKind.WEB_SEARCH_FINISHED, results=results, search_time_ms=search_time_ms)
+
+    async def web_search_processing(self, *, results: int) -> None:
+        await self._emit(StreamKind.WEB_SEARCH_PROCESSING, results=results)
+
     async def vision_started(self, *, image_count: int) -> None:
         await self._emit(StreamKind.VISION_STARTED, image_count=image_count)
 

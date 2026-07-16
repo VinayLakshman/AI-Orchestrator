@@ -104,6 +104,8 @@ def plan_to_route(plan: ControllerPlan) -> RouteDecision:
         route = RouteType.CODE
     elif plan.next_specialist == SpecialistType.KNOWLEDGE:
         route = RouteType.RAG
+    elif plan.next_specialist == SpecialistType.WEB:
+        route = RouteType.GENERAL
     elif plan.next_specialist == SpecialistType.TOOLS:
         route = RouteType.TOOLS
     else:

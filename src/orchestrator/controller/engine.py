@@ -14,6 +14,7 @@ from ..common.enums import (
 )
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
+from ..models.web import WebSearchResult
 from ..models.ollama import ModelGenerationResponse, extract_assistant_text, normalize_generation_response
 from ..context.builder import (
     build_controller_messages,
@@ -89,6 +90,10 @@ _REASONING_TOKENS = (
     "deep reasoning",
     "design plan",
 )
+_WEB_TOKENS = (
+    "current", "latest", "today", "recent", "release", "version", "changelog",
+    "news", "internet", "online", "live information", "up to date", "cve", "cves",
+)
 
 
 def _coerce_knowledge(value: Any) -> KnowledgeRetrieveResponse | None:
@@ -99,6 +104,19 @@ def _coerce_knowledge(value: Any) -> KnowledgeRetrieveResponse | None:
     if isinstance(value, dict):
         try:
             return KnowledgeRetrieveResponse.model_validate(value)
+        except Exception:
+            return None
+    return None
+
+
+def _coerce_web(value: Any) -> WebSearchResult | None:
+    if value is None:
+        return None
+    if isinstance(value, WebSearchResult):
+        return value
+    if isinstance(value, dict):
+        try:
+            return WebSearchResult.model_validate(value)
         except Exception:
             return None
     return None
@@ -209,6 +227,7 @@ def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
     repository_request = hints.repository_likelihood >= 0.55 or any(token in lower for token in _REPOSITORY_TOKENS)
     code_request = hints.code_likelihood >= 0.55 or any(token in lower for token in _CODE_TOKENS)
     reasoning_request = any(token in lower for token in _REASONING_TOKENS)
+    web_search_request = any(token in lower for token in _WEB_TOKENS)
     vision_request = has_images or has_files or hints.vision_likelihood >= 0.45
     if vision_request:
         classification = "VISION"
@@ -220,6 +239,8 @@ def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
         classification = "REASONING"
     else:
         classification = "GENERAL"
+    if vision_request or code_request:
+        web_search_request = False
     return {
         "request": request,
         "metadata": metadata,
@@ -232,6 +253,7 @@ def _request_profile(state: dict[str, Any]) -> dict[str, Any]:
         "reasoning_request": reasoning_request,
         "vision_request": vision_request,
         "classification": classification,
+        "use_web_search": web_search_request,
     }
 
 
@@ -242,6 +264,8 @@ def _specialist_allowed_for_profile(profile: dict[str, Any], specialist: Special
         return bool(profile.get("vision_request"))
     if specialist == SpecialistType.KNOWLEDGE:
         return bool(profile.get("repository_request"))
+    if specialist == SpecialistType.WEB:
+        return bool(profile.get("use_web_search"))
     if specialist == SpecialistType.CODER:
         return bool(profile.get("code_request"))
     if specialist == SpecialistType.REASONING:
@@ -263,6 +287,8 @@ def _profile_next_specialist(profile: dict[str, Any]) -> SpecialistType | None:
         return SpecialistType.CODER
     if classification == "REASONING":
         return SpecialistType.REASONING
+    if profile.get("use_web_search"):
+        return SpecialistType.WEB
     return None
 
 
@@ -335,6 +361,8 @@ def _recommended_next_for_profile(
     if not profile.get("repository_request") and not profile.get("code_request") and not profile.get("vision_request"):
         return None
     if last_step == SpecialistType.KNOWLEDGE:
+        if profile.get("use_web_search"):
+            return SpecialistType.WEB
         if profile.get("code_request"):
             return SpecialistType.CODER
         if profile.get("repository_request"):
@@ -345,6 +373,8 @@ def _recommended_next_for_profile(
         if profile.get("repository_request") and profile.get("reasoning_request"):
             return SpecialistType.REASONING
     if last_step == SpecialistType.VISION:
+        return None
+    if last_step == SpecialistType.WEB:
         return None
     return None
 
@@ -502,6 +532,22 @@ def _specialist_evidence_summary(
         )
         return summary
 
+    if last_step == SpecialistType.WEB:
+        web = _coerce_web(state.get("web_search_result"))
+        if web is None:
+            summary.update({"status": "failed", "result_summary": "Web search did not return a result.", "hit_count": 0})
+            return summary
+        sufficient = bool(web.results)
+        summary.update({
+            "status": _status_from_sufficient(sufficient),
+            "confidence": 1.0 if sufficient else 0.0,
+            "result_summary": "Web search returned live evidence." if sufficient else (web.error or "No web results."),
+            "hit_count": len(web.results),
+            "answer_quality": _answer_quality(1.0, sufficient=sufficient, hit_count=len(web.results)),
+            "sufficient": sufficient,
+        })
+        return summary
+
     if last_step == SpecialistType.CODER:
         coder = _coerce_coder(state.get("coder_result"))
         if coder is None:
@@ -615,6 +661,7 @@ class ControllerEngine:
             knowledge_result=_coerce_knowledge(knowledge_result),
             coder_result=_coerce_coder(coder_result),
             tool_result=_coerce_tool(tool_result),
+            web_search_result=_coerce_web(state.get("web_search_result")),
             reasoning_result=_coerce_generation(reasoning_result),
             controller_plan=_coerce_plan(plan),
             controller_validation=_coerce_validation(validation),
@@ -648,12 +695,14 @@ class ControllerEngine:
         deterministic_next = _profile_next_specialist(profile)
         classification = str(profile.get("classification") or "GENERAL")
         explicit_next = deterministic_next
+        if explicit_next is None and profile.get("use_web_search") and self.settings.web_search_enabled:
+            explicit_next = SpecialistType.WEB
         complete = explicit_next is None
         needs_reasoning = explicit_next == SpecialistType.REASONING
         requires_clarification = False
         pending_specialists = [explicit_next] if explicit_next is not None else []
 
-        if classification == "GENERAL":
+        if classification == "GENERAL" and not profile.get("use_web_search"):
             complete = True
             explicit_next = None
             pending_specialists = []
@@ -695,13 +744,14 @@ class ControllerEngine:
             needs_reasoning=needs_reasoning,
             final_answer_ready=complete,
             clarification_question=None,
-            fallback_to_general=classification == "GENERAL",
+            fallback_to_general=classification == "GENERAL" and not profile.get("use_web_search"),
             knowledge_sufficient=None,
             completion_condition="Finalize when the planned specialist evidence is sufficient.",
             explanation=_plan_summary_for_profile(profile),
+            use_web_search=bool(profile.get("use_web_search") and self.settings.web_search_enabled),
         )
 
-        if plan.classification == "GENERAL":
+        if plan.classification == "GENERAL" and not plan.use_web_search:
             plan.next_specialist = None
             plan.pending_specialists = []
             plan.needs_reasoning = False
@@ -726,6 +776,7 @@ class ControllerEngine:
                         "code_request": profile.get("code_request", False),
                         "reasoning_request": profile.get("reasoning_request", False),
                         "vision_request": profile.get("vision_request", False),
+                        "use_web_search": plan.use_web_search,
                     },
                     "rejected_model_signals": rejected_reasons,
                 },
@@ -950,6 +1001,7 @@ class ControllerEngine:
             issues=[],
             notes="",
             classification=(plan.classification if plan else "GENERAL"),
+            use_web_search=bool(plan.use_web_search if plan else profile.get("use_web_search", False)),
         )
 
         logger.debug(

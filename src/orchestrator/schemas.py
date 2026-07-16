@@ -8,6 +8,7 @@ from .common.enums import ControllerAction, RouteType, SpecialistType
 from .models.knowledge import KnowledgeRetrieveResponse
 from .models.ollama import ModelGenerationResponse
 from .models.vision import VisionAnalysis
+from .models.web import WebSearchResult
 
 
 class RouteDecision(BaseModel):
@@ -74,6 +75,7 @@ class ExecutionPlan(BaseModel):
     clarification_question: str | None = None
     fallback_to_general: bool = False
     knowledge_sufficient: bool | None = None
+    use_web_search: bool = False
     tool_requests: list[ToolRequest] = Field(default_factory=list)
     completion_condition: str = ""
     explanation: str = ""
@@ -133,6 +135,7 @@ class OrchestratorResponse(BaseModel):
     used_models: list[str] = Field(default_factory=list)
     used_tools: list[str] = Field(default_factory=list)
     knowledge_result: KnowledgeRetrieveResponse | None = None
+    web_search_result: WebSearchResult | None = None
     vision: VisionAnalysis | None = None
     vision_context: str = ""
     coder_result: CoderResult | None = None

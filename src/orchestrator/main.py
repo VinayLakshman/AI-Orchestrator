@@ -51,6 +51,7 @@ async def lifespan(app: FastAPI):
             await cleanup_task
         await runtime.ollama_client.client.aclose()  # type: ignore[union-attr]
         await runtime.knowledge_client.client.aclose()  # type: ignore[union-attr]
+        await runtime.searxng_client.client.aclose()  # type: ignore[union-attr]
 
 
 settings = get_settings()

@@ -4,6 +4,7 @@ from typing import Any, TypedDict
 
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse
+from ..models.web import WebSearchResult
 from ..schemas import (
     ControllerPlan,
     ControllerValidation,
@@ -57,6 +58,7 @@ class OrchestratorState(TypedDict, total=False):
     clarification_question: str
 
     knowledge_result: KnowledgeRetrieveResponse | dict[str, Any] | None
+    web_search_result: WebSearchResult | dict[str, Any] | None
     vision: dict[str, Any] | None
     vision_context: str
     coder_result: CoderResult | dict[str, Any] | None

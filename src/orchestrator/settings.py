@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     knowledge_min_score: float = 0.55
     knowledge_min_hits: int = 1
 
+    # Native web retrieval
+    web_search_enabled: bool = True
+    web_search_url: str = "http://searxng:8080"
+    web_search_timeout_s: float = 20.0
+    web_search_max_results: int = 10
+    web_search_language: str = "en"
+    web_search_safesearch: int = 0
+    web_search_categories: str = "general"
+
     # Vision pipeline
     vision_enabled: bool = True
     vision_max_images: int = 8

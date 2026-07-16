@@ -28,6 +28,7 @@ class ToolType(str, Enum):
 
 class SpecialistType(StrEnum):
     KNOWLEDGE = "knowledge"
+    WEB = "web"
     VISION = "vision"
     CODER = "coder"
     TOOLS = "tools"

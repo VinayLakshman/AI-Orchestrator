@@ -17,6 +17,9 @@ class StreamKind(StrEnum):
 
     KNOWLEDGE_STARTED = "knowledge_started"
     KNOWLEDGE_FINISHED = "knowledge_finished"
+    WEB_SEARCH_STARTED = "web_search_started"
+    WEB_SEARCH_PROCESSING = "web_search_processing"
+    WEB_SEARCH_FINISHED = "web_search_finished"
 
     VISION_STARTED = "vision_started"
     VISION_PROGRESS = "vision_progress"

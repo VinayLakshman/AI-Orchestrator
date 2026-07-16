@@ -9,6 +9,7 @@ from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse
+from ..models.web import WebSearchResult
 from ..schemas import (
     ControllerPlan,
     ControllerValidation,
@@ -23,6 +24,8 @@ FINALIZE_CONTEXT_TOKEN_BUDGET = 700
 CONVERSATION_HISTORY_TOKEN_BUDGET = 2400
 FINALIZE_SOURCE_ORDER = {
     "knowledge": 0,
+    "knowledge_summary": 0,
+    "web": 1,
     "coder": 1,
     "vision": 2,
     "tool": 3,
@@ -399,6 +402,7 @@ def render_structured_context(
     reasoning_result: ModelGenerationResponse | None = None,
     controller_plan: ControllerPlan | None = None,
     controller_validation: ControllerValidation | None = None,
+    web_search_result: WebSearchResult | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -418,6 +422,9 @@ def render_structured_context(
 
     if knowledge_result and knowledge_result.context:
         add("Knowledge Context", knowledge_result.context)
+
+    if web_search_result and web_search_result.results:
+        add("Web Evidence", json.dumps([item.model_dump(exclude_none=True) for item in web_search_result.results], ensure_ascii=False))
 
     if vision_context:
         add("Vision Context", vision_context)
@@ -561,7 +568,26 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
                 filtered_extended.append(item)
             if filtered_extended:
                 sources.extend(filtered_extended[:3])
-                raw_evidence_count += len(filtered_extended)
+            raw_evidence_count += len(filtered_extended)
+
+    web_value = state.get("web_search_result")
+    if web_value:
+        try:
+            web = web_value if isinstance(web_value, WebSearchResult) else WebSearchResult.model_validate(web_value)
+        except Exception:
+            web = None
+        if web and web.results:
+            evidence = []
+            for item in web.results[:8]:
+                evidence.append({
+                    "title": _truncate(item.title, 140),
+                    "url": _truncate(item.url, 240),
+                    "snippet": _truncate(item.snippet, 280),
+                    "engine": _truncate(item.engine, 60),
+                })
+            sources.append({"type": "web", "query": _truncate(web.query, 240), "evidence": evidence})
+            raw_evidence_count += len(evidence)
+            logger.info("results_used=%d source=web", len(evidence))
 
     vision_context = _normalize_text(str(state.get("vision_context", "") or ""))
     vision = state.get("vision")

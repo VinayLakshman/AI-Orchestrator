@@ -15,6 +15,7 @@ from .graph.build import OrchestratorRuntime
 from .models.chat import ChatRequest
 from .models.knowledge import KnowledgeRetrieveResponse
 from .models.ollama import ModelGenerationResponse, extract_assistant_text
+from .models.web import WebSearchResult
 from .request_normalizer import normalize_openai_request
 from .schemas import (
     ControllerPlan,
@@ -123,6 +124,7 @@ def _input_state_from_normalized_request(
         "used_models": [],
         "used_tools": [],
         "knowledge_result": None,
+        "web_search_result": None,
         "vision": None,
         "vision_context": "",
         "coder_result": None,
@@ -169,6 +171,15 @@ def _knowledge_from_state(state: dict[str, Any]) -> KnowledgeRetrieveResponse | 
         return KnowledgeRetrieveResponse.model_validate(knowledge_result)
     if isinstance(knowledge_result, KnowledgeRetrieveResponse):
         return knowledge_result
+    return None
+
+
+def _web_from_state(state: dict[str, Any]) -> WebSearchResult | None:
+    value = state.get("web_search_result")
+    if isinstance(value, dict):
+        return WebSearchResult.model_validate(value)
+    if isinstance(value, WebSearchResult):
+        return value
     return None
 
 
@@ -265,6 +276,7 @@ def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorR
         used_models=state.get("used_models", []),
         used_tools=state.get("used_tools", []),
         knowledge_result=_knowledge_from_state(state),
+        web_search_result=_web_from_state(state),
         vision=state.get("vision"),
         vision_context=state.get("vision_context", ""),
         coder_result=_coder_from_state(state),

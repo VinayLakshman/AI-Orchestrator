@@ -6,6 +6,7 @@ from typing import Any
 from orchestrator.controller.engine import ControllerEngine
 
 from ..clients.knowledge import KnowledgeClient
+from ..clients.searxng import SearXNGClient, normalize_query
 from ..common.enums import ChatRole, ControllerAction, SpecialistType
 from ..context.builder import last_user_text, render_structured_context
 from ..controller.shared import (
@@ -23,9 +24,11 @@ from ..controller.shared import (
 from ..models.chat import ChatMessage
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse, extract_assistant_text
+from ..models.web import WebSearchResult
 from ..schemas import ControllerPlan, ControllerValidation, CoderResult, ToolResult
 from ..logging import get_logger
 from ..settings import Settings
+from ..specialists.web import WebSpecialist
 from ..streaming.context import get_current_stream
 from ..vision.fetcher import collect_latest_message_images, strip_images_from_messages
 from ..vision.pipeline import VisionPipeline
@@ -62,6 +65,16 @@ def _as_knowledge(value: Any) -> KnowledgeRetrieveResponse | None:
         return value
     if isinstance(value, dict):
         return KnowledgeRetrieveResponse.model_validate(value)
+    return None
+
+
+def _as_web(value: Any) -> WebSearchResult | None:
+    if value is None:
+        return None
+    if isinstance(value, WebSearchResult):
+        return value
+    if isinstance(value, dict):
+        return WebSearchResult.model_validate(value)
     return None
 
 
@@ -610,6 +623,46 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
     return knowledge_node
 
 
+def make_web_node(web_specialist: WebSpecialist, settings: Settings):
+    async def web_node(state: OrchestratorState) -> dict[str, Any]:
+        updates = _step_update(state, SpecialistType.WEB)
+        query = normalize_query(last_user_text(state.get("messages", [])))
+        if not settings.web_search_enabled or not query:
+            updates["web_search_result"] = WebSearchResult(query=query, error="web search disabled or empty query").model_dump()
+            updates["specialist_status"] = "failed"
+            return updates
+
+        cached = _as_web(state.get("web_search_result"))
+        stream = get_current_stream()
+        if cached is not None and cached.query == query:
+            result = cached
+        else:
+            if stream:
+                await stream.web_search_started(query=query[:200])
+            logger.info("web_search_started query=%r", query[:200])
+            result = await web_specialist.retrieve(
+                query,
+                cached=cached,
+                max_results=settings.web_search_max_results,
+            )
+            if stream:
+                await stream.web_search_processing(results=len(result.results))
+            logger.info("web_search_completed search_duration_ms=%d results_returned=%d", result.search_time_ms, len(result.results))
+            if stream:
+                await stream.web_search_finished(results=len(result.results), search_time_ms=result.search_time_ms)
+
+        payload = {
+            **updates,
+            "web_search_result": result.model_dump(exclude_none=True),
+            "used_tools": _update_used_tools(state, "web.search"),
+            "specialist_status": "success" if result.results else "failed",
+        }
+        _log_transition("specialist_complete", specialist=SpecialistType.WEB.value, **_state_snapshot({**state, **payload}), selected_next_node="validate")
+        return payload
+
+    return web_node
+
+
 def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
     user_text = last_user_text(state.get("messages", []))
     plan = _as_plan(state.get("execution_plan") or state.get("controller_plan"))
@@ -840,6 +893,7 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
                             knowledge_result=_as_knowledge(state.get("knowledge_result")),
                             coder_result=_as_coder(state.get("coder_result")),
                             tool_result=_as_tool(state.get("tool_result")),
+                            web_search_result=_as_web(state.get("web_search_result")),
                             controller_plan=_as_plan(state.get("execution_plan") or state.get("controller_plan")),
                             controller_validation=_as_validation(state.get("execution_plan") or state.get("controller_validation")),
                         )

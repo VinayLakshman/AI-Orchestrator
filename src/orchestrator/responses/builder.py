@@ -4,6 +4,7 @@ from typing import Any
 
 from ..models.knowledge import KnowledgeRetrieveResponse
 from ..models.ollama import ModelGenerationResponse
+from ..models.web import WebSearchResult
 from ..schemas import CoderResult, ControllerPlan, ControllerValidation, OrchestratorResponse, RouteDecision, ToolResult
 
 
@@ -15,6 +16,7 @@ def build_generation_response(
     controller_plan: ControllerPlan | None = None,
     controller_validation: ControllerValidation | None = None,
     knowledge_result: KnowledgeRetrieveResponse | None = None,
+    web_search_result: WebSearchResult | None = None,
     coder_result: CoderResult | None = None,
     tool_result: ToolResult | None = None,
     reasoning: ModelGenerationResponse | None = None,
@@ -31,6 +33,7 @@ def build_generation_response(
         used_models=used_models or [],
         used_tools=used_tools or [],
         knowledge_result=knowledge_result,
+        web_search_result=web_search_result,
         coder_result=coder_result,
         tool_result=tool_result,
         reasoning=reasoning,

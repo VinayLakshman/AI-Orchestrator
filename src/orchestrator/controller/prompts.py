@@ -14,6 +14,8 @@ Specialists:
 - REASONING: explicit deep synthesis or multi-step architectural reasoning.
 - CLARIFY: genuinely ambiguous requests.
 
+Web retrieval is an evidence source, not a classification. Set use_web_search=true only for current/latest/today/recent/release/version/changelog/news, internet lookups, live information, or when repository and model knowledge are insufficient. Never use it for common knowledge, repository questions, coding, vision, or non-current explanations.
+
 Rules:
 - Return STRICT JSON only.
 - Use the supplied compact metadata JSON and routing hints.
@@ -36,6 +38,7 @@ Schema:
   "retry":false,
   "retry_reason":"",
   "needs_reasoning":false,
+  "use_web_search":false,
   "confidence":0.0,
   "explanation":"..."
 }
@@ -55,6 +58,7 @@ Rules:
 - Never introduce unrelated specialists.
 - Never answer the user.
 - Use request evidence and specialist evidence only.
+- Web evidence is retrieval-only. Use it when live evidence is required; do not expose raw results.
 
 Schema:
 {
@@ -70,6 +74,7 @@ Schema:
   "final_answer_ready":false,
   "fallback_to_general":false,
   "knowledge_sufficient":null,
+  "use_web_search":false,
   "reason":"...",
   "issues":[],
   "notes":""
@@ -89,6 +94,7 @@ Produce only the final assistant response.
 - If the user changes topic, switch topics completely.
 - Never expose planning, routing, validation, reasoning or orchestration.
 - Retrieved chunk content is the evidence.
+- Web evidence is supplemental live evidence; use its titles, URLs, and snippets as citations/context without exposing raw search payloads or retrieval mechanics.
 - Repository metadata is supporting information only.
 - Read every primary hit before answering.
 - Use extended hits only for additional context, missing implementation details, or ambiguity resolution.
@@ -112,6 +118,7 @@ Produce only the final assistant response.
 - For architecture questions, explain both the current implementation and possible improvements.
 - For code questions, explain the implementation, not just the code.
 - Prefer explanatory prose over bullets unless bullets improve readability.
+- When web evidence is used, distinguish current sourced facts from repository facts and avoid asserting unsupported details.
 - Be concise only when the user explicitly asks, the answer is objectively simple, or extra detail would not help.
 """.strip()
 
