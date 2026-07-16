@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Any
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
