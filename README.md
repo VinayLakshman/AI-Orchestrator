@@ -26,7 +26,7 @@ Implemented:
 Accepted but not fully implemented:
 
 - `temperature` and `max_tokens` are accepted on chat completion requests for compatibility, but they are not currently forwarded to Ollama.
-- Streaming returns one complete assistant-content chunk followed by `[DONE]`; it is not token-by-token streaming.
+- Streaming begins with an assistant role-only chunk, then emits assistant content chunks followed by `[DONE]`.
 - The `model` request field is echoed in the response. Internal graph nodes use configured models from environment variables.
 
 Not implemented in this repository:
@@ -291,13 +291,19 @@ Non-streaming response shape:
 }
 ```
 
-Streaming response shape:
+Streaming response shape (the role-only chunk is sent immediately; content chunks follow):
 
 ```text
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1760000000,"model":"qwen3:14b","choices":[{"index":0,"delta":{"role":"assistant","content":"..."},"finish_reason":null}]}
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1760000000,"model":"qwen3:14b","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":1760000000,"model":"qwen3:14b","choices":[{"index":0,"delta":{"content":"..."},"finish_reason":null}]}
+
+: keep-alive
 
 data: [DONE]
 ```
+
+The `: keep-alive` line is an SSE comment emitted every 10 seconds while orchestration is running and no assistant token has arrived. It is not an OpenAI event or conversation content.
 
 ## Repository Map
 

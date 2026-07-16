@@ -411,41 +411,81 @@ async def openai_chat_completions(
     publisher = StreamPublisher(stream)
 
     if payload.stream:
-        logger.debug("SSE: creating graph task")
-        graph_task = asyncio.create_task(
-            _run_graph_with_stream(
-                runtime=runtime,
-                request_id=request_id,
-                thread_id=thread_id,
-                state_input=state_input,
-                publisher=publisher,
-            ),
-            name=f"orchestrator-stream-{request_id}",
-        )
-
-        def _graph_done(task: asyncio.Task):
-            try:
-                exc = task.exception()
-                if exc:
-                    logger.exception("GRAPH TASK FAILED", exc_info=exc)
-                else:
-                    logger.debug("GRAPH TASK COMPLETED")
-            except asyncio.CancelledError:
-                logger.debug("GRAPH TASK CANCELLED")
-
-        graph_task.add_done_callback(_graph_done)
-        logger.debug("SSE: graph task created")
 
         async def sse_generator():
-            role_sent = False
             token_seen = False
             result: dict[str, Any] | None = None
+            graph_task: asyncio.Task | None = None
+            event_queue: asyncio.Queue[Any] = asyncio.Queue()
+            next_heartbeat = asyncio.get_running_loop().time() + 10
 
             logger.debug("SSE: generator started")
 
+            # Send the standard OpenAI role chunk before starting orchestration.
+            # This gives clients immediate response feedback without emitting text.
+            yield _openai_chunk(
+                request_id=request_id,
+                model=str(payload.model),
+                role="assistant",
+            )
+
+            async def relay_events() -> None:
+                try:
+                    async for event in stream.subscribe(after_seq=0):
+                        await event_queue.put(event)
+                finally:
+                    await event_queue.put(None)
+
             try:
-                logger.debug("SSE: subscribing")
-                async for event in stream.subscribe(after_seq=0):
+                logger.debug("SSE: creating graph task")
+                graph_task = asyncio.create_task(
+                    _run_graph_with_stream(
+                        runtime=runtime,
+                        request_id=request_id,
+                        thread_id=thread_id,
+                        state_input=state_input,
+                        publisher=publisher,
+                    ),
+                    name=f"orchestrator-stream-{request_id}",
+                )
+
+                def _graph_done(task: asyncio.Task):
+                    try:
+                        exc = task.exception()
+                        if exc:
+                            logger.exception("GRAPH TASK FAILED", exc_info=exc)
+                        else:
+                            logger.debug("GRAPH TASK COMPLETED")
+                    except asyncio.CancelledError:
+                        logger.debug("GRAPH TASK CANCELLED")
+
+                graph_task.add_done_callback(_graph_done)
+                logger.debug("SSE: graph task created")
+
+                relay_task = asyncio.create_task(
+                    relay_events(),
+                    name=f"orchestrator-events-{request_id}",
+                )
+                while True:
+                    timeout = max(0, next_heartbeat - asyncio.get_running_loop().time())
+                    if timeout == 0:
+                        # Do not let a continuously busy internal event queue postpone
+                        # the connection heartbeat or make wait_for spin at zero.
+                        yield ": keep-alive\n\n"
+                        next_heartbeat = asyncio.get_running_loop().time() + 10
+                        continue
+                    try:
+                        event = await asyncio.wait_for(event_queue.get(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        # SSE comment: keeps intermediaries and clients connected without
+                        # adding a non-OpenAI event to the conversation.
+                        yield ": keep-alive\n\n"
+                        next_heartbeat = asyncio.get_running_loop().time() + 10
+                        continue
+
+                    if event is None:
+                        break
+
                     logger.debug(
                         "SSE: event kind=%s payload=%s",
                         event.kind,
@@ -466,14 +506,6 @@ async def openai_chat_completions(
 
                     token_seen = True
 
-                    if not role_sent:
-                        role_sent = True
-                        yield _openai_chunk(
-                            request_id=request_id,
-                            model=str(payload.model),
-                            role="assistant",
-                        )
-
                     yield _openai_chunk(
                         request_id=request_id,
                         model=str(payload.model),
@@ -487,12 +519,6 @@ async def openai_chat_completions(
                 if not token_seen:
                     answer = str((result or {}).get("answer", "") or "")
                     if answer:
-                        if not role_sent:
-                            yield _openai_chunk(
-                                request_id=request_id,
-                                model=str(payload.model),
-                                role="assistant",
-                            )
                         yield _openai_chunk(
                             request_id=request_id,
                             model=str(payload.model),
@@ -507,10 +533,15 @@ async def openai_chat_completions(
                 yield _openai_done()
 
             except asyncio.CancelledError:
-                graph_task.cancel()
+                if graph_task is not None:
+                    graph_task.cancel()
                 raise
             finally:
-                if not graph_task.done():
+                if "relay_task" in locals() and not relay_task.done():
+                    relay_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await relay_task
+                if graph_task is not None and not graph_task.done():
                     graph_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await graph_task
