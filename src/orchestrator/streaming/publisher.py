@@ -68,7 +68,7 @@ class StreamPublisher:
         await self._emit(StreamKind.LLM_FINISHED)
 
     async def llm_token(self, token: str) -> StreamEvent:
-        return await self.emit(
+        return await self._emit(
             kind=StreamKind.LLM_TOKEN,
             stage="generation",
             message="Generated token.",

@@ -81,3 +81,17 @@ class StreamHub:
         stale = [key for key, stream in self._streams.items() if stream._closed]
         for key in stale:
             self._streams.pop(key, None)
+
+    async def close(self, request_id: str) -> None:
+        """
+        Close the stream for a request.
+
+        This wakes any subscribers waiting in RequestEventStream.subscribe().
+        The stream object is intentionally retained until cleanup() so that
+        late subscribers can still inspect the closed stream if needed.
+        """
+        stream = self._streams.get(request_id)
+        if stream is None:
+            return
+
+        await stream.close()

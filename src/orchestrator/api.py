@@ -283,9 +283,10 @@ async def _run_graph_with_stream(
     publisher: StreamPublisher,
 ) -> dict[str, Any]:
     logger.debug("GRAPH: entered _run_graph_with_stream")
-    async with stream_scope(publisher):
-        await publisher.graph_started(route_hint=state_input.get("metadata", {}).get("requested_model"))
-        try:
+    try:
+        async with stream_scope(publisher):
+            # await publisher.graph_started(route_hint=state_input.get("metadata", {}).get("requested_model"))
+            await publisher.graph_started()
             logger.debug("GRAPH: invoking graph")
             result = await runtime.graph.ainvoke(
                 state_input,
@@ -295,12 +296,12 @@ async def _run_graph_with_stream(
             route_name = result.get("route_name") or result.get("route", {}).get("route")
             await publisher.graph_finished(route=route_name)
             return result
-        except Exception as exc:
-            await publisher.graph_failed(str(exc))
-            raise
-        finally:
-            logger.debug("GRAPH: closing stream")
-            await runtime.stream_hub.close(request_id)
+    except Exception as exc:
+        await publisher.graph_failed(str(exc))
+        raise
+    finally:
+        logger.debug("GRAPH: closing stream")
+        await runtime.stream_hub.close(request_id)
 
 
 def _request_headers_out(request_id: str, thread_id: str) -> dict[str, str]:
@@ -421,6 +422,18 @@ async def openai_chat_completions(
             ),
             name=f"orchestrator-stream-{request_id}",
         )
+
+        def _graph_done(task: asyncio.Task):
+            try:
+                exc = task.exception()
+                if exc:
+                    logger.exception("GRAPH TASK FAILED", exc_info=exc)
+                else:
+                    logger.debug("GRAPH TASK COMPLETED")
+            except asyncio.CancelledError:
+                logger.debug("GRAPH TASK CANCELLED")
+
+        graph_task.add_done_callback(_graph_done)
         logger.debug("SSE: graph task created")
 
         async def sse_generator():
