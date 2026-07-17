@@ -67,6 +67,25 @@ def _dedupe_text_items(values: list[str]) -> tuple[list[str], int]:
         deduped.append(item)
     return deduped, removed
 
+
+
+def _evidence_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("content", "snippet", "text", "summary", "title", "url", "evidence"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, list):
+        parts = [_evidence_to_text(item) for item in value]
+        return "\n".join(part for part in parts if part.strip())
+    return str(value).strip()
+
+
 def _collect_hit_evidence(
     hits: list[Any],
     *,
@@ -113,7 +132,11 @@ def _source_text_items(source: dict[str, Any]) -> list[str]:
     for key in ("evidence", "extended_evidence", "observations", "code_snippets"):
         value = source.get(key)
         if isinstance(value, list):
-            items.extend(str(item) for item in value if str(item).strip())
+            items.extend(
+                text
+                for text in (_evidence_to_text(item) for item in value)
+                if text.strip()
+            )
     summary = source.get("summary")
     if isinstance(summary, str) and summary.strip():
         items.insert(0, summary)
@@ -549,12 +572,12 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
 
         # Dedupe by the actual text evidence only; metadata stays attached.
         primary_texts, removed = _dedupe_text_items(
-            [item["evidence"][0] for item in primary_sources if item.get("evidence")]
+            [ _evidence_to_text(item["evidence"][0]) for item in primary_sources if item.get("evidence") ]
         )
         removed_duplicates += removed
 
         extended_texts, removed = _dedupe_text_items(
-            [item["evidence"][0] for item in extended_sources if item.get("evidence")]
+            [ _evidence_to_text(item["evidence"][0]) for item in extended_sources if item.get("evidence") ]
         )
         removed_duplicates += removed
 
@@ -562,7 +585,7 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
             filtered_primary: list[dict[str, Any]] = []
             seen_texts: set[str] = set()
             for item in primary_sources:
-                text = item["evidence"][0]
+                text = _evidence_to_text(item["evidence"][0])
                 key = _normalize_text(text).lower()
                 if key in seen_texts or key not in {t.lower() for t in primary_texts}:
                     continue
@@ -574,12 +597,12 @@ def build_finalize_context(state: dict[str, Any] | None) -> dict[str, Any]:
         if extended_texts:
             filtered_extended: list[dict[str, Any]] = []
             seen_texts = {
-                _normalize_text(item["evidence"][0]).lower()
+                _normalize_text(_evidence_to_text(item["evidence"][0])).lower()
                 for item in sources
                 if isinstance(item.get("evidence"), list) and item["evidence"]
             }
             for item in extended_sources:
-                text = item["evidence"][0]
+                text = _evidence_to_text(item["evidence"][0])
                 key = _normalize_text(text).lower()
                 if key in seen_texts or key not in {t.lower() for t in extended_texts}:
                     continue

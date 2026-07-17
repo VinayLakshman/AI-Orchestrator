@@ -386,6 +386,17 @@ def _next_pending_specialist(plan: ControllerPlan | None, executed_steps: Iterab
     return None
 
 
+def _plan_execution_queue(plan: ControllerPlan | None) -> list[SpecialistType]:
+    if plan is None:
+        return []
+    queue = list(plan.execution_queue or [])
+    if not queue:
+        queue = list(plan.pending_specialists or [])
+    if not queue and plan.next_specialist is not None:
+        queue = [plan.next_specialist]
+    return _unique_steps(queue)
+
+
 def _fallback_final_answer(state: dict[str, Any]) -> str:
     latest_user_message = last_user_text(state.get("messages", []))
     validation = _coerce_validation(state.get("controller_validation"))
@@ -721,25 +732,32 @@ class ControllerEngine:
                 retry_counts[str(key)] = 0
 
         executed = {_step_name(step) for step in current_executed_steps(state)}
-        pending_next = _next_pending_specialist(plan, executed)
+        planned_queue = _plan_execution_queue(plan)
+        remaining_queue = [
+            step for step in planned_queue
+            if _step_name(step) not in executed
+        ]
 
         retry = False
         fallback_to_general = False
         needs_reasoning = False
         requires_clarification = False
-        complete = pending_next is None
-        action = ControllerAction.FINALIZE if complete else ControllerAction.CONTINUE
-        next_specialist = pending_next
-
         current_status = str(evidence.get("status") or "").strip().lower()
 
         if last_step is not None and current_status == "failed":
             retries_used = retry_counts.get(last_step.value, 0)
             if retries_used < self.settings.max_specialist_retries:
                 retry = True
-                next_specialist = last_step
-                complete = False
-                action = ControllerAction.CONTINUE
+
+        if retry and last_step is not None:
+            remaining_queue = [last_step] + [
+                step for step in remaining_queue
+                if _step_name(step) != last_step.value
+            ]
+
+        next_specialist = remaining_queue[0] if remaining_queue else None
+        complete = not remaining_queue
+        action = ControllerAction.FINALIZE if complete else ControllerAction.CONTINUE
 
         if not retry and next_specialist is not None:
             if next_specialist == SpecialistType.REASONING:
@@ -767,14 +785,14 @@ class ControllerEngine:
         )
         retry_reason = summary if retry else ""
 
-        pending_specialists = [next_specialist] if next_specialist is not None and not complete else []
         validation = ControllerValidation(
             action=action,
             summary=summary,
             confidence=confidence,
             complete=complete or action == ControllerAction.FINALIZE,
             next_specialist=next_specialist,
-            pending_specialists=_unique_steps(pending_specialists),
+            pending_specialists=_unique_steps(remaining_queue),
+            execution_queue=_unique_steps(remaining_queue),
             retry=retry,
             retry_reason=retry_reason,
             needs_reasoning=needs_reasoning,
