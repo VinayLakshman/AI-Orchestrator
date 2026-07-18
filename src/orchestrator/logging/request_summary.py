@@ -11,6 +11,8 @@ from . import get_logger
 logger = get_logger(__name__)
 
 _ROW_WIDTH = 15
+_PROMPT_LIMIT = 100
+_TRACE_EXCLUDE = {"prepare"}
 
 
 def _format_row(label: str, value: str) -> str:
@@ -26,23 +28,14 @@ def _duration_value(value: Any) -> str:
         return "skipped"
     if duration < 0:
         return "skipped"
-    return f"{duration} ms"
+    return f"({duration} ms)"
 
 
-def _timing_label_map() -> list[tuple[str, str]]:
-    return [
-        ("Prepare", "prepare"),
-        ("Planner", "planner"),
-        ("Knowledge", "knowledge"),
-        ("Web", "web"),
-        ("Vision", "vision"),
-        ("Code", "coder"),
-        ("Tools", "tools"),
-        ("Reasoning", "reasoning"),
-        ("Validation", "validation"),
-        ("Clarification", "clarify"),
-        ("Finalizer", "finalize"),
-    ]
+def _truncate_prompt(text: str | None) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if len(cleaned) <= _PROMPT_LIMIT:
+        return cleaned
+    return cleaned[: max(0, _PROMPT_LIMIT - 3)].rstrip() + "..."
 
 
 def _controller_model(state: OrchestratorState) -> str:
@@ -80,16 +73,38 @@ def _request_status(state: OrchestratorState) -> str:
     return "SUCCESS"
 
 
-def _request_route(state: OrchestratorState) -> str:
-    if (
-        state.response.finish_reason == "clarify"
-        or state.response.metadata.get("route") == "clarify"
-        or state.execution.validation is not None
-        and state.execution.validation.action == ControllerAction.CLARIFY
-    ):
-        return "clarify"
+def _execution_trace(
+    state: OrchestratorState,
+    execution_trace: list[dict[str, Any]] | None,
+    timings: dict[str, float] | None,
+) -> list[dict[str, Any]]:
+    trace = list(execution_trace or state.debug.execution_trace or [])
+    if trace:
+        return trace
 
-    return "finalize"
+    fallback: list[dict[str, Any]] = []
+    for key, value in (timings or {}).items():
+        label = str(key).replace("_", " ").strip().title()
+        if key in _TRACE_EXCLUDE:
+            continue
+        fallback.append({"key": key, "label": label, "duration_ms": value})
+    return fallback
+
+
+def _execution_path_lines(
+    state: OrchestratorState,
+    execution_trace: list[dict[str, Any]] | None,
+    timings: dict[str, float] | None,
+) -> list[str]:
+    lines: list[str] = []
+    for entry in _execution_trace(state, execution_trace, timings):
+        label = str(entry.get("label") or entry.get("key") or "").strip()
+        if not label or label.lower() in _TRACE_EXCLUDE:
+            continue
+        duration = _duration_value(entry.get("duration_ms"))
+        prefix = "→ " if lines else ""
+        lines.append(f"{prefix}{label} {duration}")
+    return lines
 
 
 def _evidence_stats(state: OrchestratorState) -> dict[str, int]:
@@ -115,28 +130,32 @@ def _evidence_stats(state: OrchestratorState) -> dict[str, int]:
 def build_request_summary(
     request_id: str,
     state: OrchestratorState,
+    execution_trace: list[dict[str, Any]] | None,
     timings: dict[str, float] | None,
     total_duration_ms: int | float | None,
 ) -> str:
-    timings = timings or {}
     evidence = _evidence_stats(state)
+    prompt = _truncate_prompt(state.request.user_message)
+    path_lines = _execution_path_lines(state, execution_trace, timings)
 
     lines = [
         "Request Summary",
         "---------------",
         _format_row("Request ID", request_id or str(state.request.request_id or "")),
+        _format_row("Prompt", prompt),
         _format_row("Classification", str(state.execution.plan.classification or "GENERAL")),
-        _format_row("Route", _request_route(state)),
         "",
+        "Execution Path",
+        "--------------",
     ]
 
-    for label, key in _timing_label_map():
-        lines.append(_format_row(label, _duration_value(timings.get(key))))
+    lines.extend(path_lines or ["(no executed nodes recorded)"])
 
     lines.extend(
         [
             "",
-            _format_row("Total", _duration_value(total_duration_ms)),
+            _format_row("Total", f"{int(round(float(total_duration_ms or 0)))} ms"),
+            "",
             _format_row("Controller", _controller_model(state)),
             _format_row("Final Model", _final_model(state)),
             "",
@@ -157,7 +176,17 @@ def build_request_summary(
 def log_request_summary(
     request_id: str,
     state: OrchestratorState,
+    execution_trace: list[dict[str, Any]] | None,
     timings: dict[str, float] | None,
     total_duration_ms: int | float | None,
 ) -> None:
-    logger.info("%s", build_request_summary(request_id, state, timings, total_duration_ms))
+    logger.info(
+        "%s",
+        build_request_summary(
+            request_id=request_id,
+            state=state,
+            execution_trace=execution_trace,
+            timings=timings,
+            total_duration_ms=total_duration_ms,
+        ),
+    )

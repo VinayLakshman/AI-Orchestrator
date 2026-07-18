@@ -80,6 +80,8 @@ class DebugState(BaseModel):
 
     timings: dict[str, float] = Field(default_factory=dict)
 
+    execution_trace: list[dict[str, Any]] = Field(default_factory=list)
+
 
 class OrchestratorState(BaseModel):
     """

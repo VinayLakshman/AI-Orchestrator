@@ -197,11 +197,13 @@ def _emit_request_summary(
     *,
     request_id: str,
     state: OrchestratorState,
+    execution_trace: list[dict[str, Any]] | None,
     total_duration_ms: int | float,
 ) -> None:
     log_request_summary(
         request_id=request_id,
         state=state,
+        execution_trace=execution_trace,
         timings=state.debug.timings,
         total_duration_ms=total_duration_ms,
     )
@@ -255,6 +257,7 @@ async def chat(
     _emit_request_summary(
         request_id=request_id,
         state=result,
+        execution_trace=result.debug.execution_trace,
         total_duration_ms=(perf_counter() - started_at) * 1000.0,
     )
 
@@ -442,6 +445,7 @@ async def openai_chat_completions(
                     _emit_request_summary(
                         request_id=request_id,
                         state=result,
+                        execution_trace=result.debug.execution_trace,
                         total_duration_ms=(perf_counter() - started_at) * 1000.0,
                     )
 
@@ -480,6 +484,7 @@ async def openai_chat_completions(
     _emit_request_summary(
         request_id=request_id,
         state=result,
+        execution_trace=result.debug.execution_trace,
         total_duration_ms=(perf_counter() - started_at) * 1000.0,
     )
 
