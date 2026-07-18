@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from time import time
+from time import perf_counter, time
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from orchestrator.logging import get_logger
+from orchestrator.logging.request_summary import log_request_summary
 
 from .common.constants import THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
@@ -192,6 +193,20 @@ async def _run_graph_with_stream(
         await runtime.stream_hub.close(request_id)
 
 
+def _emit_request_summary(
+    *,
+    request_id: str,
+    state: OrchestratorState,
+    total_duration_ms: int | float,
+) -> None:
+    log_request_summary(
+        request_id=request_id,
+        state=state,
+        timings=state.debug.timings,
+        total_duration_ms=total_duration_ms,
+    )
+
+
 @router.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -229,10 +244,18 @@ async def chat(
 ) -> dict[str, Any]:
     thread_id = _thread_id_from_request(payload)
     state_input = _input_state_from_request(payload, thread_id=thread_id)
+    request_id = state_input.request.request_id
+    started_at = perf_counter()
 
     result: OrchestratorState = await runtime.graph.ainvoke(
         state_input,
         config={"configurable": {"thread_id": thread_id}},
+    )
+
+    _emit_request_summary(
+        request_id=request_id,
+        state=result,
+        total_duration_ms=(perf_counter() - started_at) * 1000.0,
     )
 
     return _orchestrator_chat_result(thread_id, result)
@@ -293,6 +316,7 @@ async def openai_chat_completions(
     request_id = str(uuid4())
     request_state = normalize_openai_request(payload)
     thread_id = str(uuid4())
+    started_at = perf_counter()
 
     state_input = _input_state_from_request_state(
         request_state,
@@ -414,6 +438,13 @@ async def openai_chat_completions(
                             content=answer,
                         )
 
+                if result is not None:
+                    _emit_request_summary(
+                        request_id=request_id,
+                        state=result,
+                        total_duration_ms=(perf_counter() - started_at) * 1000.0,
+                    )
+
                 yield openai_chunk(
                     request_id=request_id,
                     model=str(payload.model),
@@ -444,6 +475,12 @@ async def openai_chat_completions(
     result: OrchestratorState = await runtime.graph.ainvoke(
         state_input,
         config={"configurable": {"thread_id": thread_id}},
+    )
+
+    _emit_request_summary(
+        request_id=request_id,
+        state=result,
+        total_duration_ms=(perf_counter() - started_at) * 1000.0,
     )
 
     completion = _completion_from_state(

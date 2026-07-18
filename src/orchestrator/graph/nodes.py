@@ -131,7 +131,7 @@ def _state_snapshot(
 
 
 def _log_transition(event: str, **payload: Any) -> None:
-    logger.info("%s %s", event, json.dumps(payload, sort_keys=True, default=str))
+    logger.debug("%s %s", event, json.dumps(payload, sort_keys=True, default=str))
 
 
 def _update_used_models(
@@ -183,6 +183,7 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
         execution.plan = plan
         execution.validation = ValidationResult()
         execution.initialize()
+        execution.runtime.metadata["controller_model"] = controller.models.controller().name
         state.execution = execution
 
         state.debug.planner_prompt = build_controller_plan_prompt()
@@ -663,6 +664,7 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         execution.runtime.metadata["validation_action"] = validation.action.value if hasattr(validation.action, "value") else str(validation.action)
         execution.runtime.metadata["validation_confidence"] = float(validation.confidence or 0.0)
         execution.runtime.metadata["validation_summary"] = validation.summary
+        execution.runtime.metadata["controller_model"] = controller.models.controller().name
         state.execution = execution
         state.debug.validator_prompt = build_controller_validation_prompt()
         state.debug.validator_response = validation.model_dump(exclude_none=True)

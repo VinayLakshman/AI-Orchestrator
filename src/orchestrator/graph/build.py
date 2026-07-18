@@ -33,6 +33,7 @@ from .nodes import (
     _state_snapshot,
     _log_transition,
 )
+from .instrumentation import timed_node
 
 
 CheckpointerKind = Literal["memory", "sqlite"]
@@ -193,6 +194,18 @@ def build_graph(
     reasoning_node = make_reasoning_node(controller, settings)
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
+
+    prepare_node = timed_node("prepare", prepare_node)
+    plan_node = timed_node("planner", plan_node)
+    vision_node = timed_node("vision", vision_node)
+    knowledge_node = timed_node("knowledge", knowledge_node)
+    web_node = timed_node("web", web_node)
+    coder_node = timed_node("coder", coder_node)
+    tools_node = timed_node("tools", tools_node)
+    validate_node = timed_node("validation", validate_node)
+    reasoning_node = timed_node("reasoning", reasoning_node)
+    clarify_node = timed_node("clarify", clarify_node)
+    finalize_node = timed_node("finalize", finalize_node)
 
     builder.add_node("prepare", prepare_node)
     builder.add_node("plan", plan_node)

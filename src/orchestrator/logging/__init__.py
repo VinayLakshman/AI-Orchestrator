@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from .settings import Settings
+from ..settings import Settings
 
 
 def configure_logging(settings: Settings) -> None:
