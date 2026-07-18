@@ -49,9 +49,16 @@ class TypedGraphFacade:
     @staticmethod
     def _unwrap_state(result: Any) -> OrchestratorState:
         state = getattr(result, "value", result)
-        if not isinstance(state, OrchestratorState):
-            raise TypeError(f"Expected OrchestratorState from graph, got {type(state).__name__}")
-        return state
+
+        if isinstance(state, OrchestratorState):
+            return state
+
+        if isinstance(state, dict):
+            return OrchestratorState.model_validate(state)
+
+        raise TypeError(
+            f"Expected OrchestratorState or dict from graph, got {type(state).__name__}"
+        )
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> OrchestratorState:
         kwargs.setdefault("version", "v2")
@@ -83,8 +90,17 @@ class TypedGraphFacade:
             return chunk.data
         if isinstance(chunk, tuple) and chunk and isinstance(chunk[-1], OrchestratorState):
             return chunk[-1]
-        if isinstance(chunk, dict) and isinstance(chunk.get("data"), OrchestratorState):
-            return chunk["data"]
+        if isinstance(chunk, dict):
+            if "data" in chunk:
+                data = chunk["data"]
+
+                if isinstance(data, dict):
+                    return OrchestratorState.model_validate(data)
+
+                if isinstance(data, OrchestratorState):
+                    return data
+
+            return OrchestratorState.model_validate(chunk)
         return chunk
 
 
