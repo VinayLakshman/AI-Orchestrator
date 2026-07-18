@@ -115,6 +115,54 @@ def _request_messages(
     return list(state.request.messages)
 
 
+def _response_text(response: Any) -> str:
+    content = getattr(response, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+
+    raw = getattr(response, "raw", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    if isinstance(raw, dict) and raw:
+        return json.dumps(raw, sort_keys=True, default=str)
+
+    return ""
+
+
+def _log_planner_request(
+    *,
+    system_prompt: str,
+    request_context: str,
+    messages: list[ChatMessage],
+) -> None:
+    latest_user_prompt = ""
+    for message in reversed(messages):
+        if message.role == ChatRole.USER:
+            latest_user_prompt = str(message.content or "").strip()
+            break
+
+    logger.debug(
+        "\n=========================\nPlanner Request\n=========================\n\nSystem Prompt\n%s\n\nRequest Context\n%s\n\nUser Prompt\n%s\n",
+        system_prompt,
+        request_context,
+        latest_user_prompt,
+    )
+
+
+def _log_planner_response(raw_response: str) -> None:
+    logger.debug(
+        "\n=========================\nRaw LLM Response\n=========================\n\n%s\n",
+        raw_response or "<empty>",
+    )
+
+
+def _log_planner_plan(plan: ExecutionPlan) -> None:
+    logger.debug(
+        "\n=========================\nParsed ExecutionPlan\n=========================\n\n%s\n",
+        json.dumps(plan.model_dump(exclude_none=True), indent=2, sort_keys=True, default=str),
+    )
+
+
 def _normalized_plan_payload(parsed: dict[str, Any]) -> dict[str, Any]:
     classification = str(
         parsed.get("classification")
@@ -250,10 +298,27 @@ class ControllerEngine:
             "has_files": bool(state.request.metadata.get("attachments")),
         }
 
+        system_prompt = build_controller_plan_prompt()
+        request_context = render_request_context(state.request)
+
         messages = build_controller_messages(
-            system_prompt=build_controller_plan_prompt(),
+            system_prompt=system_prompt,
             messages=_request_messages(state),
-            request_context=render_request_context(state.request),
+            request_context=request_context,
+        )
+
+        logger.debug(
+            "planner_model_request model=%s temperature=%s max_tokens=%s json_mode=%s",
+            self.models.controller().name,
+            self.settings.controller_plan_temperature,
+            self.settings.controller_plan_max_tokens,
+            True,
+        )
+
+        _log_planner_request(
+            system_prompt=system_prompt,
+            request_context=request_context,
+            messages=messages,
         )
 
         response = await self.ollama.chat(
@@ -262,20 +327,32 @@ class ControllerEngine:
             temperature=self.settings.controller_plan_temperature,
             max_tokens=self.settings.controller_plan_max_tokens,
             stream=False,
+            response_format="json",
             keep_alive=self.settings.controller_keep_alive,
         )
 
-        raw_content = response.content or response.raw or "{}"
+        raw_content = _response_text(response)
+        _log_planner_response(raw_content)
         parsed = _extract_json_object(raw_content)
         if not isinstance(parsed, dict):
             parsed = {}
+
+        if not parsed:
+            logger.error(
+                "planner_response_parse_failed model=%s raw_response=%s",
+                self.models.controller().name,
+                raw_content[:4000] or "<empty>",
+            )
 
         payload = _normalized_plan_payload(parsed)
 
         try:
             plan = ExecutionPlan.model_validate(payload)
         except Exception:
-            logger.exception("failed_to_validate_execution_plan")
+            logger.exception(
+                "failed_to_validate_execution_plan raw_response=%s",
+                raw_content[:4000],
+            )
             plan = ExecutionPlan()
 
         if plan.execution_queue:
@@ -299,6 +376,8 @@ class ControllerEngine:
                 default=str,
             ),
         )
+
+        _log_planner_plan(plan)
 
         return plan
 
@@ -326,6 +405,7 @@ class ControllerEngine:
             temperature=self.settings.controller_validate_temperature,
             max_tokens=self.settings.controller_validate_max_tokens,
             stream=False,
+            response_format="json",
             keep_alive=self.settings.controller_keep_alive,
         )
 
