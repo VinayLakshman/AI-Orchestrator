@@ -12,7 +12,6 @@ from .schemas import (
     NormalizedAttachment,
     OpenAIChatCompletionRequest,
     OpenAIMessage,
-    RoutingHints,
 )
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
@@ -155,53 +154,6 @@ def _scan_text(messages: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _routing_hints(user_query: str, controller_text: str, attachments: list[NormalizedAttachment]) -> RoutingHints:
-    text = f"{user_query}\n{controller_text}".lower()
-    has_images = any(item.attachment_type == "image" for item in attachments)
-    code_score = 0.1
-    repo_score = 0.1
-    vision_score = 0.1
-
-    if has_images:
-        vision_score += 0.7
-
-    if _CODE_BLOCK_RE.search(controller_text):
-        code_score += 0.5
-
-    if _URL_RE.search(text):
-        repo_score += 0.1
-
-    code_tokens = ("def ", "class ", "function ", "import ", "curl ", "bash", "python", "typescript", "javascript", "yaml", "json")
-    repo_tokens = (
-        "repository",
-        "repo",
-        "my orchestrator",
-        "knowledge-service",
-        "knowledge service",
-        "compose",
-        "docker compose",
-        "proxmox",
-        "homelab",
-        "indexed",
-        "my setup",
-        "my config",
-    )
-    vision_tokens = ("screenshot", "image", "photo", "diagram", "ocr", "visual")
-
-    if any(token in text for token in code_tokens):
-        code_score += 0.5
-    if any(token in text for token in repo_tokens):
-        repo_score += 0.6
-    if any(token in text for token in vision_tokens):
-        vision_score += 0.4
-
-    return RoutingHints(
-        repository_likelihood=min(1.0, repo_score),
-        code_likelihood=min(1.0, code_score),
-        vision_likelihood=min(1.0, vision_score),
-    )
-
-
 def normalize_openai_request(
     payload: OpenAIChatCompletionRequest,
     *,
@@ -221,7 +173,6 @@ def normalize_openai_request(
         1,
         int(math.ceil((len(controller_text) + len(user_query) + len(original_messages) * 20) / 4.0)),
     )
-    routing_hints = _routing_hints(user_query=user_query, controller_text=controller_text, attachments=attachments)
 
     metadata = {
         "has_images": has_images,
@@ -245,7 +196,6 @@ def normalize_openai_request(
         images=[item.placeholder for item in attachments if item.attachment_type == "image"],
         metadata={
             **metadata,
-            "routing_hints": routing_hints.model_dump(exclude_none=True),
             "attachments": [item.model_dump(exclude_none=True) for item in attachments],
             "file_count": sum(item.attachment_type != "image" for item in attachments),
         },

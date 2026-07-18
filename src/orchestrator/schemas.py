@@ -27,12 +27,6 @@ class NormalizedAttachment(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
-class RoutingHints(BaseModel):
-    repository_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
-    code_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
-    vision_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
-
-
 class CoderResult(BaseModel):
     task: str = ""
     summary: str = ""

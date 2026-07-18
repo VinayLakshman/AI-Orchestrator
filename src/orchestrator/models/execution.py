@@ -25,8 +25,6 @@ class ExecutionPlan(BaseModel):
 
     route: RouteType = RouteType.GENERAL
 
-    route: RouteType = RouteType.GENERAL
-
     requires_repository: bool = False
 
     requires_web: bool = False

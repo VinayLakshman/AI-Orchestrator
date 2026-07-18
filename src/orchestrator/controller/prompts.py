@@ -12,7 +12,6 @@ Do NOT answer the user.
 You receive:
 
 - normalized request
-- routing hints
 - conversation history
 
 Your job is to determine:

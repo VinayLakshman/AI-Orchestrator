@@ -312,11 +312,6 @@ def render_request_context(request: RequestState) -> str:
             "code_blocks": int(bool(request.metadata.get("contains_code_blocks", False))),
             "estimated_tokens": int(request.metadata.get("estimated_prompt_tokens", 0) or 0),
         },
-        "routing_hints": {
-            "repository": round(float(request.routing_hints.repository_likelihood), 2),
-            "code": round(float(request.routing_hints.code_likelihood), 2),
-            "vision": round(float(request.routing_hints.vision_likelihood), 2),
-        },
     }
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
