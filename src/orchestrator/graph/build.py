@@ -40,6 +40,55 @@ logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
+class TypedGraphFacade:
+    graph: Any
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.graph, name)
+
+    @staticmethod
+    def _unwrap_state(result: Any) -> OrchestratorState:
+        state = getattr(result, "value", result)
+        if not isinstance(state, OrchestratorState):
+            raise TypeError(f"Expected OrchestratorState from graph, got {type(state).__name__}")
+        return state
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> OrchestratorState:
+        kwargs.setdefault("version", "v2")
+        result = await self.graph.ainvoke(*args, **kwargs)
+        return self._unwrap_state(result)
+
+    def invoke(self, *args: Any, **kwargs: Any) -> OrchestratorState:
+        kwargs.setdefault("version", "v2")
+        result = self.graph.invoke(*args, **kwargs)
+        return self._unwrap_state(result)
+
+    async def astream(self, *args: Any, **kwargs: Any):
+        kwargs.setdefault("version", "v2")
+        async for chunk in self.graph.astream(*args, **kwargs):
+            yield self._normalize_stream_chunk(chunk, stream_mode=kwargs.get("stream_mode", "values"))
+
+    def stream(self, *args: Any, **kwargs: Any):
+        kwargs.setdefault("version", "v2")
+        for chunk in self.graph.stream(*args, **kwargs):
+            yield self._normalize_stream_chunk(chunk, stream_mode=kwargs.get("stream_mode", "values"))
+
+    @staticmethod
+    def _normalize_stream_chunk(chunk: Any, *, stream_mode: str) -> Any:
+        if stream_mode != "values":
+            return chunk
+        if isinstance(chunk, OrchestratorState):
+            return chunk
+        if hasattr(chunk, "data") and isinstance(chunk.data, OrchestratorState):
+            return chunk.data
+        if isinstance(chunk, tuple) and chunk and isinstance(chunk[-1], OrchestratorState):
+            return chunk[-1]
+        if isinstance(chunk, dict) and isinstance(chunk.get("data"), OrchestratorState):
+            return chunk["data"]
+        return chunk
+
+
+@dataclass(slots=True)
 class OrchestratorRuntime:
     settings: Settings
     model_manager: ModelManager
@@ -111,7 +160,11 @@ def build_graph(
     vision_pipeline: VisionPipeline,
     searxng_client: SearXNGClient | None = None,
 ) -> tuple[Any, Any]:
-    builder = StateGraph(OrchestratorState)
+    builder = StateGraph(
+        OrchestratorState,
+        input_schema=OrchestratorState,
+        output_schema=OrchestratorState,
+    )
 
     prepare_node = make_prepare_node(settings)
     plan_node = make_controller_plan_node(controller, settings)
@@ -232,7 +285,7 @@ def build_graph(
     builder.add_edge("finalize", END)
 
     checkpointer, _kind = build_checkpointer(settings)
-    graph = builder.compile(checkpointer=checkpointer)
+    graph = TypedGraphFacade(builder.compile(checkpointer=checkpointer))
 
     return graph, checkpointer
 

@@ -153,22 +153,19 @@ def _update_used_tools(
 
 
 def make_prepare_node(settings: Settings):
-    async def prepare_node(state: OrchestratorState) -> dict[str, Any]:
-        execution = ExecutionState()
-        execution.validation = ValidationResult()
-
-        return {
-            "execution": execution,
-            "evidence": EvidenceLedger(),
-            "response": ResponseState(),
-            "debug": DebugState(),
-        }
+    async def prepare_node(state: OrchestratorState) -> OrchestratorState:
+        state.execution = ExecutionState()
+        state.execution.validation = ValidationResult()
+        state.evidence = EvidenceLedger()
+        state.response = ResponseState()
+        state.debug = DebugState()
+        return state
 
     return prepare_node
 
 
 def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
-    async def controller_plan_node(state: OrchestratorState) -> dict[str, Any]:
+    async def controller_plan_node(state: OrchestratorState) -> OrchestratorState:
         stream = get_current_stream()
 
         if stream:
@@ -186,26 +183,23 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
         execution.plan = plan
         execution.validation = ValidationResult()
         execution.initialize()
+        state.execution = execution
 
-        debug = state.debug
-        debug.planner_prompt = build_controller_plan_prompt()
-        debug.planner_response = plan.model_dump(exclude_none=True)
+        state.debug.planner_prompt = build_controller_plan_prompt()
+        state.debug.planner_response = plan.model_dump(exclude_none=True)
 
         _log_transition(
             "controller_plan",
             **_state_snapshot(state),
         )
 
-        return {
-            "execution": execution,
-            "debug": _update_used_models(state, settings.controller_model),
-        }
+        return state
 
     return controller_plan_node
 
 
 def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
-    async def vision_node(state: OrchestratorState) -> dict[str, Any]:
+    async def vision_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
 
@@ -223,8 +217,9 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
                 metadata={"status": "failed", "reason": "vision_disabled"},
             )
             execution = _advance_runtime(execution, SpecialistType.VISION, success=False, error="vision_disabled")
+            state.execution = execution
             _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
-            return {"execution": execution, "evidence": evidence, "debug": _update_used_models(state, settings.vision_model)}
+            return state
 
         stream = get_current_stream()
         image_refs = state.request.images[: settings.vision_max_images]
@@ -248,12 +243,9 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             if stream:
                 await stream.vision_finished(summary="No image attachments were found.")
             execution = _advance_runtime(execution, SpecialistType.VISION, success=False, error="no_images_found")
+            state.execution = execution
             _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
-            return {
-                "execution": execution,
-                "evidence": evidence,
-                "debug": _update_used_models(state, settings.vision_model),
-            }
+            return state
 
         analysis = result.analysis
         summary = str(getattr(analysis, "summary", "") or "").strip()
@@ -290,21 +282,16 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             await stream.vision_finished(summary=summary[:200] or "Vision analysis completed.")
 
         execution = _advance_runtime(execution, SpecialistType.VISION, success=True)
-        metadata = dict(state.request.metadata)
-        metadata["vision_cache_hit"] = bool(result.cache_hit)
-        metadata["vision_task_type"] = str(getattr(analysis, "task_type", "") and getattr(analysis.task_type, "value", analysis.task_type) or "")
+        state.execution = execution
         _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
-        return {
-            "execution": execution,
-            "evidence": evidence,
-            "debug": _update_used_models(state, str(getattr(analysis, "source_model", "") or settings.vision_model)),
-        }
+        _update_used_models(state, str(getattr(analysis, "source_model", "") or settings.vision_model))
+        return state
 
     return vision_node
 
 
 def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
-    async def knowledge_node(state: OrchestratorState) -> dict[str, Any]:
+    async def knowledge_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
         execution.runtime.current_specialist = SpecialistType.KNOWLEDGE
@@ -326,12 +313,10 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
                 metadata={"status": "failed", "reason": "rag_disabled"},
             )
             execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=False, error="rag_disabled")
+            state.execution = execution
             _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
-            return {
-                "execution": execution,
-                "evidence": evidence,
-                "debug": _update_used_tools(state, "knowledge.retrieve"),
-            }
+            _update_used_tools(state, "knowledge.retrieve")
+            return state
 
         if not query.strip():
             evidence.repository = RepositoryEvidence(
@@ -348,12 +333,10 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
                 metadata={"status": "failed", "reason": "empty_query"},
             )
             execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=False, error="empty_query")
+            state.execution = execution
             _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
-            return {
-                "execution": execution,
-                "evidence": evidence,
-                "debug": _update_used_tools(state, "knowledge.retrieve"),
-            }
+            _update_used_tools(state, "knowledge.retrieve")
+            return state
 
         stream = get_current_stream()
         if stream:
@@ -395,12 +378,10 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
         )
 
         execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=True)
+        state.execution = execution
         _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
-        return {
-            "execution": execution,
-            "evidence": evidence,
-            "debug": _update_used_tools(state, "knowledge.retrieve"),
-        }
+        _update_used_tools(state, "knowledge.retrieve")
+        return state
 
     return knowledge_node
 
@@ -423,7 +404,7 @@ def _summarize_web_results(results: list[Any]) -> str:
 
 
 def make_web_node(web_specialist: WebSpecialist, settings: Settings):
-    async def web_node(state: OrchestratorState) -> dict[str, Any]:
+    async def web_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
         execution.runtime.current_specialist = SpecialistType.WEB
@@ -444,11 +425,9 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
                 },
             )
             execution = _advance_runtime(execution, SpecialistType.WEB, success=False, error="web_disabled_or_empty_query")
+            state.execution = execution
             _log_transition("specialist_complete", specialist=SpecialistType.WEB.value, **_state_snapshot(state))
-            return {
-                "execution": execution,
-                "evidence": evidence,
-            }
+            return state
 
         cached = evidence.web if evidence.web and evidence.web.query == query else None
         stream = get_current_stream()
@@ -501,12 +480,10 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
         )
 
         execution = _advance_runtime(execution, SpecialistType.WEB, success=True)
+        state.execution = execution
         _log_transition("specialist_complete", specialist=SpecialistType.WEB.value, **_state_snapshot(state))
-        return {
-            "execution": execution,
-            "evidence": evidence,
-            "debug": _update_used_tools(state, "web.search"),
-        }
+        _update_used_tools(state, "web.search")
+        return state
 
     return web_node
 
@@ -551,7 +528,7 @@ def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
 
 
 def make_coder_node(controller: ControllerEngine, settings: Settings):
-    async def coder_node(state: OrchestratorState) -> dict[str, Any]:
+    async def coder_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
         execution.runtime.current_specialist = SpecialistType.CODER
@@ -599,18 +576,16 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
         )
 
         execution = _advance_runtime(execution, SpecialistType.CODER, success=bool(code or explanation))
+        state.execution = execution
         _log_transition("specialist_complete", specialist=SpecialistType.CODER.value, **_state_snapshot(state))
-        return {
-            "execution": execution,
-            "evidence": evidence,
-            "debug": _update_used_models(state, settings.coder_model),
-        }
+        _update_used_models(state, settings.coder_model)
+        return state
 
     return coder_node
 
 
 def make_tools_node(settings: Settings):
-    async def tools_node(state: OrchestratorState) -> dict[str, Any]:
+    async def tools_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
         execution.runtime.current_specialist = SpecialistType.TOOLS
@@ -627,11 +602,9 @@ def make_tools_node(settings: Settings):
                 },
             )
             execution = _advance_runtime(execution, SpecialistType.TOOLS, success=False, error="no_tool_requests")
+            state.execution = execution
             _log_transition("specialist_complete", specialist=SpecialistType.TOOLS.value, **_state_snapshot(state))
-            return {
-                "execution": execution,
-                "evidence": evidence,
-            }
+            return state
 
         executions: list[dict[str, Any]] = []
         for request in tool_requests:
@@ -658,21 +631,17 @@ def make_tools_node(settings: Settings):
         )
 
         execution = _advance_runtime(execution, SpecialistType.TOOLS, success=True)
+        state.execution = execution
         _log_transition("specialist_complete", specialist=SpecialistType.TOOLS.value, **_state_snapshot(state))
-        return {
-            "execution": execution,
-            "evidence": evidence,
-            "debug": _update_used_tools(state, "mcp.plan"),
-        }
+        _update_used_tools(state, "mcp.plan")
+        return state
 
     return tools_node
 
 
 def make_controller_validate_node(controller: ControllerEngine, settings: Settings):
-    async def controller_validate_node(state: OrchestratorState) -> dict[str, Any]:
+    async def controller_validate_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
-        debug = state.debug
-
         last_step = None
         completed = list(execution.runtime.completed)
         if completed:
@@ -694,8 +663,9 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         execution.runtime.metadata["validation_action"] = validation.action.value if hasattr(validation.action, "value") else str(validation.action)
         execution.runtime.metadata["validation_confidence"] = float(validation.confidence or 0.0)
         execution.runtime.metadata["validation_summary"] = validation.summary
-        debug.validator_prompt = build_controller_validation_prompt()
-        debug.validator_response = validation.model_dump(exclude_none=True)
+        state.execution = execution
+        state.debug.validator_prompt = build_controller_validation_prompt()
+        state.debug.validator_response = validation.model_dump(exclude_none=True)
 
         stream = get_current_stream()
         if stream:
@@ -704,7 +674,6 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
                 issues=list(validation.issues or []),
             )
 
-        state.execution = execution
         selected_next_node = _select_next_node(state)
         _log_transition(
             "controller_validated",
@@ -713,16 +682,14 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
             **_state_snapshot(state),
         )
 
-        return {
-            "execution": execution,
-            "debug": _update_used_models(state, settings.controller_model),
-        }
+        _update_used_models(state, settings.controller_model)
+        return state
 
     return controller_validate_node
 
 
 def make_reasoning_node(controller: ControllerEngine, settings: Settings):
-    async def reasoning_node(state: OrchestratorState) -> dict[str, Any]:
+    async def reasoning_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
 
@@ -757,15 +724,13 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
             runtime.current_specialist = None
             execution = execution.model_copy(update={"runtime": runtime})
 
+        state.execution = execution
         if stream:
             await stream.reasoning_finished()
 
         _log_transition("specialist_complete", specialist=SpecialistType.REASONING.value, **_state_snapshot(state))
-        return {
-            "execution": execution,
-            "evidence": evidence,
-            "debug": _update_used_models(state, settings.reasoning_model),
-        }
+        _update_used_models(state, settings.reasoning_model)
+        return state
 
     return reasoning_node
 
@@ -809,7 +774,7 @@ def _truncate(text: str, limit: int = 220) -> str:
 
 
 def make_clarify_node():
-    async def clarify_node(state: OrchestratorState) -> dict[str, Any]:
+    async def clarify_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         response = state.response
 
@@ -837,24 +802,21 @@ def make_clarify_node():
             runtime.current_specialist = None
             execution = execution.model_copy(update={"runtime": runtime})
 
-        return {
-            "execution": execution,
-            "response": response,
-        }
+        state.execution = execution
+        return state
 
     return clarify_node
 
 
 def make_finalize_node(controller: ControllerEngine, settings: Settings):
-    async def finalize_node(state: OrchestratorState) -> dict[str, Any]:
+    async def finalize_node(state: OrchestratorState) -> OrchestratorState:
         response = state.response
-        metadata = dict(state.request.metadata)
         stream = get_current_stream()
 
         existing_answer = str(response.final_response or "").strip()
         if existing_answer:
             answer = existing_answer
-            model = str(metadata.get("final_model") or settings.controller_model)
+            model = str(response.metadata.get("final_model") or settings.controller_model)
         else:
             generation = await controller.finalize(state, publisher=stream)
             model = str(generation.model or settings.controller_model)
@@ -867,18 +829,9 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
         response.finish_reason = "stop"
         response.metadata["final_model"] = model
         response.metadata["final_answer_ready"] = True
+        response.metadata["final_answer"] = answer
 
-        metadata.update(
-            {
-                "final_model": model,
-                "final_answer_ready": True,
-                "final_answer": answer,
-            }
-        )
-
-        return {
-            "response": response,
-            "debug": _update_used_models(state, model),
-        }
+        _update_used_models(state, model)
+        return state
 
     return finalize_node
