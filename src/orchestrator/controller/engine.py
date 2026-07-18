@@ -191,6 +191,26 @@ def _normalized_plan_payload(parsed: dict[str, Any]) -> dict[str, Any]:
 
     queue = _unique_steps(raw_queue)
 
+    # If planner set explicit requires_* booleans but omitted execution_queue,
+    # infer the execution queue from those flags (without keyword heuristics).
+    if not queue:
+        inferred_steps: list[SpecialistType] = []
+        if _bool_from_any(parsed.get("requires_repository") or parsed.get("requires_rag")):
+            inferred_steps.append(SpecialistType.KNOWLEDGE)
+        if _bool_from_any(parsed.get("requires_web")):
+            inferred_steps.append(SpecialistType.WEB)
+        if _bool_from_any(parsed.get("requires_vision")):
+            inferred_steps.append(SpecialistType.VISION)
+        # planner prompt may use requires_code to mean coder
+        if _bool_from_any(parsed.get("requires_code")):
+            inferred_steps.append(SpecialistType.CODER)
+        if _bool_from_any(parsed.get("requires_tools")):
+            inferred_steps.append(SpecialistType.TOOLS)
+        if _bool_from_any(parsed.get("requires_reasoning")):
+            inferred_steps.append(SpecialistType.REASONING)
+
+        queue = _unique_steps(inferred_steps)
+
     return {
         "classification": classification,
         "intent": str(parsed.get("intent") or "").strip(),
