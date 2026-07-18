@@ -27,7 +27,7 @@ from .schemas import (
 from .streaming.context import stream_scope
 from .streaming.models import StreamKind
 from .streaming.publisher import StreamPublisher
-from .streaming.sse import _openai_chunk, _openai_done
+from .streaming.sse import openai_chunk, openai_done
 
 router = APIRouter(tags=["orchestrator"])
 logger = get_logger(__name__)
@@ -316,7 +316,7 @@ async def openai_chat_completions(
 
             logger.debug("SSE: generator started")
 
-            yield _openai_chunk(
+            yield openai_chunk(
                 request_id=request_id,
                 model=str(payload.model),
                 role="assistant",
@@ -395,7 +395,7 @@ async def openai_chat_completions(
 
                     token_seen = True
 
-                    yield _openai_chunk(
+                    yield openai_chunk(
                         request_id=request_id,
                         model=str(payload.model),
                         content=token,
@@ -408,18 +408,18 @@ async def openai_chat_completions(
                 if not token_seen:
                     answer = _final_answer_from_state(result) if result is not None else ""
                     if answer:
-                        yield _openai_chunk(
+                        yield openai_chunk(
                             request_id=request_id,
                             model=str(payload.model),
                             content=answer,
                         )
 
-                yield _openai_chunk(
+                yield openai_chunk(
                     request_id=request_id,
                     model=str(payload.model),
                     finish_reason="stop",
                 )
-                yield _openai_done()
+                yield openai_done()
 
             except asyncio.CancelledError:
                 if graph_task is not None:
