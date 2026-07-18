@@ -183,6 +183,14 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
         execution.plan = plan
         execution.validation = ValidationResult()
         execution.initialize()
+        # DEBUG: trace planner->runtime queue transfer
+        logger.debug(
+            "DEBUG planner_to_runtime queue_after_initialize=%s plan_classification=%s plan_execution_queue=%s",
+            [s.value for s in execution.runtime.queue],
+            getattr(execution.plan, "classification", None),
+            [s.value for s in (getattr(execution.plan, "execution_queue", []) or [])],
+        )
+
         execution.runtime.metadata["controller_model"] = controller.models.controller().name
         state.execution = execution
 

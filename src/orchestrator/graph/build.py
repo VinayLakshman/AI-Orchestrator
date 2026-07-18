@@ -223,7 +223,21 @@ def build_graph(
     builder.add_edge("prepare", "plan")
 
     def _next_node(state: OrchestratorState) -> str:
+        # DEBUG: trace runtime queue -> selected node
+        runtime = state.execution.runtime
+        logger.debug(
+            "DEBUG graph_next_node queue=%s current_index=%s current_specialist=%s plan_classification=%s validation_action=%s validation_complete=%s requires_reasoning=%s requires_clarification=%s",
+            [s.value for s in (runtime.queue or [])],
+            runtime.current_index,
+            runtime.current_specialist.value if runtime.current_specialist else None,
+            getattr(state.execution.plan, "classification", None),
+            state.execution.validation.action.value if state.execution.validation else None,
+            state.execution.validation.complete if state.execution.validation else None,
+            state.execution.validation.requires_reasoning if state.execution.validation else None,
+            state.execution.validation.requires_clarification if state.execution.validation else None,
+        )
         validation = state.execution.validation
+
 
         if validation is not None:
             if validation.retry:
