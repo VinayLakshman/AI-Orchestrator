@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from orchestrator.models.evidence import EvidenceLedger
+from orchestrator.models.execution import ExecutionState
+from orchestrator.models.state import DebugState, ResponseState
+from pydantic import BaseModel, Field
 
-from .common.enums import ControllerAction, RouteType, SpecialistType
-from .models.knowledge import KnowledgeRetrieveResponse
-from .models.ollama import ModelGenerationResponse
-from .models.vision import VisionAnalysis
-from .models.web import WebSearchResult
-
+from .common.enums import RouteType
 
 class RouteDecision(BaseModel):
     route: RouteType
@@ -23,12 +21,6 @@ class RouteDecision(BaseModel):
     candidate_models: list[str] = Field(default_factory=list)
 
 
-class ToolRequest(BaseModel):
-    tool_name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    description: str = ""
-
-
 class NormalizedAttachment(BaseModel):
     attachment_type: str
     placeholder: str
@@ -39,73 +31,6 @@ class RoutingHints(BaseModel):
     repository_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
     code_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
     vision_likelihood: float = Field(default=0.0, ge=0.0, le=1.0)
-
-
-class NormalizedRequest(BaseModel):
-    original_messages: list[dict[str, Any]] = Field(default_factory=list)
-    controller_messages: list[dict[str, Any]] = Field(default_factory=list)
-    user_query: str = ""
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    routing_hints: RoutingHints = Field(default_factory=RoutingHints)
-    attachments: list[NormalizedAttachment] = Field(default_factory=list)
-
-
-class ExecutionPlan(BaseModel):
-    classification: Literal[
-        "GENERAL",
-        "KNOWLEDGE",
-        "CODE",
-        "VISION",
-        "TOOLS",
-        "REASONING",
-        "CLARIFY",
-    ] = "GENERAL"
-    intent: str = ""
-    summary: str = ""
-    complexity: Literal["low", "medium", "high"] = "medium"
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    action: ControllerAction = ControllerAction.CONTINUE
-    complete: bool = False
-    next_specialist: SpecialistType | None = None
-    pending_specialists: list[SpecialistType] = Field(default_factory=list)
-    execution_queue: list[SpecialistType] = Field(default_factory=list)
-    retry: bool = False
-    retry_reason: str = ""
-    needs_reasoning: bool = False
-    final_answer_ready: bool = False
-    clarification_question: str | None = None
-    fallback_to_general: bool = False
-    knowledge_sufficient: bool | None = None
-    use_web_search: bool = False
-    tool_requests: list[ToolRequest] = Field(default_factory=list)
-    completion_condition: str = ""
-    explanation: str = ""
-    reason: str = ""
-    issues: list[str] = Field(default_factory=list)
-    notes: str = ""
-
-    route_hint: RouteDecision | None = None
-
-    @field_validator("classification", mode="before")
-    @classmethod
-    def _normalize_classification(cls, value: Any) -> str:
-        normalized = str(value or "GENERAL").strip().upper()
-        if normalized == "RAG":
-            return "KNOWLEDGE"
-        if normalized == "REASON":
-            return "REASONING"
-        return normalized
-
-    @field_validator("action", mode="before")
-    @classmethod
-    def _normalize_action(cls, value: Any) -> Any:
-        if isinstance(value, str) and value.strip().lower() == "reasoning":
-            return "reason"
-        return value
-
-
-ControllerPlan = ExecutionPlan
-ControllerValidation = ExecutionPlan
 
 
 class CoderResult(BaseModel):
@@ -129,19 +54,21 @@ class ToolResult(BaseModel):
 
 class OrchestratorResponse(BaseModel):
     thread_id: str
-    route: RouteDecision | None = None
-    controller_plan: ControllerPlan | None = None
-    controller_validation: ControllerValidation | None = None
+
     answer: str
+
+    execution: ExecutionState
+
+    evidence: EvidenceLedger
+
+    response: ResponseState
+
+    debug: DebugState | None = None
+
     used_models: list[str] = Field(default_factory=list)
+
     used_tools: list[str] = Field(default_factory=list)
-    knowledge_result: KnowledgeRetrieveResponse | None = None
-    web_search_result: WebSearchResult | None = None
-    vision: VisionAnalysis | None = None
-    vision_context: str = ""
-    coder_result: CoderResult | None = None
-    tool_result: ToolResult | None = None
-    reasoning: ModelGenerationResponse | None = None
+
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

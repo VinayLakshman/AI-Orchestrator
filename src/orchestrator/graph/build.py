@@ -12,6 +12,7 @@ from ..clients.searxng import SearXNGClient
 from ..clients.ollama import OllamaClient
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
+from ..models.state import OrchestratorState
 from ..logging import get_logger
 from ..settings import Settings
 from ..specialists.web import WebSpecialist
@@ -29,11 +30,9 @@ from .nodes import (
     make_reasoning_node,
     make_tools_node,
     make_vision_node,
-    _select_next_node,
     _state_snapshot,
     _log_transition,
 )
-from .state import OrchestratorState
 
 
 CheckpointerKind = Literal["memory", "sqlite"]
@@ -141,22 +140,55 @@ def build_graph(
     builder.add_edge(START, "prepare")
     builder.add_edge("prepare", "plan")
 
+    def _next_node(state: OrchestratorState) -> str:
+        validation = state.execution.validation
+
+        if validation is not None:
+            if validation.retry:
+                current = state.execution.runtime.current_specialist
+                if current is not None:
+                    return current.value
+
+            if validation.requires_reasoning:
+                return "reasoning"
+
+            if validation.requires_clarification:
+                return "clarify"
+
+            if validation.complete:
+                return "finalize"
+
+        runtime = state.execution.runtime
+        queue = runtime.queue
+
+        if runtime.current_index >= len(queue):
+            return "finalize"
+
+        specialist = queue[runtime.current_index]
+        return specialist.value
+
+
     def route_after_plan(state: OrchestratorState) -> str:
-        selected = _select_next_node(state)
+        selected = _next_node(state)
+
         _log_transition(
             "route_after_plan",
             selected_next_node=selected,
             **_state_snapshot(state),
         )
+
         return selected
 
+
     def route_after_validate(state: OrchestratorState) -> str:
-        selected = _select_next_node(state)
+        selected = _next_node(state)
+
         _log_transition(
             "route_after_validate",
             selected_next_node=selected,
             **_state_snapshot(state),
         )
+
         return selected
 
     builder.add_conditional_edges(

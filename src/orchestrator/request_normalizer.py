@@ -7,9 +7,9 @@ from typing import Any
 
 from .common.enums import ChatRole
 from .models.chat import ChatMessage
+from .models.state import RequestState
 from .schemas import (
     NormalizedAttachment,
-    NormalizedRequest,
     OpenAIChatCompletionRequest,
     OpenAIMessage,
     RoutingHints,
@@ -65,6 +65,17 @@ def _placeholder_for_attachment(attachment_type: str) -> str:
     }.get(attachment_type, "<Attachment Attached>")
 
 
+def _attachment_reference(part: dict[str, Any], attachment_type: str) -> str:
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict) and image_url.get("url"):
+        return str(image_url["url"])
+    for key in ("url", "source", "path", "file_id", "filename", "name"):
+        value = part.get(key)
+        if value:
+            return str(value)
+    return _placeholder_for_attachment(attachment_type)
+
+
 def _content_to_text(content: Any, *, attachments: list[NormalizedAttachment]) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -84,7 +95,7 @@ def _content_to_text(content: Any, *, attachments: list[NormalizedAttachment]) -
                 attachments.append(
                     NormalizedAttachment(
                         attachment_type=attachment_type,
-                        placeholder=_placeholder_for_attachment(attachment_type),
+                        placeholder=_attachment_reference(item, attachment_type),
                         raw=copy.deepcopy(item),
                     )
                 )
@@ -191,7 +202,12 @@ def _routing_hints(user_query: str, controller_text: str, attachments: list[Norm
     )
 
 
-def normalize_openai_request(payload: OpenAIChatCompletionRequest) -> NormalizedRequest:
+def normalize_openai_request(
+    payload: OpenAIChatCompletionRequest,
+    *,
+    request_id: str = "",
+    thread_id: str = "",
+) -> RequestState:
     original_messages = [message.model_dump(exclude_none=True) for message in payload.messages]
     controller_messages, attachments, user_query = _extract_controller_messages(payload.messages)
     controller_text = _scan_text(controller_messages)
@@ -218,11 +234,19 @@ def normalize_openai_request(payload: OpenAIChatCompletionRequest) -> Normalized
         "message_count": len(original_messages),
     }
 
-    return NormalizedRequest(
-        original_messages=original_messages,
-        controller_messages=controller_messages,
-        user_query=user_query,
-        metadata=metadata,
-        routing_hints=routing_hints,
-        attachments=attachments,
+    return RequestState(
+        request_id=request_id,
+        conversation_id=thread_id,
+        thread_id=thread_id,
+        model=payload.model,
+        stream=payload.stream,
+        messages=[ChatMessage.model_validate(message) for message in controller_messages],
+        user_message=user_query,
+        images=[item.placeholder for item in attachments if item.attachment_type == "image"],
+        metadata={
+            **metadata,
+            "routing_hints": routing_hints.model_dump(exclude_none=True),
+            "attachments": [item.model_dump(exclude_none=True) for item in attachments],
+            "file_count": sum(item.attachment_type != "image" for item in attachments),
+        },
     )
