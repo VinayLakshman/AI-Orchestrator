@@ -24,6 +24,7 @@ from ..models.evidence import (
     VisionEvidence,
     WebEvidence,
 )
+from ..models.ollama import extract_assistant_text
 from ..models.state import DebugState, OrchestratorState, ResponseState
 from ..models.execution import (
     ExecutionState,
@@ -197,7 +198,6 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
         return {
             "execution": execution,
-            "debug": debug,
             "debug": _update_used_models(state, settings.controller_model),
         }
 
@@ -715,7 +715,6 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
 
         return {
             "execution": execution,
-            "debug": debug,
             "debug": _update_used_models(state, settings.controller_model),
         }
 

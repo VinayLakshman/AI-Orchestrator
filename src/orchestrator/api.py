@@ -75,8 +75,8 @@ def _openai_request_from_chat_request(payload: ChatRequest) -> OpenAIChatComplet
     )
 
 
-def _input_state_from_normalized_request(
-    normalized: RequestState,
+def _input_state_from_request_state(
+    request_state: RequestState,
     *,
     thread_id: str,
     request_id: str | None = None,
@@ -84,7 +84,7 @@ def _input_state_from_normalized_request(
     stream: bool = False,
 ) -> OrchestratorState:
     request_id = request_id or str(uuid4())
-    request_state = normalized.model_copy(
+    request_state = request_state.model_copy(
         update={
             "request_id": request_id,
             "conversation_id": thread_id,
@@ -92,7 +92,7 @@ def _input_state_from_normalized_request(
             "model": model,
             "stream": stream,
             "metadata": {
-                **normalized.metadata,
+                **request_state.metadata,
                 "request_headers": _request_headers(request_id, thread_id),
             },
         }
@@ -244,9 +244,9 @@ def _input_state_from_request(
     request_id: str | None = None,
     thread_id: str | None = None,
 ) -> OrchestratorState:
-    normalized_request = normalize_openai_request(_openai_request_from_chat_request(payload))
-    return _input_state_from_normalized_request(
-        normalized_request,
+    request_state = normalize_openai_request(_openai_request_from_chat_request(payload))
+    return _input_state_from_request_state(
+        request_state,
         thread_id=thread_id or _thread_id_from_request(payload),
         request_id=request_id,
         model=payload.model or "orchestrator",
@@ -291,11 +291,11 @@ async def openai_chat_completions(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ):
     request_id = str(uuid4())
-    normalized_request = normalize_openai_request(payload)
+    request_state = normalize_openai_request(payload)
     thread_id = str(uuid4())
 
-    state_input = _input_state_from_normalized_request(
-        normalized_request,
+    state_input = _input_state_from_request_state(
+        request_state,
         thread_id=thread_id,
         request_id=request_id,
         model=str(payload.model or "orchestrator"),

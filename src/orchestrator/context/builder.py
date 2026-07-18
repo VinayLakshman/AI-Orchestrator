@@ -380,7 +380,7 @@ def build_controller_messages(
         outgoing.append(
             ChatMessage(
                 role=ChatRole.SYSTEM,
-                metadata={"source": "normalized_request"},
+                metadata={"source": "request_context"},
                 content=request_context,
             )
         )
