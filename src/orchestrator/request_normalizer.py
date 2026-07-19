@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from .common.enums import ChatRole
+from .logging import get_logger
 from .models.chat import ChatMessage
 from .models.state import RequestState
 from .schemas import (
@@ -13,6 +14,8 @@ from .schemas import (
     OpenAIChatCompletionRequest,
     OpenAIMessage,
 )
+
+logger = get_logger(__name__)
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```", re.DOTALL)
@@ -116,6 +119,7 @@ def _extract_controller_messages(
     attachments: list[NormalizedAttachment] = []
     user_query = ""
 
+    # Always set user_query from the *latest* user message.
     for message in messages:
         content = _content_to_text(message.content, attachments=attachments)
         controller_messages.append(
@@ -126,9 +130,10 @@ def _extract_controller_messages(
                 tool_call_id=message.tool_call_id,
             ).model_dump(exclude_none=True)
         )
-        if message.role == ChatRole.USER.value and content and not user_query:
+        if message.role == ChatRole.USER.value and content and content.strip():
             user_query = content
 
+    # Fallback: if no non-empty content was found, pick the latest user message.
     if not user_query:
         for message in reversed(controller_messages):
             if message.get("role") == ChatRole.USER.value and str(message.get("content") or "").strip():
@@ -163,6 +168,16 @@ def normalize_openai_request(
     original_messages = [message.model_dump(exclude_none=True) for message in payload.messages]
     controller_messages, attachments, user_query = _extract_controller_messages(payload.messages)
     controller_text = _scan_text(controller_messages)
+
+    logger.debug(
+        "NORMALIZE: request_id=%s thread_id=%s user_message_len=%d has_images=%s message_count=%d user_message_preview=%r",
+        request_id,
+        thread_id,
+        len(user_query or ""),
+        any(item.attachment_type == "image" for item in attachments),
+        len(original_messages),
+        (user_query or "")[:120],
+    )
 
     has_images = any(item.attachment_type == "image" for item in attachments)
     has_files = any(item.attachment_type != "image" for item in attachments)
