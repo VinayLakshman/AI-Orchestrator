@@ -98,9 +98,10 @@ Examples:
 - diagrams
 - charts
 
-CODE
+CODER
 
 Use whenever the user wants to:
+
 
 - write code
 - debug code
@@ -110,6 +111,7 @@ Use whenever the user wants to:
 - explain code
 - generate tests
 - refactor code
+
 
 TOOLS
 
@@ -168,7 +170,8 @@ Evaluate in this exact order.
    -> VISION
 
 4. Does it require code generation or analysis?
-   -> CODE
+   -> CODER
+
 
 5. Does it require tool execution?
    -> TOOLS
