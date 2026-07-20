@@ -55,32 +55,67 @@ _ALLOWED_ACTIONS = {
 }
 
 def _normalize_step(value: Any) -> SpecialistType | None:
+    """Normalize a planner specialist token into SpecialistType.
+
+    Returns None for empty values only.
+    Unknown specialist tokens are handled by _unique_steps where we can
+    enforce strict contract behavior.
+    """
     if value is None:
         return None
     if isinstance(value, SpecialistType):
         return value
-    text = str(value).strip().lower()
+    text = str(value).strip()
     if not text:
         return None
-    try:
-        return SpecialistType(text)
-    except Exception:
-        return None
+
+    # SpecialistType is a StrEnum; this will raise ValueError if unknown.
+    return SpecialistType(text.lower())
+
 
 
 def _unique_steps(steps: Iterable[Any]) -> list[SpecialistType]:
+    """Validate and de-duplicate planner execution queue entries.
+
+    Contract: every planner-supplied entry must map to a supported
+    SpecialistType. Unknown entries are treated as a contract violation
+    and will raise.
+
+    Duplicate valid specialists are de-duplicated (preserves existing behavior).
+    """
+
     seen: set[str] = set()
     out: list[SpecialistType] = []
-    for step in steps:
-        normalized = _normalize_step(step)
+
+    raw_steps = list(steps)
+    invalid: list[Any] = []
+
+    for step in raw_steps:
+        try:
+            normalized = _normalize_step(step)
+        except ValueError:
+            invalid.append(step)
+            continue
+
         if normalized is None:
             continue
+
         key = normalized.value
         if key in seen:
             continue
         seen.add(key)
         out.append(normalized)
+
+    if invalid:
+        logger.error(
+            "planner_contract_violation invalid_specialist_detected invalid_tokens=%s raw_execution_queue=%s",
+            invalid,
+            raw_steps,
+        )
+        raise ValueError(f"Invalid execution_queue specialist token(s): {invalid}")
+
     return out
+
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -163,8 +198,54 @@ def _log_planner_plan(plan: ExecutionPlan) -> None:
     )
 
 
+def _normalize_route_value(parsed: dict[str, Any], *, classification: str) -> str:
+
+    """Normalize planner `route` into a valid coarse RouteType.
+
+    Reasoning must NOT be allowed to leak into the graph route.
+    If planner emits an invalid route, fail open only to a safe coarse route
+    while keeping specialist intent via `requires_reasoning` / `execution_queue`.
+    """
+
+    from ..common.enums import RouteType
+
+    raw = parsed.get("route") or parsed.get("graph_route") or parsed.get("category")
+    candidate = str(raw or "").strip().lower() or str(classification).strip().lower()
+
+    specialist_tokens = {
+        "reasoning",
+        "clarify",
+        "knowledge",
+        "web",
+        "vision",
+        "code",
+        "coder",
+        "tools",
+        "tool",
+        "rag",
+        "multi_step",
+        "multistep",
+    }
+
+    if candidate in specialist_tokens:
+        return RouteType.MULTI_STEP.value if candidate == "multi_step" else RouteType.GENERAL.value
+
+    for rt in RouteType:
+        if candidate == rt.value:
+            return rt.value
+
+    # default safe coarse route
+    return RouteType.GENERAL.value
+
+
 def _normalized_plan_payload(parsed: dict[str, Any]) -> dict[str, Any]:
+
+    # Preserve execution queue exactly as produced by the planner (except for
+    # safe normalization like casing and de-duplication).
+    # Important: do not alter requires_* booleans based on `route`.
+
     classification = str(
+
         parsed.get("classification")
         or parsed.get("route")
         or parsed.get("category")
@@ -250,11 +331,12 @@ def _normalized_plan_payload(parsed: dict[str, Any]) -> dict[str, Any]:
         "reason": str(parsed.get("reason") or "").strip(),
         "issues": list(parsed.get("issues") or []),
         "notes": str(parsed.get("notes") or "").strip(),
-        "route": (
-            "rag"
-            if str(parsed.get("route") or classification).strip().upper() in {"KNOWLEDGE", "RAG"}
-            else str(parsed.get("route") or classification).strip().lower()
-        ),
+        # NOTE: `route` is a coarse orchestration route only.
+        # Do not allow specialist values (e.g. `reasoning`) to leak into the graph route.
+        # If planner emits an invalid route (including specialist-ish tokens), we default
+        # to a safe coarse route while preserving requires_reasoning/execution_queue.
+        "route": _normalize_route_value(parsed, classification=classification),
+
         "route_hint": parsed.get("route_hint"),
     }
 
@@ -376,7 +458,17 @@ class ControllerEngine:
             plan = ExecutionPlan()
 
         if plan.execution_queue:
-            plan.execution_queue = _unique_steps(plan.execution_queue)
+            try:
+                plan.execution_queue = _unique_steps(plan.execution_queue)
+            except ValueError:
+                # planner emitted an invalid execution queue; fail loudly
+                # so the system can recover via the existing exception path.
+                logger.exception(
+                    "planner_contract_validation_failed invalid_execution_queue raw_response=%s",
+                    raw_content[:4000] or "<empty>",
+                )
+                raise
+
 
         logger.debug(
             "execution_plan %s",

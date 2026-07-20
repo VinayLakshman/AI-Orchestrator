@@ -131,6 +131,27 @@ Use ONLY after other specialists when multiple evidence sources must be synthesi
 
 Reasoning is NEVER the first specialist.
 
+IMPORTANT ROUTING CONTRACT
+- `route` (graph route) is ONLY for coarse orchestration routes and MUST NOT be used to represent specialists.
+- Do NOT output `route: "reasoning"` or any specialist name in the `route` field.
+- Represent reasoning ONLY via `execution_queue` and/or `requires_reasoning`.
+
+Correct examples:
+{
+  "classification":"GENERAL",
+  "confidence":0.0,
+  "requires_reasoning":true,
+  "execution_queue":["KNOWLEDGE","WEB","REASONING"]
+}
+
+{
+  "classification":"GENERAL",
+  "confidence":0.0,
+  "requires_reasoning":true,
+  "execution_queue":["REASONING"]
+}
+
+
 --------------------------------------------------
 ROUTING PRIORITY
 --------------------------------------------------

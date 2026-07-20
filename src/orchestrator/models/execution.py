@@ -17,13 +17,21 @@ class ExecutionPlan(BaseModel):
     Immutable execution plan produced by the planner.
 
     Once created, this object should never be modified.
+
+    Architectural note:
+    - `route` is a coarse orchestration path (graph route) and MUST NOT include
+      specialist steps such as `REASONING`.
+    - specialist work is represented only via `execution_queue`.
     """
 
     classification: str = "GENERAL"
 
     confidence: float = 0.0
 
+    # Coarse orchestration route only.
+    # Reasoning must be represented as a specialist step in `execution_queue`.
     route: RouteType = RouteType.GENERAL
+
 
     requires_repository: bool = False
 
