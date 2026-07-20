@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     controller_keep_alive: str = "30m"
     reasoning_keep_alive: str = "15m"
+    coder_keep_alive: str = "30m"
+    vision_keep_alive: str = "30m"
     controller_model_think: bool = False
     reasoning_model_think: bool = True
     controller_plan_temperature: float = 0.05
