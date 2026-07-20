@@ -12,6 +12,7 @@ from ..clients.searxng import SearXNGClient
 from ..clients.ollama import OllamaClient
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
+from ..models.state import OrchestratorState
 from ..logging import get_logger
 from ..settings import Settings
 from ..specialists.web import WebSpecialist
@@ -29,15 +30,79 @@ from .nodes import (
     make_reasoning_node,
     make_tools_node,
     make_vision_node,
-    _select_next_node,
     _state_snapshot,
     _log_transition,
 )
-from .state import OrchestratorState
+from .instrumentation import timed_node
 
 
 CheckpointerKind = Literal["memory", "sqlite"]
 logger = get_logger(__name__)
+
+
+@dataclass(slots=True)
+class TypedGraphFacade:
+    graph: Any
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.graph, name)
+
+    @staticmethod
+    def _unwrap_state(result: Any) -> OrchestratorState:
+        state = getattr(result, "value", result)
+
+        if isinstance(state, OrchestratorState):
+            return state
+
+        if isinstance(state, dict):
+            return OrchestratorState.model_validate(state)
+
+        raise TypeError(
+            f"Expected OrchestratorState or dict from graph, got {type(state).__name__}"
+        )
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> OrchestratorState:
+        kwargs.setdefault("version", "v2")
+        result = await self.graph.ainvoke(*args, **kwargs)
+        return self._unwrap_state(result)
+
+    def invoke(self, *args: Any, **kwargs: Any) -> OrchestratorState:
+        kwargs.setdefault("version", "v2")
+        result = self.graph.invoke(*args, **kwargs)
+        return self._unwrap_state(result)
+
+    async def astream(self, *args: Any, **kwargs: Any):
+        kwargs.setdefault("version", "v2")
+        async for chunk in self.graph.astream(*args, **kwargs):
+            yield self._normalize_stream_chunk(chunk, stream_mode=kwargs.get("stream_mode", "values"))
+
+    def stream(self, *args: Any, **kwargs: Any):
+        kwargs.setdefault("version", "v2")
+        for chunk in self.graph.stream(*args, **kwargs):
+            yield self._normalize_stream_chunk(chunk, stream_mode=kwargs.get("stream_mode", "values"))
+
+    @staticmethod
+    def _normalize_stream_chunk(chunk: Any, *, stream_mode: str) -> Any:
+        if stream_mode != "values":
+            return chunk
+        if isinstance(chunk, OrchestratorState):
+            return chunk
+        if hasattr(chunk, "data") and isinstance(chunk.data, OrchestratorState):
+            return chunk.data
+        if isinstance(chunk, tuple) and chunk and isinstance(chunk[-1], OrchestratorState):
+            return chunk[-1]
+        if isinstance(chunk, dict):
+            if "data" in chunk:
+                data = chunk["data"]
+
+                if isinstance(data, dict):
+                    return OrchestratorState.model_validate(data)
+
+                if isinstance(data, OrchestratorState):
+                    return data
+
+            return OrchestratorState.model_validate(chunk)
+        return chunk
 
 
 @dataclass(slots=True)
@@ -112,7 +177,11 @@ def build_graph(
     vision_pipeline: VisionPipeline,
     searxng_client: SearXNGClient | None = None,
 ) -> tuple[Any, Any]:
-    builder = StateGraph(OrchestratorState)
+    builder = StateGraph(
+        OrchestratorState,
+        input_schema=OrchestratorState,
+        output_schema=OrchestratorState,
+    )
 
     prepare_node = make_prepare_node(settings)
     plan_node = make_controller_plan_node(controller, settings)
@@ -125,6 +194,18 @@ def build_graph(
     reasoning_node = make_reasoning_node(controller, settings)
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
+
+    prepare_node = timed_node("prepare", prepare_node, display_name="Prepare")
+    plan_node = timed_node("planner", plan_node, display_name="Planner")
+    vision_node = timed_node("vision", vision_node, display_name="Vision")
+    knowledge_node = timed_node("knowledge", knowledge_node, display_name="Knowledge")
+    web_node = timed_node("web", web_node, display_name="Web")
+    coder_node = timed_node("coder", coder_node, display_name="Code")
+    tools_node = timed_node("tools", tools_node, display_name="Tools")
+    validate_node = timed_node("validation", validate_node, display_name="Validation")
+    reasoning_node = timed_node("reasoning", reasoning_node, display_name="Reasoning")
+    clarify_node = timed_node("clarify", clarify_node, display_name="Clarification")
+    finalize_node = timed_node("finalize", finalize_node, display_name="Finalizer")
 
     builder.add_node("prepare", prepare_node)
     builder.add_node("plan", plan_node)
@@ -141,22 +222,69 @@ def build_graph(
     builder.add_edge(START, "prepare")
     builder.add_edge("prepare", "plan")
 
+    def _next_node(state: OrchestratorState) -> str:
+        # DEBUG: trace runtime queue -> selected node
+        runtime = state.execution.runtime
+        logger.debug(
+            "DEBUG graph_next_node queue=%s current_index=%s current_specialist=%s plan_classification=%s validation_action=%s validation_complete=%s requires_reasoning=%s requires_clarification=%s",
+            [s.value for s in (runtime.queue or [])],
+            runtime.current_index,
+            runtime.current_specialist.value if runtime.current_specialist else None,
+            getattr(state.execution.plan, "classification", None),
+            state.execution.validation.action.value if state.execution.validation else None,
+            state.execution.validation.complete if state.execution.validation else None,
+            state.execution.validation.requires_reasoning if state.execution.validation else None,
+            state.execution.validation.requires_clarification if state.execution.validation else None,
+        )
+        validation = state.execution.validation
+
+
+        if validation is not None:
+            if validation.retry:
+                current = state.execution.runtime.current_specialist
+                if current is not None:
+                    return current.value
+
+            if validation.requires_reasoning:
+                return "reasoning"
+
+            if validation.requires_clarification:
+                return "clarify"
+
+            if validation.complete:
+                return "finalize"
+
+        runtime = state.execution.runtime
+        queue = runtime.queue
+
+        if runtime.current_index >= len(queue):
+            return "finalize"
+
+        specialist = queue[runtime.current_index]
+        return specialist.value
+
+
     def route_after_plan(state: OrchestratorState) -> str:
-        selected = _select_next_node(state)
+        selected = _next_node(state)
+
         _log_transition(
             "route_after_plan",
             selected_next_node=selected,
             **_state_snapshot(state),
         )
+
         return selected
 
+
     def route_after_validate(state: OrchestratorState) -> str:
-        selected = _select_next_node(state)
+        selected = _next_node(state)
+
         _log_transition(
             "route_after_validate",
             selected_next_node=selected,
             **_state_snapshot(state),
         )
+
         return selected
 
     builder.add_conditional_edges(
@@ -200,7 +328,7 @@ def build_graph(
     builder.add_edge("finalize", END)
 
     checkpointer, _kind = build_checkpointer(settings)
-    graph = builder.compile(checkpointer=checkpointer)
+    graph = TypedGraphFacade(builder.compile(checkpointer=checkpointer))
 
     return graph, checkpointer
 

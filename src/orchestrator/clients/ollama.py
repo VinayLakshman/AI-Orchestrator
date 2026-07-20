@@ -45,6 +45,7 @@ class OllamaClient:
         max_tokens: int | None = None,
         stream: bool = False,
         options: dict[str, Any] | None = None,
+        response_format: str | dict[str, Any] | None = None,
         keep_alive: str | None = None,
         think: bool | None = None,
     ) -> dict[str, Any]:
@@ -54,6 +55,9 @@ class OllamaClient:
             "stream": stream,
             "options": dict(options or {}),
         }
+
+        if response_format is not None:
+            payload["format"] = response_format
 
         if temperature is not None:
             payload["options"]["temperature"] = temperature
@@ -115,6 +119,7 @@ class OllamaClient:
         max_tokens: int | None = None,
         stream: bool = False,
         options: dict[str, Any] | None = None,
+        response_format: str | dict[str, Any] | None = None,
         keep_alive: str | None = None,
         think: bool | None = None,
     ) -> ModelGenerationResponse:
@@ -127,6 +132,7 @@ class OllamaClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 options=options,
+                response_format=response_format,
                 keep_alive=keep_alive,
                 think=think,
             ):
@@ -143,6 +149,7 @@ class OllamaClient:
             max_tokens=max_tokens,
             stream=False,
             options=options,
+            response_format=response_format,
             keep_alive=keep_alive,
             think=think,
         )
@@ -177,6 +184,7 @@ class OllamaClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         options: dict[str, Any] | None = None,
+        response_format: str | dict[str, Any] | None = None,
         keep_alive: str | None = None,
         think: bool | None = None,
     ) -> AsyncIterator[OllamaStreamChunk]:
@@ -188,6 +196,7 @@ class OllamaClient:
             max_tokens=max_tokens,
             stream=True,
             options=options,
+            response_format=response_format,
             keep_alive=keep_alive,
             think=think,
         )

@@ -5,7 +5,7 @@ from time import time
 from typing import Any
 
 
-def _openai_chunk(
+def openai_chunk(
     *,
     request_id: str,
     model: str,
@@ -35,5 +35,5 @@ def _openai_chunk(
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def _openai_done() -> str:
+def openai_done() -> str:
     return "data: [DONE]\n\n"

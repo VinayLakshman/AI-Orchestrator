@@ -2,40 +2,33 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from time import time
+from time import perf_counter, time
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from orchestrator.logging import get_logger
+from orchestrator.logging.request_summary import log_request_summary
 
 from .common.constants import THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
 from .models.chat import ChatRequest
-from .models.knowledge import KnowledgeRetrieveResponse
-from .models.ollama import ModelGenerationResponse, extract_assistant_text
-from .models.web import WebSearchResult
+from .models.state import OrchestratorState, RequestState
 from .request_normalizer import normalize_openai_request
 from .schemas import (
-    ControllerPlan,
-    ControllerValidation,
-    CoderResult,
-    NormalizedRequest,
     OpenAIChatCompletionChoice,
     OpenAIChatCompletionRequest,
     OpenAIChatCompletionResponse,
     OpenAIMessage,
     OpenAIModelCard,
     OpenAIModelListResponse,
-    OrchestratorResponse,
-    RouteDecision,
-    ToolResult,
+    OpenAIUsage,
 )
 from .streaming.context import stream_scope
 from .streaming.models import StreamKind
 from .streaming.publisher import StreamPublisher
-from .streaming.sse import _openai_chunk, _openai_done
+from .streaming.sse import openai_chunk, openai_done
 
 router = APIRouter(tags=["orchestrator"])
 logger = get_logger(__name__)
@@ -83,206 +76,91 @@ def _openai_request_from_chat_request(payload: ChatRequest) -> OpenAIChatComplet
     )
 
 
-def _input_state_from_request(
-    payload: ChatRequest,
-    request: Request,
-    *,
-    request_id: str | None = None,
-) -> dict[str, Any]:
-    normalized_request = normalize_openai_request(_openai_request_from_chat_request(payload))
-    return _input_state_from_normalized_request(
-        normalized_request,
-        request,
-        thread_id=_thread_id_from_request(payload),
-        request_id=request_id,
-    )
-
-
-def _input_state_from_normalized_request(
-    normalized: NormalizedRequest,
-    request: Request,
+def _input_state_from_request_state(
+    request_state: RequestState,
     *,
     thread_id: str,
     request_id: str | None = None,
-) -> dict[str, Any]:
-    metadata = {
-        **(normalized.metadata or {}),
-        "request_headers": _request_headers(request_id, thread_id),
-    }
-    if request_id:
-        metadata["request_id"] = request_id
+    model: str = "orchestrator",
+    stream: bool = False,
+) -> OrchestratorState:
+    request_id = request_id or str(uuid4())
+    request_state = request_state.model_copy(
+        update={
+            "request_id": request_id,
+            "conversation_id": thread_id,
+            "thread_id": thread_id,
+            "model": model,
+            "stream": stream,
+            "metadata": {
+                **request_state.metadata,
+                "request_headers": _request_headers(request_id, thread_id),
+            },
+        }
+    )
 
-    return {
-        "thread_id": thread_id,
-        "messages": [message for message in normalized.controller_messages],
-        "controller_messages": [message for message in normalized.controller_messages],
-        "original_messages": [message for message in normalized.original_messages],
-        "normalized_request": normalized.model_dump(exclude_none=True),
-        "routing_hints": normalized.routing_hints.model_dump(exclude_none=True),
-        "attachments": [attachment.model_dump(exclude_none=True) for attachment in normalized.attachments],
-        "metadata": metadata,
-        "used_models": [],
-        "used_tools": [],
-        "knowledge_result": None,
-        "web_search_result": None,
-        "vision": None,
-        "vision_context": "",
-        "coder_result": None,
-        "tool_result": None,
-        "reasoning_result": None,
-        "execution_plan": None,
-        "retry_limit": 1,
-        "executed_specialists": [],
-        "pending_specialists": [],
-        "failed_specialists": [],
-        "retry_counts": {},
-        "pending_steps": [],
-        "completed_steps": [],
-        "current_step": "",
-        "needs_reasoning": False,
-        "requires_clarification": False,
-        "controller_cycles": 0,
-        "specialist_executions": 0,
-        "workflow_progress": 0,
-        "workflow_stall_count": 0,
-        "last_progress_signature": "",
-        "last_controller_decision": "",
-        "last_specialist": "",
-        "validation_status": "",
-        "specialist_status": "",
-        "final_answer_ready": False,
-    }
+    return OrchestratorState(request=request_state)
 
 
-def _route_from_state(state: dict[str, Any]) -> RouteDecision | None:
-    route = state.get("route")
-    if route is None:
-        plan = state.get("controller_plan")
-        if isinstance(plan, dict):
-            route = plan.get("route_hint")
-    if route is None:
-        return None
-    return RouteDecision.model_validate(route)
+def _final_answer_from_state(state: OrchestratorState) -> str:
+    answer = state.response.final_response.strip()
+    return answer or "I could not generate a complete answer for that request. Please try again with a little more detail."
 
 
-def _knowledge_from_state(state: dict[str, Any]) -> KnowledgeRetrieveResponse | None:
-    knowledge_result = state.get("knowledge_result")
-    if isinstance(knowledge_result, dict):
-        return KnowledgeRetrieveResponse.model_validate(knowledge_result)
-    if isinstance(knowledge_result, KnowledgeRetrieveResponse):
-        return knowledge_result
-    return None
-
-
-def _web_from_state(state: dict[str, Any]) -> WebSearchResult | None:
-    value = state.get("web_search_result")
-    if isinstance(value, dict):
-        return WebSearchResult.model_validate(value)
-    if isinstance(value, WebSearchResult):
-        return value
-    return None
-
-
-def _controller_plan_from_state(state: dict[str, Any]) -> ControllerPlan | None:
-    value = state.get("execution_plan") or state.get("controller_plan")
-    if isinstance(value, dict):
-        return ControllerPlan.model_validate(value)
-    if isinstance(value, ControllerPlan):
-        return value
-    return None
-
-
-def _controller_validation_from_state(state: dict[str, Any]) -> ControllerValidation | None:
-    value = state.get("execution_plan") or state.get("controller_validation")
-    if isinstance(value, dict):
-        return ControllerValidation.model_validate(value)
-    if isinstance(value, ControllerValidation):
-        return value
-    return None
-
-
-def _coder_from_state(state: dict[str, Any]) -> CoderResult | None:
-    value = state.get("coder_result")
-    if isinstance(value, dict):
-        return CoderResult.model_validate(value)
-    if isinstance(value, CoderResult):
-        return value
-    return None
-
-
-def _tool_from_state(state: dict[str, Any]) -> ToolResult | None:
-    value = state.get("tool_result")
-    if isinstance(value, dict):
-        return ToolResult.model_validate(value)
-    if isinstance(value, ToolResult):
-        return value
-    return None
-
-
-def _assistant_content_from_messages(state: dict[str, Any]) -> str:
-    messages = state.get("messages", []) or []
-    for message in reversed(messages):
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            text = extract_assistant_text(message.get("content"))
-            if text:
-                return text
-    return ""
-
-
-def _answer_from_state(state: dict[str, Any]) -> tuple[str, str]:
-    answer = extract_assistant_text(state.get("answer"))
-    if answer:
-        return answer, "answer"
-
-    reasoning = state.get("reasoning_result")
-    if isinstance(reasoning, dict):
-        reasoning = ModelGenerationResponse.model_validate(reasoning)
-    if isinstance(reasoning, ModelGenerationResponse):
-        reasoning_content = extract_assistant_text(reasoning.content) or extract_assistant_text(reasoning.raw)
-        if reasoning_content:
-            return reasoning_content, "reasoning_result.content"
-
-    assistant_content = _assistant_content_from_messages(state)
-    if assistant_content:
-        return assistant_content, "messages[-1].content"
-
-    metadata = state.get("metadata", {}) or {}
-    if isinstance(metadata, dict):
-        final_answer = extract_assistant_text(metadata.get("final_answer"))
-        if final_answer:
-            return final_answer, "metadata.final_answer"
-
-    return (
-        "I could not generate a complete answer for that request. "
-        "Please try again with a little more detail.",
-        "fallback",
+def _usage_from_response_state(state: OrchestratorState) -> OpenAIUsage:
+    usage = state.response.usage
+    return OpenAIUsage(
+        prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+        completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+        total_tokens=int(usage.get("total_tokens", 0) or 0),
     )
 
 
-def _response_from_state(thread_id: str, state: dict[str, Any]) -> OrchestratorResponse:
-    answer, _answer_source = _answer_from_state(state)
-    reasoning = state.get("reasoning_result")
-    if isinstance(reasoning, dict):
-        reasoning = ModelGenerationResponse.model_validate(reasoning)
-    elif reasoning is not None and not isinstance(reasoning, ModelGenerationResponse):
-        reasoning = None
+def _orchestrator_chat_result(thread_id: str, state: OrchestratorState) -> dict[str, Any]:
+    return {
+        "thread_id": thread_id,
+        "answer": _final_answer_from_state(state),
+        "request": state.request.model_dump(mode="json", exclude_none=True),
+        "execution": state.execution.model_dump(mode="json", exclude_none=True),
+        "evidence": state.evidence.model_dump(mode="json", exclude_none=True),
+        "response": state.response.model_dump(mode="json", exclude_none=True),
+        "debug": state.debug.model_dump(mode="json", exclude_none=True),
+        "used_models": state.debug.used_models,
+        "used_tools": state.debug.used_tools,
+        "metadata": state.response.metadata,
+    }
 
-    return OrchestratorResponse(
-        thread_id=thread_id,
-        route=_route_from_state(state),
-        controller_plan=_controller_plan_from_state(state),
-        controller_validation=_controller_validation_from_state(state),
-        answer=answer,
-        used_models=state.get("used_models", []),
-        used_tools=state.get("used_tools", []),
-        knowledge_result=_knowledge_from_state(state),
-        web_search_result=_web_from_state(state),
-        vision=state.get("vision"),
-        vision_context=state.get("vision_context", ""),
-        coder_result=_coder_from_state(state),
-        tool_result=_tool_from_state(state),
-        reasoning=reasoning,
-        metadata=state.get("metadata", {}),
+
+def _completion_from_state(
+    *,
+    request_id: str,
+    payload: OpenAIChatCompletionRequest,
+    state: OrchestratorState,
+    thread_id: str,
+) -> OpenAIChatCompletionResponse:
+    answer = _final_answer_from_state(state)
+    usage = _usage_from_response_state(state)
+    response_metadata = dict(state.response.metadata)
+    response_metadata.update(
+        {
+            "thread_id": thread_id,
+            "request_id": request_id,
+        }
+    )
+
+    return OpenAIChatCompletionResponse(
+        id=request_id,
+        created=int(time()),
+        model=str(payload.model),
+        choices=[
+            OpenAIChatCompletionChoice(
+                index=0,
+                message=OpenAIMessage(role="assistant", content=answer),
+                finish_reason="stop",
+            )
+        ],
+        usage=usage,
+        metadata=response_metadata,
     )
 
 
@@ -291,13 +169,12 @@ async def _run_graph_with_stream(
     runtime: OrchestratorRuntime,
     request_id: str,
     thread_id: str,
-    state_input: dict[str, Any],
+    state_input: OrchestratorState,
     publisher: StreamPublisher,
-) -> dict[str, Any]:
+) -> OrchestratorState:
     logger.debug("GRAPH: entered _run_graph_with_stream")
     try:
         async with stream_scope(publisher):
-            # await publisher.graph_started(route_hint=state_input.get("metadata", {}).get("requested_model"))
             await publisher.graph_started()
             logger.debug("GRAPH: invoking graph")
             result = await runtime.graph.ainvoke(
@@ -305,7 +182,7 @@ async def _run_graph_with_stream(
                 config={"configurable": {"thread_id": thread_id}},
             )
             logger.debug("GRAPH: graph finished")
-            route_name = result.get("route_name") or result.get("route", {}).get("route")
+            route_name = result.execution.plan.route.value
             await publisher.graph_finished(route=route_name)
             return result
     except Exception as exc:
@@ -316,14 +193,20 @@ async def _run_graph_with_stream(
         await runtime.stream_hub.close(request_id)
 
 
-def _request_headers_out(request_id: str, thread_id: str) -> dict[str, str]:
-    return {
-        "cache-control": "no-cache",
-        "connection": "keep-alive",
-        "x-accel-buffering": "no",
-        "x-orchestrator-request-id": request_id,
-        "x-orchestrator-thread-id": thread_id,
-    }
+def _emit_request_summary(
+    *,
+    request_id: str,
+    state: OrchestratorState,
+    execution_trace: list[dict[str, Any]] | None,
+    total_duration_ms: int | float,
+) -> None:
+    log_request_summary(
+        request_id=request_id,
+        state=state,
+        execution_trace=execution_trace,
+        timings=state.debug.timings,
+        total_duration_ms=total_duration_ms,
+    )
 
 
 @router.get("/healthz")
@@ -355,21 +238,46 @@ async def list_models(runtime: OrchestratorRuntime = Depends(get_runtime)) -> Op
     )
 
 
-@router.post("/chat", response_model=OrchestratorResponse)
+@router.post("/chat")
 async def chat(
     payload: ChatRequest,
     request: Request,
     runtime: OrchestratorRuntime = Depends(get_runtime),
-) -> OrchestratorResponse:
+) -> dict[str, Any]:
     thread_id = _thread_id_from_request(payload)
-    state_input = _input_state_from_request(payload, request)
+    state_input = _input_state_from_request(payload, thread_id=thread_id)
+    request_id = state_input.request.request_id
+    started_at = perf_counter()
 
-    result = await runtime.graph.ainvoke(
+    result: OrchestratorState = await runtime.graph.ainvoke(
         state_input,
         config={"configurable": {"thread_id": thread_id}},
     )
 
-    return _response_from_state(thread_id, result)
+    _emit_request_summary(
+        request_id=request_id,
+        state=result,
+        execution_trace=result.debug.execution_trace,
+        total_duration_ms=(perf_counter() - started_at) * 1000.0,
+    )
+
+    return _orchestrator_chat_result(thread_id, result)
+
+
+def _input_state_from_request(
+    payload: ChatRequest,
+    *,
+    request_id: str | None = None,
+    thread_id: str | None = None,
+) -> OrchestratorState:
+    request_state = normalize_openai_request(_openai_request_from_chat_request(payload))
+    return _input_state_from_request_state(
+        request_state,
+        thread_id=thread_id or _thread_id_from_request(payload),
+        request_id=request_id,
+        model=payload.model or "orchestrator",
+        stream=payload.stream,
+    )
 
 
 @router.get("/v1/streams/{request_id}")
@@ -395,7 +303,7 @@ async def stream_events(
     return StreamingResponse(
         event_gen(),
         media_type="text/event-stream",
-        headers=_request_headers_out(request_id, stream.conversation_id or ""),
+        headers=_request_headers(request_id, stream.conversation_id or ""),
     )
 
 
@@ -409,14 +317,16 @@ async def openai_chat_completions(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ):
     request_id = str(uuid4())
-    normalized_request = normalize_openai_request(payload)
+    request_state = normalize_openai_request(payload)
     thread_id = str(uuid4())
+    started_at = perf_counter()
 
-    state_input = _input_state_from_normalized_request(
-        normalized_request,
-        request,
+    state_input = _input_state_from_request_state(
+        request_state,
         thread_id=thread_id,
         request_id=request_id,
+        model=str(payload.model or "orchestrator"),
+        stream=payload.stream,
     )
 
     stream = runtime.stream_hub.get_or_create(request_id, conversation_id=thread_id)
@@ -426,16 +336,14 @@ async def openai_chat_completions(
 
         async def sse_generator():
             token_seen = False
-            result: dict[str, Any] | None = None
+            result: OrchestratorState | None = None
             graph_task: asyncio.Task | None = None
             event_queue: asyncio.Queue[Any] = asyncio.Queue()
             next_heartbeat = asyncio.get_running_loop().time() + 10
 
             logger.debug("SSE: generator started")
 
-            # Send the standard OpenAI role chunk before starting orchestration.
-            # This gives clients immediate response feedback without emitting text.
-            yield _openai_chunk(
+            yield openai_chunk(
                 request_id=request_id,
                 model=str(payload.model),
                 role="assistant",
@@ -481,16 +389,12 @@ async def openai_chat_completions(
                 while True:
                     timeout = max(0, next_heartbeat - asyncio.get_running_loop().time())
                     if timeout == 0:
-                        # Do not let a continuously busy internal event queue postpone
-                        # the connection heartbeat or make wait_for spin at zero.
                         yield ": keep-alive\n\n"
                         next_heartbeat = asyncio.get_running_loop().time() + 10
                         continue
                     try:
                         event = await asyncio.wait_for(event_queue.get(), timeout=timeout)
                     except asyncio.TimeoutError:
-                        # SSE comment: keeps intermediaries and clients connected without
-                        # adding a non-OpenAI event to the conversation.
                         yield ": keep-alive\n\n"
                         next_heartbeat = asyncio.get_running_loop().time() + 10
                         continue
@@ -518,7 +422,7 @@ async def openai_chat_completions(
 
                     token_seen = True
 
-                    yield _openai_chunk(
+                    yield openai_chunk(
                         request_id=request_id,
                         model=str(payload.model),
                         content=token,
@@ -529,20 +433,28 @@ async def openai_chat_completions(
                     result = await graph_task
 
                 if not token_seen:
-                    answer = str((result or {}).get("answer", "") or "")
+                    answer = _final_answer_from_state(result) if result is not None else ""
                     if answer:
-                        yield _openai_chunk(
+                        yield openai_chunk(
                             request_id=request_id,
                             model=str(payload.model),
                             content=answer,
                         )
 
-                yield _openai_chunk(
+                if result is not None:
+                    _emit_request_summary(
+                        request_id=request_id,
+                        state=result,
+                        execution_trace=result.debug.execution_trace,
+                        total_duration_ms=(perf_counter() - started_at) * 1000.0,
+                    )
+
+                yield openai_chunk(
                     request_id=request_id,
                     model=str(payload.model),
                     finish_reason="stop",
                 )
-                yield _openai_done()
+                yield openai_done()
 
             except asyncio.CancelledError:
                 if graph_task is not None:
@@ -564,27 +476,23 @@ async def openai_chat_completions(
             headers=_request_headers(request_id, thread_id),
         )
 
-    result = await runtime.graph.ainvoke(
+    result: OrchestratorState = await runtime.graph.ainvoke(
         state_input,
         config={"configurable": {"thread_id": thread_id}},
     )
 
-    answer, _answer_source = _answer_from_state(result or {})
-    completion = OpenAIChatCompletionResponse(
-        id=request_id,
-        created=int(time()),
-        model=str(payload.model),
-        choices=[
-            OpenAIChatCompletionChoice(
-                index=0,
-                message=OpenAIMessage(role="assistant", content=answer),
-                finish_reason="stop",
-            )
-        ],
-        metadata={
-            "thread_id": thread_id,
-            "request_id": request_id,
-        },
+    _emit_request_summary(
+        request_id=request_id,
+        state=result,
+        execution_trace=result.debug.execution_trace,
+        total_duration_ms=(perf_counter() - started_at) * 1000.0,
+    )
+
+    completion = _completion_from_state(
+        request_id=request_id,
+        payload=payload,
+        state=result,
+        thread_id=thread_id,
     )
 
     await stream.close()

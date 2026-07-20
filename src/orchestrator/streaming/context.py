@@ -8,10 +8,13 @@ if TYPE_CHECKING:
     from .publisher import StreamPublisher
 
 
-_current_stream: ContextVar[StreamPublisher | None] = ContextVar("current_stream", default=None)
+_current_stream: ContextVar[StreamPublisher | None] = ContextVar(
+    "current_stream",
+    default=None,
+)
 
 
-def get_current_stream():
+def get_current_stream() -> StreamPublisher | None:
     return _current_stream.get()
 
 

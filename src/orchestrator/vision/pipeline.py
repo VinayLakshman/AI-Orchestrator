@@ -10,13 +10,12 @@ from ..common.enums import VisionTaskType
 from ..settings import Settings
 from .detector import infer_vision_task
 from .fetcher import (
-    collect_latest_message_images,
-    extract_latest_user_text,
     resolve_image_ref,
     strip_images_from_messages,
 )
 from ..models.vision import ResolvedImage, VisionAnalysis, VisionResult
 from ..models.ollama import extract_assistant_text
+from ..models.state import OrchestratorState
 from .prompts import build_vision_system_prompt, render_vision_context
 
 logger = get_logger(__name__)
@@ -131,18 +130,17 @@ class VisionPipeline:
                 raw_text=raw_text,
             )
 
-    async def process(self, state: dict[str, Any]) -> VisionResult | None:
-        messages = state.get("original_messages") or state.get("messages", []) or []
-        metadata = state.get("metadata", {}) or {}
-        request_headers = metadata.get("request_headers", {}) or {}
+    async def process(self, state: OrchestratorState) -> VisionResult | None:
+        messages = state.request.messages
+        request_headers = state.request.metadata.get("request_headers", {}) or {}
 
-        images = collect_latest_message_images(messages, self.settings.vision_max_images)
+        images = state.request.images[: self.settings.vision_max_images]
         cleaned_messages = strip_images_from_messages(messages)
 
         if not images:
             return None
 
-        user_text = extract_latest_user_text(messages)
+        user_text = state.request.user_message
         task_type = infer_vision_task(user_text)
 
         resolved_images: list[ResolvedImage] = []

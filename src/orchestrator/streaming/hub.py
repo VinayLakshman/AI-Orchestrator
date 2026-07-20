@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 from orchestrator.logging import get_logger
 
 from .models import StreamEvent, StreamKind
 
 logger = get_logger(__name__)
-@dataclass
+
+
+@dataclass(slots=True)
 class RequestEventStream:
     request_id: str
     conversation_id: str | None = None
@@ -18,12 +20,13 @@ class RequestEventStream:
     _closed: bool = False
     _cond: asyncio.Condition = field(default_factory=asyncio.Condition)
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     async def publish(self, kind: StreamKind, **payload: Any) -> StreamEvent:
-        logger.debug(
-            "STREAM: publish kind=%s payload=%s",
-            kind,
-            payload,
-        )
+        logger.debug("STREAM: publish kind=%s payload=%s", kind, payload)
+
         async with self._cond:
             self._seq += 1
             event = StreamEvent(
@@ -37,8 +40,9 @@ class RequestEventStream:
             self._cond.notify_all()
             return event
 
-    async def subscribe(self, after_seq: int = 0):
+    async def subscribe(self, after_seq: int = 0) -> AsyncIterator[StreamEvent]:
         idx = 0
+
         while True:
             async with self._cond:
                 while idx >= len(self._events) and not self._closed:
@@ -65,10 +69,17 @@ class StreamHub:
     def __init__(self) -> None:
         self._streams: dict[str, RequestEventStream] = {}
 
-    def get_or_create(self, request_id: str, conversation_id: str | None = None) -> RequestEventStream:
+    def get_or_create(
+        self,
+        request_id: str,
+        conversation_id: str | None = None,
+    ) -> RequestEventStream:
         stream = self._streams.get(request_id)
         if stream is None:
-            stream = RequestEventStream(request_id=request_id, conversation_id=conversation_id)
+            stream = RequestEventStream(
+                request_id=request_id,
+                conversation_id=conversation_id,
+            )
             self._streams[request_id] = stream
         elif conversation_id and not stream.conversation_id:
             stream.conversation_id = conversation_id
@@ -77,21 +88,18 @@ class StreamHub:
     async def get(self, request_id: str) -> RequestEventStream | None:
         return self._streams.get(request_id)
 
-    async def cleanup(self) -> None:
-        stale = [key for key, stream in self._streams.items() if stream._closed]
-        for key in stale:
-            self._streams.pop(key, None)
-
     async def close(self, request_id: str) -> None:
-        """
-        Close the stream for a request.
-
-        This wakes any subscribers waiting in RequestEventStream.subscribe().
-        The stream object is intentionally retained until cleanup() so that
-        late subscribers can still inspect the closed stream if needed.
-        """
         stream = self._streams.get(request_id)
         if stream is None:
             return
-
         await stream.close()
+
+    async def cleanup(self) -> None:
+        stale = [key for key, stream in self._streams.items() if stream.closed]
+        for key in stale:
+            self._streams.pop(key, None)
+
+    async def remove(self, request_id: str) -> None:
+        stream = self._streams.pop(request_id, None)
+        if stream is not None:
+            await stream.close()
