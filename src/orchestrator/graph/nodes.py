@@ -244,7 +244,6 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
             result = await vision_pipeline.process(state)
 
 
-
         if result is None:
             evidence.vision = VisionEvidence(
                 task=None,
@@ -567,14 +566,12 @@ def make_coder_node(controller: ControllerEngine, settings: Settings, model_life
         async with model_lifecycle.active_inference("coder"):
             response = await controller.ollama.chat(
                 model=settings.coder_model,
-
-
-            messages=messages,
-            temperature=0.15,
-            max_tokens=settings.coder_max_tokens,
-            stream=False,
-            keep_alive=settings.controller_keep_alive,
-        )
+                messages=messages,
+                temperature=0.15,
+                max_tokens=settings.coder_max_tokens,
+                stream=False,
+                keep_alive=settings.controller_keep_alive,
+            )
 
         text = extract_assistant_text(response.content) or extract_assistant_text(response.raw) or ""
         parsed = _extract_json_object(text)
