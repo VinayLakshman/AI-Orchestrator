@@ -207,7 +207,9 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
     return controller_plan_node
 
 
-def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
+def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_lifecycle: Any):
+
+
     async def vision_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
@@ -233,10 +235,14 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
         stream = get_current_stream()
         image_refs = state.request.images[: settings.vision_max_images]
 
+        await model_lifecycle.ensure_warm("vision")
+
         if stream and image_refs:
             await stream.vision_started(image_count=len(image_refs))
 
-        result = await vision_pipeline.process(state)
+        async with model_lifecycle.active_inference("vision"):
+            result = await vision_pipeline.process(state)
+
 
         if result is None:
             evidence.vision = VisionEvidence(
@@ -290,7 +296,11 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             )
             await stream.vision_finished(summary=summary[:200] or "Vision analysis completed.")
 
+        model_lifecycle.touch("vision")
+        await model_lifecycle.keep_warm("vision")
+
         execution = _advance_runtime(execution, SpecialistType.VISION, success=True)
+
         state.execution = execution
         _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
         _update_used_models(state, str(getattr(analysis, "source_model", "") or settings.vision_model))
@@ -536,11 +546,16 @@ def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
     ]
 
 
-def make_coder_node(controller: ControllerEngine, settings: Settings):
+def make_coder_node(controller: ControllerEngine, settings: Settings, model_lifecycle: Any):
+
+
     async def coder_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
         execution.runtime.current_specialist = SpecialistType.CODER
+
+        # Model lifecycle: warm/cached residency is handled here.
+        await model_lifecycle.ensure_warm("coder")
 
         stream = get_current_stream()
         if stream:
@@ -548,14 +563,15 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
 
         messages = _build_coder_prompt(state)
 
-        response = await controller.ollama.chat(
-            model=settings.coder_model,
-            messages=messages,
-            temperature=0.15,
-            max_tokens=settings.coder_max_tokens,
-            stream=False,
-            keep_alive=settings.controller_keep_alive,
-        )
+        async with model_lifecycle.active_inference("coder"):
+            response = await controller.ollama.chat(
+                model=settings.coder_model,
+                messages=messages,
+                temperature=0.15,
+                max_tokens=settings.coder_max_tokens,
+                stream=False,
+                keep_alive=settings.controller_keep_alive,
+            )
 
         text = extract_assistant_text(response.content) or extract_assistant_text(response.raw) or ""
         parsed = _extract_json_object(text)
@@ -584,7 +600,10 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
             },
         )
 
+        model_lifecycle.touch("coder")
+        model_lifecycle.keep_warm("coder")
         execution = _advance_runtime(execution, SpecialistType.CODER, success=bool(code or explanation))
+
         state.execution = execution
         _log_transition("specialist_complete", specialist=SpecialistType.CODER.value, **_state_snapshot(state))
         _update_used_models(state, settings.coder_model)
@@ -698,16 +717,24 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
     return controller_validate_node
 
 
-def make_reasoning_node(controller: ControllerEngine, settings: Settings):
+def make_reasoning_node(controller: ControllerEngine, settings: Settings, model_lifecycle: Any):
+
+
     async def reasoning_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
+
+        # Model lifecycle: warm/cached residency is handled here.
+        await model_lifecycle.ensure_warm("reasoning")
 
         stream = get_current_stream()
         if stream:
             await stream.reasoning_started(model=settings.reasoning_model)
 
-        generation = await controller.reason(state)
+        async with model_lifecycle.active_inference("reasoning"):
+            generation = await controller.reason(state)
+
+
         summary = str(generation.content or generation.raw or "").strip()
         if not summary:
             summary = "No reasoning output produced."
@@ -734,11 +761,15 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings):
             runtime.current_specialist = None
             execution = execution.model_copy(update={"runtime": runtime})
 
+        model_lifecycle.touch("reasoning")
+        await model_lifecycle.keep_warm("reasoning")
+
         state.execution = execution
         if stream:
             await stream.reasoning_finished()
 
         _log_transition("specialist_complete", specialist=SpecialistType.REASONING.value, **_state_snapshot(state))
+
         _update_used_models(state, settings.reasoning_model)
         return state
 

@@ -12,6 +12,8 @@ from ..clients.searxng import SearXNGClient
 from ..clients.ollama import OllamaClient
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
+from ..runtime.model_lifecycle import ModelLifecycle
+
 from ..models.state import OrchestratorState
 from ..logging import get_logger
 from ..settings import Settings
@@ -31,6 +33,7 @@ from .nodes import (
     make_tools_node,
     make_vision_node,
     _state_snapshot,
+
     _log_transition,
 )
 from .instrumentation import timed_node
@@ -109,6 +112,8 @@ class TypedGraphFacade:
 class OrchestratorRuntime:
     settings: Settings
     model_manager: ModelManager
+    model_lifecycle: ModelLifecycle
+
     controller: ControllerEngine
     knowledge_client: KnowledgeClient
     ollama_client: OllamaClient
@@ -140,7 +145,9 @@ class OrchestratorRuntime:
 
     async def close(self) -> None:
         """Close runtime-owned transports exactly once."""
+        await self.model_lifecycle.close()
         clients = [self.ollama_client.client, self.knowledge_client.client]
+
         if self.searxng_client is not None:
             clients.append(self.searxng_client.client)
         closed: set[int] = set()
@@ -175,8 +182,10 @@ def build_graph(
     knowledge_client: KnowledgeClient,
     ollama_client: OllamaClient,
     vision_pipeline: VisionPipeline,
+    model_lifecycle: ModelLifecycle,
     searxng_client: SearXNGClient | None = None,
 ) -> tuple[Any, Any]:
+
     builder = StateGraph(
         OrchestratorState,
         input_schema=OrchestratorState,
@@ -185,13 +194,17 @@ def build_graph(
 
     prepare_node = make_prepare_node(settings)
     plan_node = make_controller_plan_node(controller, settings)
-    vision_node = make_vision_node(vision_pipeline, settings)
+    vision_node = make_vision_node(vision_pipeline, settings, model_lifecycle)
+
+
     knowledge_node = make_knowledge_node(knowledge_client, settings)
     web_node = make_web_node(WebSpecialist(searxng_client), settings)
-    coder_node = make_coder_node(controller, settings)
+    coder_node = make_coder_node(controller, settings, model_lifecycle)
+
     tools_node = make_tools_node(settings)
     validate_node = make_controller_validate_node(controller, settings)
-    reasoning_node = make_reasoning_node(controller, settings)
+    reasoning_node = make_reasoning_node(controller, settings, model_lifecycle)
+
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
 
@@ -346,6 +359,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
 
     ollama_client = OllamaClient(settings=settings, client=ollama_http)
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
+
     searxng_client: SearXNGClient | None = None
     if settings.web_search_enabled:
         web_http = httpx.AsyncClient(
@@ -358,19 +372,34 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     vision_pipeline = VisionPipeline(settings=settings, client=ollama_http)
     stream_hub = StreamHub()
 
+    # Build lifecycle first so graph node factories can receive the shared instance.
+    model_lifecycle = ModelLifecycle(
+        settings=settings,
+        models=model_manager,
+        ollama_client=ollama_client,
+    )
+    model_lifecycle.start_background_cleanup()
+
     graph, checkpointer = build_graph(
         settings=settings,
         controller=controller,
         knowledge_client=knowledge_client,
-        searxng_client=searxng_client,
         ollama_client=ollama_client,
         vision_pipeline=vision_pipeline,
+        model_lifecycle=model_lifecycle,
+        searxng_client=searxng_client,
     )
 
+
+
+
     runtime = OrchestratorRuntime(
+
         settings=settings,
         model_manager=model_manager,
+        model_lifecycle=model_lifecycle,
         controller=controller,
+
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
         vision_pipeline=vision_pipeline,
