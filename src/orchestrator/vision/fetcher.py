@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
+from io import BytesIO
 from typing import Any
 
 import httpx
 
 from ..common.enums import ChatRole
+from ..logging import get_logger
 from ..settings import Settings
 from ..models.vision import ResolvedImage
+
+
+logger = get_logger(__name__)
 
 
 def collect_latest_message_images(messages: list[dict[str, Any]] | None, max_images: int) -> list[str]:
@@ -24,7 +30,11 @@ def collect_latest_message_images(messages: list[dict[str, Any]] | None, max_ima
         refs: list[str] = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "image_url":
-                url = part.get("image_url", {}).get("url")
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url")
+                else:
+                    url = image_url
                 if isinstance(url, str) and url.strip():
                     refs.append(url.strip())
             elif isinstance(part, dict) and part.get("type") == "image":
@@ -72,6 +82,34 @@ def strip_images_from_messages(messages: list[dict[str, Any]] | None) -> list[di
     return cleaned
 
 
+def _image_dimensions(raw: bytes) -> tuple[int, int] | None:
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        with Image.open(BytesIO(raw)) as image:
+            return int(image.width), int(image.height)
+    except Exception:
+        return None
+
+
+def _log_image_resolution(source: str, mime_type: str, raw: bytes, base64_data: str) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    dimensions = _image_dimensions(raw)
+    logger.debug(
+        "VISION IMAGE RESOLVED source=%s mime_type=%s raw_size=%d encoded_length=%d dimensions=%s",
+        source,
+        mime_type,
+        len(raw),
+        len(base64_data),
+        dimensions,
+    )
+
+
 async def resolve_image_ref(
     ref: str,
     *,
@@ -109,6 +147,7 @@ async def resolve_image_ref(
 
         sha256 = hashlib.sha256(raw).hexdigest()
         base64_data = base64.b64encode(raw).decode("utf-8")
+        _log_image_resolution(source, mime_type, raw, base64_data)
         return ResolvedImage(base64_data=base64_data, mime_type=mime_type, sha256=sha256, source=source)
     except Exception:
         return None

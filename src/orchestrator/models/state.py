@@ -32,6 +32,14 @@ class RequestState(BaseModel):
 
     user_message: str = ""
 
+    original_query: str = ""
+
+    resolved_query: str = ""
+
+    is_followup: bool = False
+
+    followup_confidence: float = 0.0
+
     images: list[str] = Field(default_factory=list)
 
     metadata: dict[str, Any] = Field(default_factory=dict)

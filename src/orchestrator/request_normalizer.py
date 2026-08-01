@@ -26,8 +26,11 @@ def _is_image_part(part: dict[str, Any]) -> bool:
     if part_type in {"image_url", "image", "input_image"}:
         return True
     mime_type = ""
-    if isinstance(part.get("image_url"), dict):
-        mime_type = str(part["image_url"].get("url") or "")
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict):
+        mime_type = str(image_url.get("url") or "")
+    elif isinstance(image_url, str):
+        mime_type = image_url
     if isinstance(part.get("mime_type"), str):
         mime_type = part["mime_type"]
     return "image" in part_type or mime_type.startswith("data:image/")
@@ -67,14 +70,26 @@ def _placeholder_for_attachment(attachment_type: str) -> str:
     }.get(attachment_type, "<Attachment Attached>")
 
 
-def _attachment_reference(part: dict[str, Any], attachment_type: str) -> str:
+def _extract_attachment_reference(part: dict[str, Any]) -> str:
     image_url = part.get("image_url")
-    if isinstance(image_url, dict) and image_url.get("url"):
-        return str(image_url["url"])
+    if isinstance(image_url, str) and image_url.strip():
+        return image_url.strip()
+    if isinstance(image_url, dict):
+        for key in ("url", "source", "path", "data"):
+            value = image_url.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     for key in ("url", "source", "path", "file_id", "filename", "name"):
         value = part.get(key)
-        if value:
-            return str(value)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _attachment_reference(part: dict[str, Any], attachment_type: str) -> str:
+    reference = _extract_attachment_reference(part)
+    if reference:
+        return reference
     return _placeholder_for_attachment(attachment_type)
 
 
@@ -170,11 +185,23 @@ def normalize_openai_request(
     controller_text = _scan_text(controller_messages)
 
     logger.debug(
-        "NORMALIZE: request_id=%s thread_id=%s user_message_len=%d has_images=%s message_count=%d user_message_preview=%r",
+        "NORMALIZE: request_id=%s thread_id=%s user_message_len=%d has_images=%s image_count=%d image_ref_kinds=%s message_count=%d user_message_preview=%r",
         request_id,
         thread_id,
         len(user_query or ""),
         any(item.attachment_type == "image" for item in attachments),
+        sum(1 for item in attachments if item.attachment_type == "image"),
+        [
+            "data_uri"
+            if item.placeholder.startswith("data:image/")
+            else "http_url"
+            if item.placeholder.startswith(("http://", "https://"))
+            else "placeholder"
+            if item.placeholder.startswith("<")
+            else "other"
+            for item in attachments
+            if item.attachment_type == "image"
+        ],
         len(original_messages),
         (user_query or "")[:120],
     )
@@ -208,6 +235,10 @@ def normalize_openai_request(
         stream=payload.stream,
         messages=[ChatMessage.model_validate(message) for message in controller_messages],
         user_message=user_query,
+        original_query=user_query,
+        resolved_query=user_query,
+        is_followup=False,
+        followup_confidence=0.0,
         images=[item.placeholder for item in attachments if item.attachment_type == "image"],
         metadata={
             **metadata,

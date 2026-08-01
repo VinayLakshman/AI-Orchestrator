@@ -16,6 +16,7 @@ from .graph.build import OrchestratorRuntime
 from .models.chat import ChatRequest
 from .models.state import OrchestratorState, RequestState
 from .request_normalizer import normalize_openai_request
+from .preprocessing.conversation_resolver import resolve_conversation_context
 from .schemas import (
     OpenAIChatCompletionChoice,
     OpenAIChatCompletionRequest,
@@ -120,7 +121,16 @@ def _orchestrator_chat_result(thread_id: str, state: OrchestratorState) -> dict[
     return {
         "thread_id": thread_id,
         "answer": _final_answer_from_state(state),
-        "request": state.request.model_dump(mode="json", exclude_none=True),
+        "request": state.request.model_dump(
+            mode="json",
+            exclude_none=True,
+            exclude={
+                "original_query",
+                "resolved_query",
+                "is_followup",
+                "followup_confidence",
+            },
+        ),
         "execution": state.execution.model_dump(mode="json", exclude_none=True),
         "evidence": state.evidence.model_dump(mode="json", exclude_none=True),
         "response": state.response.model_dump(mode="json", exclude_none=True),
@@ -245,7 +255,7 @@ async def chat(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ) -> dict[str, Any]:
     thread_id = _thread_id_from_request(payload)
-    state_input = _input_state_from_request(payload, thread_id=thread_id)
+    state_input = await _input_state_from_request(payload, runtime=runtime, thread_id=thread_id)
     request_id = state_input.request.request_id
     started_at = perf_counter()
 
@@ -264,15 +274,22 @@ async def chat(
     return _orchestrator_chat_result(thread_id, result)
 
 
-def _input_state_from_request(
+async def _input_state_from_request(
     payload: ChatRequest,
     *,
+    runtime: OrchestratorRuntime,
     request_id: str | None = None,
     thread_id: str | None = None,
 ) -> OrchestratorState:
     request_state = normalize_openai_request(_openai_request_from_chat_request(payload))
-    return _input_state_from_request_state(
+    resolved = await resolve_conversation_context(
         request_state,
+        settings=runtime.settings,
+        model_manager=runtime.model_manager,
+        ollama_client=runtime.ollama_client,
+    )
+    return _input_state_from_request_state(
+        resolved.request,
         thread_id=thread_id or _thread_id_from_request(payload),
         request_id=request_id,
         model=payload.model or "orchestrator",
@@ -318,11 +335,17 @@ async def openai_chat_completions(
 ):
     request_id = str(uuid4())
     request_state = normalize_openai_request(payload)
+    resolved = await resolve_conversation_context(
+        request_state,
+        settings=runtime.settings,
+        model_manager=runtime.model_manager,
+        ollama_client=runtime.ollama_client,
+    )
     thread_id = str(uuid4())
     started_at = perf_counter()
 
     state_input = _input_state_from_request_state(
-        request_state,
+        resolved.request,
         thread_id=thread_id,
         request_id=request_id,
         model=str(payload.model or "orchestrator"),
