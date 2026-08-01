@@ -208,6 +208,10 @@ def normalize_openai_request(
         stream=payload.stream,
         messages=[ChatMessage.model_validate(message) for message in controller_messages],
         user_message=user_query,
+        original_query=user_query,
+        resolved_query=user_query,
+        is_followup=False,
+        followup_confidence=0.0,
         images=[item.placeholder for item in attachments if item.attachment_type == "image"],
         metadata={
             **metadata,
