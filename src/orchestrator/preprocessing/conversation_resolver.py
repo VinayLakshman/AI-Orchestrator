@@ -28,6 +28,7 @@ RESOLVER_INTENTS = {
     "COMPARISON",
     "CORRECTION",
     "CLARIFICATION",
+    "SUBJECT_SWITCH",
 }
 RESOLVER_ENTITY_SOURCES = {
     "previous_user_message",
@@ -47,7 +48,12 @@ Rules:
 - Conversation is the highest authority.
 - Conversation entities always override user metadata, user location, world
   knowledge, and model assumptions.
-- Preserve the conversational subject unless the intent is NEW_TOPIC.
+- Preserve the conversational objective unless the intent is NEW_TOPIC.
+- When the latest message replaces the subject only, classify it as
+  SUBJECT_SWITCH and keep the same conversational objective.
+- If the latest message is only a replacement subject such as "What about
+  USA?" or "How about Docker?", continue the existing objective and replace
+  only the subject.
 - Use recent conversation entities first, then previous assistant responses,
   then previous user requests.
 - Resolve references such as it, that, those, this, there, here, them, he,
@@ -67,6 +73,7 @@ Rules:
   - COMPARISON: preserve the subject and introduce the comparison target.
   - CORRECTION: correct the previous assistant response.
   - CLARIFICATION: clarify the immediately preceding explanation.
+  - SUBJECT_SWITCH: preserve the objective, replace only the primary subject.
 - Return JSON only.
 
 Return these fields:
@@ -74,6 +81,7 @@ Return these fields:
 - conversation_subject
 - resolved_query
 - resolved_entities
+- conversation_objective
 - entity_confidence
 - rewrite_confidence
 - confidence
@@ -94,6 +102,7 @@ class ConversationResolution(BaseModel):
     resolved_query: str = ""
     intent: str = "NEW_TOPIC"
     conversation_subject: str = ""
+    conversation_objective: str = ""
     resolved_entities: dict[str, ResolvedEntity] = Field(default_factory=dict)
     entity_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     rewrite_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -138,6 +147,7 @@ def _normalize_entity(
     *,
     mention: str,
 ) -> ResolvedEntity:
+    fallback_source = "external_fallback"
     if isinstance(value, dict):
         resolved_to = str(
             value.get("resolved_to")
@@ -147,10 +157,10 @@ def _normalize_entity(
             or value.get("value")
             or ""
         ).strip()
-        source = str(value.get("source") or "").strip()
+        source = str(value.get("source") or fallback_source).strip()
         confidence = _parse_float(value.get("confidence"), default=0.0)
         if source and source not in RESOLVER_ENTITY_SOURCES:
-            source = ""
+            source = fallback_source
         return ResolvedEntity(
             resolved_to=resolved_to,
             source=source,
@@ -158,7 +168,7 @@ def _normalize_entity(
         )
 
     resolved_to = str(value or "").strip()
-    return ResolvedEntity(resolved_to=resolved_to, source="external_fallback", confidence=0.0)
+    return ResolvedEntity(resolved_to=resolved_to, source=fallback_source, confidence=0.0)
 
 
 def _normalize_resolved_entities(raw_entities: Any) -> dict[str, ResolvedEntity]:
@@ -229,6 +239,11 @@ def _normalize_resolution(parsed: dict[str, Any], *, original_query: str) -> Con
         or parsed.get("subject")
         or ""
     ).strip()
+    conversation_objective = str(
+        parsed.get("conversation_objective")
+        or parsed.get("objective")
+        or ""
+    ).strip()
     resolved_entities = _normalize_resolved_entities(parsed.get("resolved_entities"))
     entity_confidence = _parse_float(parsed.get("entity_confidence"), default=0.0)
     rewrite_confidence = _parse_float(
@@ -247,12 +262,24 @@ def _normalize_resolution(parsed: dict[str, Any], *, original_query: str) -> Con
         resolved_query=resolved_query,
         intent=intent,
         conversation_subject=conversation_subject,
+        conversation_objective=conversation_objective,
         resolved_entities=resolved_entities,
         entity_confidence=entity_confidence,
         rewrite_confidence=rewrite_confidence,
         confidence=confidence,
         is_followup=bool(parsed.get("is_followup")),
     )
+
+
+def _candidate_resolved_query(
+    resolution: ConversationResolution,
+    *,
+    original_query: str,
+) -> str:
+    if resolution.intent == "NEW_TOPIC":
+        return original_query
+    candidate = resolution.resolved_query.strip()
+    return candidate or original_query
 
 
 def _structured_context_payload(context: Any, *, original_query: str) -> dict[str, Any]:
@@ -327,8 +354,13 @@ def _conversation_resolution_metadata(
         "original_query": original_query,
         "resolved_query": resolved_query,
         "model_resolved_query": resolution.resolved_query.strip(),
+        "intent": resolution.intent,
+        "conversation_subject": resolution.conversation_subject,
+        "conversation_objective": resolution.conversation_objective,
         "is_followup": applied and resolved_query != original_query,
         "model_is_followup": bool(resolution.is_followup),
+        "entity_confidence": float(resolution.entity_confidence or 0.0),
+        "rewrite_confidence": float(resolution.rewrite_confidence or resolution.confidence or 0.0),
         "confidence": float(resolution.confidence or 0.0),
         "applied": applied,
         "resolution_time_ms": elapsed_ms,
@@ -348,12 +380,14 @@ def _log_resolution(
     }
     logger.debug(
         "conversation_resolver original_query=%r resolved_query=%r intent=%s "
-        "conversation_subject=%r resolved_entities=%s entity_sources=%s "
-        "entity_confidence=%.3f rewrite_confidence=%.3f resolution_time_ms=%.2f applied=%s",
+        "conversation_subject=%r conversation_objective=%r resolved_entities=%s "
+        "entity_sources=%s entity_confidence=%.3f rewrite_confidence=%.3f "
+        "resolution_time_ms=%.2f applied=%s",
         original_query,
         resolved_query,
         resolution.intent,
         resolution.conversation_subject,
+        resolution.conversation_objective,
         {
             mention: entity.model_dump(exclude_none=True)
             for mention, entity in resolution.resolved_entities.items()
@@ -378,6 +412,7 @@ async def resolve_conversation_context(
         resolved_query=original_query,
         intent="NEW_TOPIC",
         conversation_subject="",
+        conversation_objective="",
         resolved_entities={},
         entity_confidence=0.0,
         rewrite_confidence=0.0,
@@ -452,6 +487,7 @@ async def resolve_conversation_context(
             resolved_query=original_query,
             intent="NEW_TOPIC",
             conversation_subject="",
+            conversation_objective="",
             resolved_entities={},
             entity_confidence=0.0,
             rewrite_confidence=0.0,
@@ -461,9 +497,13 @@ async def resolve_conversation_context(
 
     applied = bool(
         resolution.confidence >= RESOLVER_CONFIDENCE_THRESHOLD
-        and resolution.resolved_query.strip()
+        and _candidate_resolved_query(resolution, original_query=original_query).strip()
     )
-    resolved_query = resolution.resolved_query.strip() if applied else original_query
+    resolved_query = (
+        _candidate_resolved_query(resolution, original_query=original_query)
+        if applied
+        else original_query
+    )
     elapsed_ms = (perf_counter() - started) * 1000.0
 
     updated = request.model_copy(
