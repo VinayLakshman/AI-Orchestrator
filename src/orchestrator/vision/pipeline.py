@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +29,15 @@ class VisionPipeline:
     client: httpx.AsyncClient
     _cache: dict[str, VisionResult] = field(default_factory=dict)
 
+    def _image_source_kind(self, ref: str) -> str:
+        if ref.startswith("data:image/"):
+            return "data_uri"
+        if ref.startswith(("http://", "https://")):
+            return "http_url"
+        if ref.startswith("<"):
+            return "placeholder"
+        return "other"
+
     def _extract_json_object(self, text: str) -> dict[str, Any]:
         text = (text or "").strip()
         if not text:
@@ -46,6 +57,37 @@ class VisionPipeline:
 
     def _parse_ollama_content(self, data: dict[str, Any]) -> str:
         return extract_assistant_text(data)
+
+    def _build_no_resolved_images_result(
+        self,
+        *,
+        task_type: VisionTaskType,
+        cleaned_messages: list[dict[str, Any]],
+        reason: str,
+    ) -> VisionResult:
+        summary = "No usable image payload was available to the vision pipeline."
+        analysis = VisionAnalysis(
+            task_type=task_type,
+            confidence=0.0,
+            summary=summary,
+            ocr="",
+            layout="",
+            metrics="",
+            errors_warnings="",
+            observations=summary,
+            answer_context=summary,
+            image_count=0,
+            source_model=self.settings.vision_model,
+            raw_text=reason,
+            hashes=[],
+        )
+        return VisionResult(
+            analysis=analysis,
+            context_markdown=render_vision_context(analysis),
+            cleaned_messages=cleaned_messages,
+            image_hashes=[],
+            cache_hit=False,
+        )
 
     def _build_fallback_analysis(
         self,
@@ -133,9 +175,21 @@ class VisionPipeline:
     async def process(self, state: OrchestratorState) -> VisionResult | None:
         messages = state.request.messages
         request_headers = state.request.metadata.get("request_headers", {}) or {}
+        request_id = str(state.request.request_id or "")
 
         images = state.request.images[: self.settings.vision_max_images]
         cleaned_messages = strip_images_from_messages(messages)
+        request_image_sources = [self._image_source_kind(ref) for ref in images]
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "VISION REQUEST request_id=%s model=%s request_state_image_count=%d request_state_image_source=%s prompt_length=%d",
+                request_id,
+                self.settings.vision_model,
+                len(images),
+                request_image_sources,
+                len(state.request.user_message or ""),
+            )
 
         if not images:
             return None
@@ -155,7 +209,19 @@ class VisionPipeline:
                 resolved_images.append(resolved)
 
         if not resolved_images:
-            return None
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "VISION REQUEST SKIPPED request_id=%s model=%s vision_skipped=true reason=%s resolved_image_count=%d",
+                    request_id,
+                    self.settings.vision_model,
+                    "no_resolved_images",
+                    0,
+                )
+            return self._build_no_resolved_images_result(
+                task_type=task_type,
+                cleaned_messages=cleaned_messages,
+                reason="no_resolved_images",
+            )
 
         image_hashes = [img.sha256 for img in resolved_images]
         cache_key = "|".join([task_type.value, user_text.strip()[:512], *image_hashes])
@@ -177,6 +243,22 @@ class VisionPipeline:
             if user_text.strip()
             else "Analyse the attached image(s) and return structured technical context."
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            payload_encoded_lengths = [len(img.base64_data or "") for img in resolved_images]
+            payload_raw_sizes = [len(base64.b64decode(img.base64_data)) for img in resolved_images]
+            payload_mime_types = [img.mime_type for img in resolved_images]
+
+            logger.debug(
+                "VISION PAYLOAD CREATED request_id=%s model=%s payload_image_count=%d payload_image_source=%s payload_mime=%s payload_raw_size=%s payload_encoded_length=%s prompt_length=%d",
+                request_id,
+                self.settings.vision_model,
+                len(resolved_images),
+                request_image_sources,
+                payload_mime_types,
+                payload_raw_sizes,
+                payload_encoded_lengths,
+                len(user_prompt),
+            )
 
         payload = {
             "model": self.settings.vision_model,
