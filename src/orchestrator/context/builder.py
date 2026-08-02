@@ -142,7 +142,30 @@ def _repository_summary(repository: Any) -> dict[str, Any]:
         "metadata": data.get("metadata") or {},
         "statistics": data.get("statistics") or {},
         "document_count": len(data.get("documents") or []),
-        "documents": [_document_summary(doc) for doc in (data.get("documents") or [])[:8]],
+    }
+
+
+def _lightweight_document_summary(document: Any) -> dict[str, Any]:
+    if document is None:
+        return {}
+    if hasattr(document, "model_dump"):
+        data = document.model_dump(exclude_none=True)
+    elif isinstance(document, dict):
+        data = dict(document)
+    else:
+        data = {"value": str(document)}
+
+    return {
+        "id": data.get("id"),
+        "filename": data.get("filename"),
+        "extension": data.get("extension"),
+        "mime_type": data.get("mime_type"),
+        "category": data.get("category"),
+        "page_count": int(data.get("page_count") or 0),
+        "line_count": int(data.get("line_count") or 0),
+        "word_count": int(data.get("word_count") or 0),
+        "status": data.get("status"),
+        "metadata": data.get("metadata") or {},
     }
 
 
@@ -515,8 +538,15 @@ def render_request_context(request: RequestState) -> str:
         "documents": {
             "count": len(request.documents or []),
             "repository_count": len(request.repository_artifacts or []),
-            "summaries": [_document_summary(document) for document in (request.documents or [])[:8]],
-            "repositories": [_repository_summary(repository) for repository in (request.repository_artifacts or [])[:4]],
+            "attachments": [_lightweight_document_summary(document) for document in (request.documents or [])[:8]],
+            "repositories": [
+                {
+                    "root": repository.root,
+                    "document_count": len(repository.documents),
+                    "metadata": repository.metadata or {},
+                }
+                for repository in (request.repository_artifacts or [])[:4]
+            ],
         },
     }
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
