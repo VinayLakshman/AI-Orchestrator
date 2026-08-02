@@ -85,6 +85,67 @@ def _first_text(values: list[Any], *, limit: int = 220) -> str:
     return ""
 
 
+def _document_summary(document: Any) -> dict[str, Any]:
+    if document is None:
+        return {}
+    if hasattr(document, "model_dump"):
+        data = document.model_dump(exclude_none=True)
+    elif isinstance(document, dict):
+        data = dict(document)
+    else:
+        data = {"value": str(document)}
+
+    excerpts = data.pop("excerpts", None)
+    text = str(data.get("text") or "").strip()
+    page_count = int(data.get("page_count") or 0)
+    line_count = int(data.get("line_count") or 0)
+    word_count = int(data.get("word_count") or 0)
+
+    summary = {
+        "id": data.get("id"),
+        "filename": data.get("filename"),
+        "extension": data.get("extension"),
+        "mime_type": data.get("mime_type"),
+        "category": data.get("category"),
+        "language": data.get("language"),
+        "encoding": data.get("encoding"),
+        "size": data.get("size"),
+        "checksum": data.get("checksum"),
+        "line_count": line_count,
+        "page_count": page_count,
+        "word_count": word_count,
+        "status": data.get("status"),
+        "error": data.get("error"),
+        "metadata": data.get("metadata") or {},
+        "excerpts": [
+            _truncate(str(item), 260)
+            for item in (excerpts or [])
+            if _truncate(str(item), 260).strip()
+        ],
+    }
+    if not summary["excerpts"] and text:
+        summary["excerpts"] = [_truncate(text, 260)]
+    return summary
+
+
+def _repository_summary(repository: Any) -> dict[str, Any]:
+    if repository is None:
+        return {}
+    if hasattr(repository, "model_dump"):
+        data = repository.model_dump(exclude_none=True)
+    elif isinstance(repository, dict):
+        data = dict(repository)
+    else:
+        data = {"value": str(repository)}
+    return {
+        "root": data.get("root"),
+        "metadata": data.get("metadata") or {},
+        "statistics": data.get("statistics") or {},
+        "document_count": len(data.get("documents") or []),
+        "documents": [_document_summary(doc) for doc in (data.get("documents") or [])[:8]],
+    }
+
+
 def _structured_source_entry(
     *,
     source_type: str,
@@ -210,6 +271,36 @@ def _build_validated_evidence_sources(evidence: EvidenceLedger) -> list[dict[str
                     "task": evidence.vision.task,
                 },
                 metadata=evidence.vision.metadata,
+            )
+        )
+
+    if evidence.documents:
+        doc_evidence = evidence.documents
+        relevant_excerpts = [
+            _truncate(item, 260)
+            for item in [
+                doc_evidence.summary,
+                doc_evidence.context,
+                *doc_evidence.excerpts,
+            ]
+            if _truncate(item, 260).strip()
+        ]
+        supporting_facts: list[Any] = [_document_summary(document) for document in doc_evidence.documents[:16]]
+        supporting_facts.extend(_repository_summary(repo) for repo in doc_evidence.repository_artifacts[:8])
+
+        sources.append(
+            _structured_source_entry(
+                source_type="documents",
+                confidence=float(doc_evidence.confidence or 0.0),
+                summary=str(doc_evidence.summary or "").strip(),
+                relevant_excerpts=relevant_excerpts,
+                supporting_facts=supporting_facts,
+                provenance={
+                    "source": "Uploaded Documents",
+                    "document_count": len(doc_evidence.documents or []),
+                    "repository_count": len(doc_evidence.repository_artifacts or []),
+                },
+                metadata=doc_evidence.metadata,
             )
         )
 
@@ -421,6 +512,12 @@ def render_request_context(request: RequestState) -> str:
             "code_blocks": int(bool(request.metadata.get("contains_code_blocks", False))),
             "estimated_tokens": int(request.metadata.get("estimated_prompt_tokens", 0) or 0),
         },
+        "documents": {
+            "count": len(request.documents or []),
+            "repository_count": len(request.repository_artifacts or []),
+            "summaries": [_document_summary(document) for document in (request.documents or [])[:8]],
+            "repositories": [_repository_summary(repository) for repository in (request.repository_artifacts or [])[:4]],
+        },
     }
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
@@ -471,6 +568,10 @@ def build_finalize_context(state: OrchestratorState) -> dict[str, Any]:
         "question": question,
         "execution": execution_summary,
         "sources": _build_validated_evidence_sources(evidence),
+        "documents": {
+            "count": len(request.documents or []),
+            "repository_count": len(request.repository_artifacts or []),
+        },
     }
 
 

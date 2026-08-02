@@ -76,6 +76,8 @@ class Settings(BaseSettings):
     vision_fetch_base_url: str = "http://open-webui:8080"
     vision_inject_analysis_as_system: bool = True
 
+    document_session_ttl_s: float = 86400.0
+
     # MCP / tools
     mcp_enabled: bool = True
     mcp_servers_json: str = "[]"

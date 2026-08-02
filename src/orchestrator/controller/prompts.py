@@ -520,6 +520,7 @@ Validated evidence may include:
 - Repository
 - Web
 - Vision
+- Documents
 - Code
 - Tool
 - Previous reasoning

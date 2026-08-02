@@ -17,6 +17,7 @@ from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.evidence import (
     CodeEvidence,
+    DocumentEvidence,
     EvidenceLedger,
     ReasoningEvidence,
     RepositoryEvidence,
@@ -26,6 +27,7 @@ from ..models.evidence import (
 )
 from ..models.ollama import extract_assistant_text
 from ..models.state import DebugState, OrchestratorState, ResponseState
+from ..documents.pipeline import DocumentPipeline
 from ..models.execution import (
     ExecutionState,
     RetryState,
@@ -152,13 +154,38 @@ def _update_used_tools(
     return state.debug
 
 
-def make_prepare_node(settings: Settings):
+def make_prepare_node(settings: Settings, document_pipeline: DocumentPipeline):
     async def prepare_node(state: OrchestratorState) -> OrchestratorState:
         state.execution = ExecutionState()
         state.execution.validation = ValidationResult()
         state.evidence = EvidenceLedger()
         state.response = ResponseState()
         state.debug = DebugState()
+
+        if state.request.documents or state.request.repository_artifacts:
+            try:
+                state.evidence.documents = document_pipeline.build_evidence(
+                    documents=state.request.documents or [],
+                    repository_artifacts=state.request.repository_artifacts or [],
+                    query=state.request.user_message,
+                    session_id=state.request.thread_id or state.request.conversation_id,
+                )
+            except Exception:
+                # Preserve orchestration even if document evidence construction fails.
+                state.evidence.documents = DocumentEvidence(
+                    question=state.request.user_message,
+                    confidence=0.0,
+                    summary="Uploaded documents are available but failed to build structured evidence.",
+                    context="",
+                    documents=state.request.documents or [],
+                    repository_artifacts=state.request.repository_artifacts or [],
+                    excerpts=[],
+                    metadata={
+                        "document_count": len(state.request.documents or []),
+                        "repository_count": len(state.request.repository_artifacts or []),
+                    },
+                )
+
         return state
 
     return prepare_node
@@ -532,6 +559,9 @@ def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
 
     if evidence.vision and evidence.vision.context:
         context_parts.append(f"Vision context:\n{evidence.vision.context}")
+
+    if evidence.documents and evidence.documents.context:
+        context_parts.append(f"Document context:\n{evidence.documents.context}")
 
     if evidence.reasoning and evidence.reasoning.summary:
         context_parts.append(

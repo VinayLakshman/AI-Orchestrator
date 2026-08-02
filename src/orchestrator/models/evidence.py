@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from orchestrator.documents.artifact import DocumentArtifact, RepositoryArtifact
+
 
 class RepositoryEvidence(BaseModel):
     repository: str | None = None
@@ -56,6 +58,24 @@ class VisionEvidence(BaseModel):
     extracted_text: str = ""
 
     detected_objects: list[str] = Field(default_factory=list)
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DocumentEvidence(BaseModel):
+    question: str | None = None
+
+    confidence: float = 0.0
+
+    summary: str = ""
+
+    context: str = ""
+
+    documents: list[DocumentArtifact] = Field(default_factory=list)
+
+    repository_artifacts: list[RepositoryArtifact] = Field(default_factory=list)
+
+    excerpts: list[str] = Field(default_factory=list)
 
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -151,6 +171,8 @@ class EvidenceLedger(BaseModel):
 
     vision: VisionEvidence | None = None
 
+    documents: DocumentEvidence | None = None
+
     code: CodeEvidence | None = None
 
     tools: ToolEvidence | None = None
@@ -168,6 +190,10 @@ class EvidenceLedger(BaseModel):
     @property
     def has_vision(self) -> bool:
         return self.vision is not None
+
+    @property
+    def has_documents(self) -> bool:
+        return self.documents is not None
 
     @property
     def has_code(self) -> bool:
@@ -197,6 +223,9 @@ class EvidenceLedger(BaseModel):
         if self.has_vision:
             sources.append("vision")
 
+        if self.has_documents:
+            sources.append("documents")
+
         if self.has_code:
             sources.append("code")
 
@@ -213,6 +242,7 @@ class EvidenceLedger(BaseModel):
             "repository": self.repository,
             "web": self.web,
             "vision": self.vision,
+            "documents": self.documents,
             "code": self.code,
             "tools": self.tools,
             "reasoning": self.reasoning,

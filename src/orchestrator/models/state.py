@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from orchestrator.models.chat import ChatMessage
+from orchestrator.documents.artifact import DocumentArtifact, RepositoryArtifact
 from pydantic import BaseModel, Field
 
 from orchestrator.models.evidence import EvidenceLedger
@@ -41,6 +42,10 @@ class RequestState(BaseModel):
     followup_confidence: float = 0.0
 
     images: list[str] = Field(default_factory=list)
+
+    documents: list[DocumentArtifact] = Field(default_factory=list)
+
+    repository_artifacts: list[RepositoryArtifact] = Field(default_factory=list)
 
     metadata: dict[str, Any] = Field(default_factory=dict)
 

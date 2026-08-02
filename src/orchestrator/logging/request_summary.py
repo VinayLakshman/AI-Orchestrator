@@ -123,6 +123,8 @@ def _evidence_stats(state: OrchestratorState) -> dict[str, int]:
         "repository_hits": len(evidence.repository.primary_hits) if evidence.repository else 0,
         "web_results": len(evidence.web.results) if evidence.web else 0,
         "images": image_count,
+        "documents": len(evidence.documents.documents) if evidence.documents else len(state.request.documents or []),
+        "repositories": len(evidence.documents.repository_artifacts) if evidence.documents else len(state.request.repository_artifacts or []),
         "tools_executed": len(evidence.tools.executions) if evidence.tools else 0,
     }
 
@@ -164,6 +166,8 @@ def build_request_summary(
             _format_row("Repository Hits", str(evidence["repository_hits"])),
             _format_row("Web Results", str(evidence["web_results"])),
             _format_row("Images", str(evidence["images"])),
+            _format_row("Documents", str(evidence["documents"])),
+            _format_row("Repositories", str(evidence["repositories"])),
             _format_row("Tools Executed", str(evidence["tools_executed"])),
             "",
             _format_row("Status", _request_status(state)),

@@ -11,6 +11,7 @@ from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import SearXNGClient
 from ..clients.ollama import OllamaClient
 from ..controller.engine import ControllerEngine
+from ..documents.pipeline import DocumentPipeline
 from ..models.manager import ModelManager
 from ..runtime.model_lifecycle import ModelLifecycle
 
@@ -118,6 +119,7 @@ class OrchestratorRuntime:
     knowledge_client: KnowledgeClient
     ollama_client: OllamaClient
     vision_pipeline: VisionPipeline
+    document_pipeline: DocumentPipeline
     stream_hub: StreamHub
     graph: Any
     checkpointer: Any
@@ -131,6 +133,7 @@ class OrchestratorRuntime:
             "knowledge_client": self.knowledge_client,
             "ollama_client": self.ollama_client,
             "vision_pipeline": self.vision_pipeline,
+            "document_pipeline": self.document_pipeline,
             "stream_hub": self.stream_hub,
             "graph": self.graph,
             "checkpointer": self.checkpointer,
@@ -146,7 +149,7 @@ class OrchestratorRuntime:
     async def close(self) -> None:
         """Close runtime-owned transports exactly once."""
         await self.model_lifecycle.close()
-        clients = [self.ollama_client.client, self.knowledge_client.client]
+        clients = [self.ollama_client.client, self.knowledge_client.client, self.document_pipeline.client]
 
         if self.searxng_client is not None:
             clients.append(self.searxng_client.client)
@@ -182,6 +185,7 @@ def build_graph(
     knowledge_client: KnowledgeClient,
     ollama_client: OllamaClient,
     vision_pipeline: VisionPipeline,
+    document_pipeline: DocumentPipeline,
     model_lifecycle: ModelLifecycle,
     searxng_client: SearXNGClient | None = None,
 ) -> tuple[Any, Any]:
@@ -192,7 +196,7 @@ def build_graph(
         output_schema=OrchestratorState,
     )
 
-    prepare_node = make_prepare_node(settings)
+    prepare_node = make_prepare_node(settings, document_pipeline)
     plan_node = make_controller_plan_node(controller, settings)
     vision_node = make_vision_node(vision_pipeline, settings, model_lifecycle)
 
@@ -352,6 +356,9 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         base_url=settings.ollama_base_url,
         timeout=settings.request_timeout_s,
     )
+    document_http = httpx.AsyncClient(
+        timeout=settings.request_timeout_s,
+    )
     knowledge_http = httpx.AsyncClient(
         base_url=settings.knowledge_service_url,
         timeout=settings.request_timeout_s,
@@ -359,6 +366,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
 
     ollama_client = OllamaClient(settings=settings, client=ollama_http)
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
+    document_pipeline = DocumentPipeline(settings=settings, client=document_http)
 
     searxng_client: SearXNGClient | None = None
     if settings.web_search_enabled:
@@ -386,6 +394,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
         vision_pipeline=vision_pipeline,
+        document_pipeline=document_pipeline,
         model_lifecycle=model_lifecycle,
         searxng_client=searxng_client,
     )
@@ -403,6 +412,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         knowledge_client=knowledge_client,
         ollama_client=ollama_client,
         vision_pipeline=vision_pipeline,
+        document_pipeline=document_pipeline,
         stream_hub=stream_hub,
         graph=graph,
         checkpointer=checkpointer,

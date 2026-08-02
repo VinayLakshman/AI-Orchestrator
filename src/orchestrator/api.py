@@ -255,7 +255,12 @@ async def chat(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ) -> dict[str, Any]:
     thread_id = _thread_id_from_request(payload)
-    state_input = await _input_state_from_request(payload, runtime=runtime, thread_id=thread_id)
+    state_input = await _input_state_from_request(
+        payload,
+        runtime=runtime,
+        request_headers=dict(request.headers),
+        thread_id=thread_id,
+    )
     request_id = state_input.request.request_id
     started_at = perf_counter()
 
@@ -278,6 +283,7 @@ async def _input_state_from_request(
     payload: ChatRequest,
     *,
     runtime: OrchestratorRuntime,
+    request_headers: dict[str, str] | None = None,
     request_id: str | None = None,
     thread_id: str | None = None,
 ) -> OrchestratorState:
@@ -288,8 +294,27 @@ async def _input_state_from_request(
         model_manager=runtime.model_manager,
         ollama_client=runtime.ollama_client,
     )
+    attachments = list(resolved.request.metadata.get("attachments") or [])
+    document_session = await runtime.document_pipeline.process(
+        attachments=attachments,
+        session_id=thread_id or _thread_id_from_request(payload),
+        headers=request_headers or {},
+    )
+    resolved_request = resolved.request.model_copy(
+        update={
+            "documents": list(document_session.documents),
+            "repository_artifacts": list(document_session.repository_artifacts),
+            "metadata": {
+                **resolved.request.metadata,
+                "document_session": document_session.metadata,
+                "document_statistics": document_session.statistics,
+                "document_count": len(document_session.documents),
+                "repository_artifact_count": len(document_session.repository_artifacts),
+            },
+        }
+    )
     return _input_state_from_request_state(
-        resolved.request,
+        resolved_request,
         thread_id=thread_id or _thread_id_from_request(payload),
         request_id=request_id,
         model=payload.model or "orchestrator",
@@ -334,22 +359,16 @@ async def openai_chat_completions(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ):
     request_id = str(uuid4())
-    request_state = normalize_openai_request(payload)
-    resolved = await resolve_conversation_context(
-        request_state,
-        settings=runtime.settings,
-        model_manager=runtime.model_manager,
-        ollama_client=runtime.ollama_client,
-    )
     thread_id = str(uuid4())
     started_at = perf_counter()
 
-    state_input = _input_state_from_request_state(
-        resolved.request,
-        thread_id=thread_id,
+    request_headers = dict(request.headers)
+    state_input = await _input_state_from_request(
+        payload,
+        runtime=runtime,
+        request_headers=request_headers,
         request_id=request_id,
-        model=str(payload.model or "orchestrator"),
-        stream=payload.stream,
+        thread_id=thread_id,
     )
 
     stream = runtime.stream_hub.get_or_create(request_id, conversation_id=thread_id)

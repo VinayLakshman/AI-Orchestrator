@@ -20,6 +20,48 @@ logger = get_logger(__name__)
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```", re.DOTALL)
 
+_TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".rst",
+    ".py",
+    ".java",
+    ".kt",
+    ".groovy",
+    ".scala",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".css",
+    ".scss",
+    ".xml",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".sql",
+    ".properties",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+    ".gradle",
+    ".dockerfile",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".log",
+    ".out",
+    ".trace",
+    ".csv",
+}
+
+_RICH_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx"}
+_HTML_EXTENSIONS = {".html", ".htm"}
+_ARCHIVE_SUFFIXES = (".zip", ".tar", ".tgz", ".tar.gz")
+
 
 def _is_image_part(part: dict[str, Any]) -> bool:
     part_type = str(part.get("type") or "").lower()
@@ -38,13 +80,15 @@ def _is_image_part(part: dict[str, Any]) -> bool:
 
 def _is_file_part(part: dict[str, Any]) -> bool:
     part_type = str(part.get("type") or "").lower()
-    if part_type in {"file", "input_file", "document", "attachment", "pdf"}:
+    if part_type in {"file", "input_file", "document", "attachment", "pdf", "archive"}:
         return True
     filename = str(part.get("filename") or part.get("name") or part.get("path") or "").lower()
     mime_type = str(part.get("mime_type") or part.get("media_type") or "").lower()
-    return filename.endswith((".pdf", ".txt", ".md", ".doc", ".docx", ".csv", ".json", ".yaml", ".yml")) or mime_type.startswith(
-        "application/"
-    )
+    if filename.endswith(_ARCHIVE_SUFFIXES):
+        return True
+    if filename.endswith(tuple(_TEXT_EXTENSIONS)) or filename.endswith(tuple(_RICH_EXTENSIONS)) or filename.endswith(tuple(_HTML_EXTENSIONS)):
+        return True
+    return mime_type.startswith(("application/", "text/"))
 
 
 def _attachment_type(part: dict[str, Any]) -> str:
@@ -53,10 +97,16 @@ def _attachment_type(part: dict[str, Any]) -> str:
     if _is_file_part(part):
         filename = str(part.get("filename") or part.get("name") or part.get("path") or "").lower()
         mime_type = str(part.get("mime_type") or part.get("media_type") or "").lower()
+        if filename.endswith(_ARCHIVE_SUFFIXES):
+            return "archive"
         if filename.endswith(".pdf") or "pdf" in mime_type:
             return "pdf"
-        if filename.endswith((".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".doc", ".docx")):
+        if filename.endswith(tuple(_HTML_EXTENSIONS)) or "html" in mime_type:
+            return "html"
+        if filename.endswith(tuple(_RICH_EXTENSIONS)) or any(filename.endswith(ext) for ext in _TEXT_EXTENSIONS):
             return "document"
+        if filename.endswith(tuple(_TEXT_EXTENSIONS)) or mime_type.startswith("text/"):
+            return "text"
         return "file"
     return str(part.get("type") or "attachment").lower()
 
