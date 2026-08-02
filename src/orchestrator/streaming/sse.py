@@ -32,7 +32,11 @@ def openai_chunk(
             }
         ],
     }
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    from ..serialization import sanitize_for_json, validate_json_serializable, SerializationError
+
+    safe = sanitize_for_json(payload)
+    validate_json_serializable(safe)
+    return f"data: {json.dumps(safe, ensure_ascii=False)}\n\n"
 
 
 def openai_done() -> str:

@@ -6,6 +6,7 @@ import httpx
 
 from ..models.knowledge import KnowledgeRetrieveRequest, KnowledgeRetrieveResponse
 from ..settings import Settings
+from ..serialization import sanitize_for_json, validate_json_serializable, SerializationError
 
 
 class KnowledgeClient:
@@ -43,7 +44,13 @@ class KnowledgeClient:
             close_client = True
 
         try:
-            resp = await client.post("/retrieve", json=request.model_dump())
+            payload = request.model_dump(exclude_none=True) if hasattr(request, "model_dump") else dict(request)
+            try:
+                sanitized = sanitize_for_json(payload)
+                validate_json_serializable(sanitized)
+            except SerializationError:
+                raise
+            resp = await client.post("/retrieve", json=sanitized)
             resp.raise_for_status()
             data: dict[str, Any] = resp.json()
             return KnowledgeRetrieveResponse.model_validate(data)

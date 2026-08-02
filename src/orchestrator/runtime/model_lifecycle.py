@@ -12,6 +12,7 @@ from ..common.enums import ChatRole
 from ..models.manager import ManagedModel, ModelManager
 from ..settings import Settings
 from .model_catalog import CODER, CONTROLLER, REASONING, VISION, ModelPolicy
+from ..serialization import sanitize_for_json, validate_json_serializable, SerializationError
 
 logger = get_logger(__name__)
 
@@ -466,10 +467,13 @@ class ModelLifecycle:
 
         # Construct request directly.
         # Note: Ollama API: POST /api/unload {"name": "model"}
-        resp = await raw_client.post(
-            "/api/unload",
-            json={"name": model_name},
-        )
+        payload = {"name": model_name}
+        try:
+            sanitized = sanitize_for_json(payload)
+            validate_json_serializable(sanitized)
+        except SerializationError:
+            raise
+        resp = await raw_client.post("/api/unload", json=sanitized)
         resp.raise_for_status()
 
     async def _cleanup_loop(self) -> None:

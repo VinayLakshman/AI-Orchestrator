@@ -20,6 +20,7 @@ from ..context.builder import (
 )
 from ..logging import get_logger
 from ..models.chat import ChatMessage
+
 from ..models.manager import ModelManager
 from ..models.ollama import (
     ModelGenerationResponse,
@@ -41,35 +42,24 @@ _ALLOWED_CLASSIFICATIONS = {
     "GENERAL",
     "KNOWLEDGE",
     "CODE",
-    "VISION",
-    "TOOLS",
-    "REASONING",
-    "CLARIFY",
-}
-
-_ALLOWED_ACTIONS = {
-    "continue",
-    "finalize",
-    "reason",
-    "clarify",
-}
-
-def _normalize_step(value: Any) -> SpecialistType | None:
-    """Normalize a planner specialist token into SpecialistType.
-
-    Returns None for empty values only.
-    Unknown specialist tokens are handled by _unique_steps where we can
-    enforce strict contract behavior.
-    """
-    if value is None:
-        return None
-    if isinstance(value, SpecialistType):
-        return value
-    text = str(value).strip()
-    if not text:
-        return None
-
-    # SpecialistType is a StrEnum; this will raise ValueError if unknown.
+        logger.debug(
+            "execution_plan %s",
+            json.dumps(
+                {
+                    "classification": plan.classification,
+                    "queue": [s.value for s in plan.execution_queue],
+                    "repository": plan.requires_repository,
+                    "web": plan.requires_web,
+                    "vision": plan.requires_vision,
+                    "tools": plan.requires_tools,
+                    "code": plan.requires_code,
+                    "reasoning": plan.requires_reasoning,
+                    "request_evidence": profile,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+        )
     return SpecialistType(text.lower())
 
 
@@ -543,10 +533,7 @@ class ControllerEngine:
                     "complete": validation.complete,
                     "retry": validation.retry,
                     "current_index": runtime.current_index,
-                    "completed": [
-                        item.value
-                        for item in runtime.completed
-                    ],
+                    "completed": [ item.value for item in runtime.completed ],
                 },
                 sort_keys=True,
                 default=str,

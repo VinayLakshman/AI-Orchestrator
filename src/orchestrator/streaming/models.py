@@ -31,9 +31,13 @@ class StreamEvent(BaseModel):
 
     def to_sse(self) -> str:
         import json
+        from ..serialization import sanitize_for_json, validate_json_serializable
 
+        payload = self.model_dump(mode="json")
+        safe = sanitize_for_json(payload)
+        validate_json_serializable(safe)
         return (
             f"id: {self.seq}\n"
             f"event: {self.kind.value}\n"
-            f"data: {json.dumps(self.model_dump(mode='json'), ensure_ascii=False)}\n\n"
+            f"data: {json.dumps(safe, ensure_ascii=False)}\n\n"
         )

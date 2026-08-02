@@ -281,7 +281,14 @@ class VisionPipeline:
         }
 
         try:
-            resp = await self.client.post("/api/chat", json=payload)
+            # Sanitize and validate vision payload before sending
+            from ..serialization import sanitize_for_json, validate_json_serializable, SerializationError
+            try:
+                sanitized = sanitize_for_json(payload)
+                validate_json_serializable(sanitized)
+            except SerializationError:
+                raise
+            resp = await self.client.post("/api/chat", json=sanitized)
             resp.raise_for_status()
             data = resp.json()
             raw_content = self._parse_ollama_content(data)

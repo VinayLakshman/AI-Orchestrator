@@ -16,6 +16,7 @@ from ..models.ollama import (
 from ..logging import get_logger
 from ..settings import Settings
 from ..models.chat import ChatMessage
+from ..serialization import sanitize_for_json, validate_json_serializable, SerializationError
 
 
 logger = get_logger(__name__)
@@ -97,7 +98,11 @@ class OllamaClient:
         )
 
     def _log_payload(self, payload: dict[str, Any]) -> None:
-        logger.debug("ollama_request_payload=%s", json.dumps(payload, sort_keys=True, default=str))
+        try:
+            logger.debug("ollama_request_payload=%s", json.dumps(payload, sort_keys=True, ensure_ascii=False))
+        except Exception:
+            # Best-effort fallback to repr if something unexpected slipped through
+            logger.debug("ollama_request_payload_repr=%s", repr(payload))
 
     async def _get_client(self, *, streaming: bool = False) -> tuple[httpx.AsyncClient, bool]:
         timeout = self._build_timeout(streaming=streaming)
@@ -153,11 +158,18 @@ class OllamaClient:
             keep_alive=keep_alive,
             think=think,
         )
-        self._log_payload(payload)
+        # Sanitize and validate payload to ensure JSON-compatibility
+        try:
+            sanitized_payload = sanitize_for_json(payload)
+            validate_json_serializable(sanitized_payload)
+        except SerializationError as exc:
+            logger.exception("ollama_payload_serialization_error model=%s error=%s payload_preview=%s", model, exc, str(payload)[:1000])
+            raise
 
+        self._log_payload(sanitized_payload)
         client, close_client = await self._get_client()
         try:
-            resp = await client.post("/api/chat", json=payload)
+            resp = await client.post("/api/chat", json=sanitized_payload)
             resp.raise_for_status()
             data = resp.json()
             return normalize_generation_response(model, data)
@@ -170,7 +182,7 @@ class OllamaClient:
                 model,
                 getattr(exc.response, "status_code", "unknown"),
                 response_text[:2000],
-                json.dumps(payload, sort_keys=True, default=str),
+                json.dumps(sanitized_payload, sort_keys=True, ensure_ascii=False),
             )
             raise
         finally:
@@ -200,11 +212,19 @@ class OllamaClient:
             keep_alive=keep_alive,
             think=think,
         )
-        self._log_payload(payload)
+        # Sanitize and validate payload for streaming
+        try:
+            sanitized_payload = sanitize_for_json(payload)
+            validate_json_serializable(sanitized_payload)
+        except SerializationError as exc:
+            logger.exception("ollama_stream_payload_serialization_error model=%s error=%s payload_preview=%s", model, exc, str(payload)[:1000])
+            raise
+
+        self._log_payload(sanitized_payload)
 
         client, close_client = await self._get_client(streaming=True)
         try:
-            async with client.stream("POST", "/api/chat", json=payload) as resp:
+            async with client.stream("POST", "/api/chat", json=sanitized_payload) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     if not line:
@@ -231,7 +251,7 @@ class OllamaClient:
                 model,
                 getattr(exc.response, "status_code", "unknown"),
                 response_text[:2000],
-                json.dumps(payload, sort_keys=True, default=str),
+                json.dumps(sanitized_payload, sort_keys=True, ensure_ascii=False),
             )
             raise
         finally:

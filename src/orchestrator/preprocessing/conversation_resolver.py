@@ -305,11 +305,7 @@ def _build_resolver_messages(
     messages: list[ChatMessage] = [
         ChatMessage(role=ChatRole.SYSTEM, content=RESOLVER_SYSTEM_PROMPT)
     ]
-    structured_context_json = json.dumps(
-        structured_context,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    structured_context_json = json.dumps(structured_context, ensure_ascii=False, separators=(",", ":"))
     messages.append(
         ChatMessage(
             role=ChatRole.SYSTEM,
