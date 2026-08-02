@@ -174,6 +174,15 @@ def _failure_artifact(
     exception: Exception | None = None,
 ) -> DocumentArtifact:
     resolved_checksum = checksum or hashlib.sha256(f"{filename}:{error}".encode()).hexdigest()
+    metadata = _canonical_document_metadata(
+        filename=filename,
+        extension=route_attachment(filename=filename, mime_type=mime_type).extension,
+        mime_type=mime_type,
+        size=size,
+        checksum=resolved_checksum,
+        route=route_attachment(filename=filename, mime_type=mime_type),
+    )
+    metadata.update({"status": "failed", "error": error})
     return DocumentArtifact(
         id=resolved_checksum[:16],
         filename=filename,
@@ -184,7 +193,7 @@ def _failure_artifact(
         category=DocumentCategory.UNSUPPORTED,
         encoding="utf-8",
         content_type=content_type,
-        metadata={"status": "failed", "error": error},
+        metadata=metadata,
         text="",
         pages=[],
         tables=[],
@@ -223,7 +232,14 @@ def _text_artifact(
         artifact.page_count = 1
     artifact.line_count = artifact.line_count or _line_count(artifact.text)
     artifact.word_count = artifact.word_count or _word_count(artifact.text)
-    artifact.metadata.setdefault("kind", category.value)
+    artifact.metadata = _canonical_document_metadata(
+        filename=artifact.filename,
+        extension=artifact.extension,
+        mime_type=artifact.mime_type,
+        size=artifact.size,
+        checksum=artifact.checksum,
+        route=route_attachment(filename=artifact.filename, mime_type=artifact.mime_type),
+    )
     return artifact
 
 
@@ -235,26 +251,51 @@ def _extract_leaf_document(
     route: AttachmentRoute,
     metadata: dict[str, Any] | None = None,
 ) -> DocumentArtifact:
-    if route.category == DocumentCategory.TEXT:
-        return _text_artifact(raw=raw, filename=filename, mime_type=mime_type, metadata=metadata)
-    if route.category == DocumentCategory.HTML:
-        return extract_html_document(raw=raw, filename=filename, mime_type=mime_type, metadata=metadata)
-    if route.extension == ".pdf":
-        return extract_pdf_document(raw=raw, filename=filename, mime_type=mime_type, metadata=metadata)
-    if route.extension == ".docx":
-        return extract_docx_document(raw=raw, filename=filename, mime_type=mime_type, metadata=metadata)
-    if route.extension == ".xlsx":
-        return extract_xlsx_document(raw=raw, filename=filename, mime_type=mime_type, metadata=metadata)
-    if route.extension == ".pptx":
-        return extract_pptx_document(raw=raw, filename=filename, mime_type=mime_type, metadata=metadata)
-    return _failure_artifact(
+    canonical_metadata = _canonical_document_metadata(
         filename=filename,
+        extension=route.extension,
         mime_type=mime_type,
-        content_type=route.category.value,
         size=len(raw),
-        error="unsupported_document_format",
         checksum=_checksum(raw),
+        route=route,
     )
+    if route.category == DocumentCategory.TEXT:
+        artifact = _text_artifact(raw=raw, filename=filename, mime_type=mime_type, metadata=canonical_metadata)
+    elif route.category == DocumentCategory.HTML:
+        artifact = extract_html_document(raw=raw, filename=filename, mime_type=mime_type, metadata=canonical_metadata)
+    elif route.extension == ".pdf":
+        artifact = extract_pdf_document(raw=raw, filename=filename, mime_type=mime_type, metadata=canonical_metadata)
+    elif route.extension == ".docx":
+        artifact = extract_docx_document(raw=raw, filename=filename, mime_type=mime_type, metadata=canonical_metadata)
+    elif route.extension == ".xlsx":
+        artifact = extract_xlsx_document(raw=raw, filename=filename, mime_type=mime_type, metadata=canonical_metadata)
+    elif route.extension == ".pptx":
+        artifact = extract_pptx_document(raw=raw, filename=filename, mime_type=mime_type, metadata=canonical_metadata)
+    else:
+        return _failure_artifact(
+            filename=filename,
+            mime_type=mime_type,
+            content_type=route.category.value,
+            size=len(raw),
+            error="unsupported_document_format",
+            checksum=_checksum(raw),
+        )
+
+    # Ensure metadata stays canonical after extraction.
+    artifact.metadata = _canonical_document_metadata(
+        filename=artifact.filename,
+        extension=artifact.extension,
+        mime_type=artifact.mime_type,
+        size=artifact.size,
+        checksum=artifact.checksum,
+        route=route,
+        encoding=artifact.encoding,
+        language=artifact.language,
+        page_count=artifact.page_count,
+        line_count=artifact.line_count,
+        word_count=artifact.word_count,
+    )
+    return artifact
 
 
 async def _resolve_attachment_bytes(
@@ -326,6 +367,38 @@ def _split_archive_members(raw: bytes, filename: str) -> list[ArchiveMember]:
     if lower.endswith((".tar", ".tgz", ".tar.gz")):
         return iter_tar_members(raw, max_members=MAX_ARCHIVE_MEMBERS)
     return []
+
+
+def _canonical_document_metadata(
+    *,
+    filename: str,
+    extension: str,
+    mime_type: str,
+    size: int,
+    checksum: str,
+    route: AttachmentRoute | None = None,
+    encoding: str | None = None,
+    language: str | None = None,
+    page_count: int | None = None,
+    line_count: int | None = None,
+    word_count: int | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "filename": filename,
+        "extension": extension,
+        "mime_type": mime_type,
+        "size": size,
+        "checksum": checksum,
+        "encoding": encoding,
+        "language": language,
+        "page_count": page_count,
+        "line_count": line_count,
+        "word_count": word_count,
+    }
+    if route is not None:
+        metadata["content_type"] = route.category.value
+        metadata["category"] = route.category.value
+    return {key: value for key, value in metadata.items() if value is not None and value != ""}
 
 
 def _chunk_text(text: str, *, chunk_size: int = 2200) -> list[str]:

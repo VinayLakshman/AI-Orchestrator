@@ -160,12 +160,9 @@ def _lightweight_document_summary(document: Any) -> dict[str, Any]:
         "filename": data.get("filename"),
         "extension": data.get("extension"),
         "mime_type": data.get("mime_type"),
-        "category": data.get("category"),
         "page_count": int(data.get("page_count") or 0),
-        "line_count": int(data.get("line_count") or 0),
         "word_count": int(data.get("word_count") or 0),
         "status": data.get("status"),
-        "metadata": data.get("metadata") or {},
     }
 
 

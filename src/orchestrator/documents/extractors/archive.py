@@ -72,11 +72,16 @@ def build_repository_artifact(
 ) -> RepositoryArtifact:
     paths = [doc.filename for doc in documents if doc.filename]
     tree = _tree_from_paths(paths)
+    safe_metadata = {}
+    if metadata:
+        for key in ("source", "mime_type", "checksum", "member_count", "nested_repository_count"):
+            if key in metadata:
+                safe_metadata[key] = metadata[key]
     return RepositoryArtifact(
         root=root,
         documents=documents,
         directory_tree=tree,
-        metadata=dict(metadata or {}),
+        metadata=safe_metadata,
         statistics={
             "document_count": len(documents),
             "text_documents": sum(1 for doc in documents if doc.category == DocumentCategory.TEXT),
