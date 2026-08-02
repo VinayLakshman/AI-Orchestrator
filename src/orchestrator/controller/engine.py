@@ -14,6 +14,7 @@ from ..context.builder import (
     build_controller_messages,
     build_finalize_context,
     build_finalizer_messages,
+    build_planner_context,
     estimate_text_tokens,
     render_request_context,
     render_structured_context,
@@ -408,6 +409,12 @@ class ControllerEngine:
             system_prompt=system_prompt,
             messages=_request_messages(state),
             request_context=request_context,
+            structured_context=json.dumps(
+                build_planner_context(state),
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ),
         )
 
         logger.debug(

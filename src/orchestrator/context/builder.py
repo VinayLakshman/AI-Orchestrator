@@ -512,6 +512,272 @@ def _build_conversation_history(
     return history_chat_messages, latest_user_text, conversation_info
 
 
+def _planner_status(metadata: dict[str, Any] | None) -> str:
+    status = str((metadata or {}).get("status") or "").strip().lower()
+    if status in {"failed", "error", "empty"}:
+        return status
+    if status:
+        return "available"
+    return "available"
+
+
+def _planner_source_entry(
+    source_type: str,
+    status: str,
+    confidence: float,
+    summary: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "type": source_type,
+        "status": status,
+        "confidence": confidence,
+        "summary": _truncate(summary, 260),
+    }
+    if details:
+        entry["details"] = details
+    return entry
+
+
+def build_planner_context(state: OrchestratorState) -> dict[str, Any]:
+    request = state.request
+    evidence = state.evidence
+    execution = state.execution
+
+    evidence_sources: list[dict[str, Any]] = []
+
+    if evidence.vision is not None:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="vision",
+                status=_planner_status(evidence.vision.metadata),
+                confidence=float(evidence.vision.confidence or 0.0),
+                summary=str(evidence.vision.summary or ""),
+                details={
+                    "task": evidence.vision.task,
+                    "observations_count": len(evidence.vision.observations or []),
+                    "extracted_text_present": bool(str(evidence.vision.extracted_text or "").strip()),
+                },
+            )
+        )
+    else:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="vision",
+                status="not_executed",
+                confidence=0.0,
+                summary="",
+                details={
+                    "task": None,
+                    "observations_count": 0,
+                    "extracted_text_present": False,
+                },
+            )
+        )
+
+    if evidence.repository is not None:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="knowledge",
+                status=_planner_status(evidence.repository.metadata),
+                confidence=float(evidence.repository.confidence or 0.0),
+                summary=str(evidence.repository.context or ""),
+                details={
+                    "question": evidence.repository.question,
+                    "retrieval_reason": evidence.repository.retrieval_reason,
+                    "hit_count": int(evidence.repository.hit_count or 0),
+                },
+            )
+        )
+    else:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="knowledge",
+                status="not_executed",
+                confidence=0.0,
+                summary="",
+                details={
+                    "question": None,
+                    "retrieval_reason": None,
+                    "hit_count": 0,
+                },
+            )
+        )
+
+    if evidence.web is not None:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="web",
+                status=_planner_status(evidence.web.metadata),
+                confidence=float(evidence.web.confidence or 0.0),
+                summary=str(evidence.web.summary or ""),
+                details={
+                    "query": evidence.web.query,
+                    "results_count": len(evidence.web.results or []),
+                    "snippets_count": len(evidence.web.snippets or []),
+                },
+            )
+        )
+    else:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="web",
+                status="not_executed",
+                confidence=0.0,
+                summary="",
+                details={
+                    "query": None,
+                    "results_count": 0,
+                    "snippets_count": 0,
+                },
+            )
+        )
+
+    if evidence.documents is not None:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="documents",
+                status=_planner_status(evidence.documents.metadata),
+                confidence=float(evidence.documents.confidence or 0.0),
+                summary=str(evidence.documents.summary or ""),
+                details={
+                    "document_count": len(evidence.documents.documents or []),
+                    "repository_artifact_count": len(evidence.documents.repository_artifacts or []),
+                },
+            )
+        )
+    else:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="documents",
+                status="not_executed",
+                confidence=0.0,
+                summary="",
+                details={
+                    "document_count": 0,
+                    "repository_artifact_count": 0,
+                },
+            )
+        )
+
+    if evidence.code is not None:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="code",
+                status=_planner_status(evidence.code.metadata),
+                confidence=float(evidence.code.confidence or 0.0),
+                summary=str(evidence.code.summary or ""),
+                details={
+                    "language": evidence.code.language,
+                    "files_count": len(evidence.code.files or []),
+                    "tests_count": len(evidence.code.tests or []),
+                    "warnings_count": len(evidence.code.warnings or []),
+                },
+            )
+        )
+    else:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="code",
+                status="not_executed",
+                confidence=0.0,
+                summary="",
+                details={
+                    "language": None,
+                    "files_count": 0,
+                    "tests_count": 0,
+                    "warnings_count": 0,
+                },
+            )
+        )
+
+    if evidence.tools is not None:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="tools",
+                status="available",
+                confidence=1.0,
+                summary="Tool execution results available.",
+                details={
+                    "executions_count": len(evidence.tools.executions or []),
+                },
+            )
+        )
+    else:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="tools",
+                status="not_executed",
+                confidence=0.0,
+                summary="",
+                details={
+                    "executions_count": 0,
+                },
+            )
+        )
+
+    if evidence.reasoning is not None:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="reasoning",
+                status="available",
+                confidence=1.0,
+                summary=str(evidence.reasoning.summary or ""),
+                details={
+                    "conclusions_count": len(evidence.reasoning.conclusions or []),
+                    "assumptions_count": len(evidence.reasoning.assumptions or []),
+                },
+            )
+        )
+    else:
+        evidence_sources.append(
+            _planner_source_entry(
+                source_type="reasoning",
+                status="not_executed",
+                confidence=0.0,
+                summary="",
+                details={
+                    "conclusions_count": 0,
+                    "assumptions_count": 0,
+                },
+            )
+        )
+
+    return {
+        "query": request.user_message,
+        "conversation": {
+            "message_count": len(request.messages or []),
+            "image_count": int(request.metadata.get("image_count", 0) or 0),
+            "file_count": int(request.metadata.get("file_count", 0) or 0),
+            "contains_urls": bool(request.metadata.get("contains_urls", False)),
+            "contains_code_blocks": bool(request.metadata.get("contains_code_blocks", False)),
+        },
+        "execution": {
+            "classification": execution.plan.classification,
+            "requires_repository": execution.plan.requires_repository,
+            "requires_web": execution.plan.requires_web,
+            "requires_reasoning": execution.plan.requires_reasoning,
+            "requires_code": execution.plan.requires_code,
+            "requires_tools": execution.plan.requires_tools,
+            "requires_vision": execution.plan.requires_vision,
+            "execution_queue": [
+                step.value if hasattr(step, "value") else str(step)
+                for step in execution.plan.execution_queue
+            ],
+            "current_specialist": (
+                execution.runtime.current_specialist.value
+                if execution.runtime.current_specialist
+                else None
+            ),
+            "completed_specialists": [
+                step.value if hasattr(step, "value") else str(step)
+                for step in execution.runtime.completed
+            ],
+        },
+        "evidence": evidence_sources,
+    }
+
+
 def render_structured_context(state: OrchestratorState) -> str:
     return json.dumps(
         build_finalize_context(state),
