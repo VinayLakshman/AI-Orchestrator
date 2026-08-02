@@ -42,24 +42,35 @@ _ALLOWED_CLASSIFICATIONS = {
     "GENERAL",
     "KNOWLEDGE",
     "CODE",
-        logger.debug(
-            "execution_plan %s",
-            json.dumps(
-                {
-                    "classification": plan.classification,
-                    "queue": [s.value for s in plan.execution_queue],
-                    "repository": plan.requires_repository,
-                    "web": plan.requires_web,
-                    "vision": plan.requires_vision,
-                    "tools": plan.requires_tools,
-                    "code": plan.requires_code,
-                    "reasoning": plan.requires_reasoning,
-                    "request_evidence": profile,
-                },
-                sort_keys=True,
-                default=str,
-            ),
-        )
+    "VISION",
+    "TOOLS",
+    "REASONING",
+    "CLARIFY",
+}
+
+_ALLOWED_ACTIONS = {
+    "continue",
+    "finalize",
+    "reason",
+    "clarify",
+}
+
+def _normalize_step(value: Any) -> SpecialistType | None:
+    """Normalize a planner specialist token into SpecialistType.
+
+    Returns None for empty values only.
+    Unknown specialist tokens are handled by _unique_steps where we can
+    enforce strict contract behavior.
+    """
+    if value is None:
+        return None
+    if isinstance(value, SpecialistType):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # SpecialistType is a StrEnum; this will raise ValueError if unknown.
     return SpecialistType(text.lower())
 
 
@@ -460,10 +471,12 @@ class ControllerEngine:
                 raise
 
 
-        logger.debug(
-            "execution_plan %s",
-            json.dumps(
-                {
+        try:
+            from ..serialization import sanitize_for_json
+
+            logger.debug(
+                "execution_plan %s",
+                json.dumps(sanitize_for_json({
                     "classification": plan.classification,
                     "queue": [s.value for s in plan.execution_queue],
                     "repository": plan.requires_repository,
@@ -473,11 +486,20 @@ class ControllerEngine:
                     "code": plan.requires_code,
                     "reasoning": plan.requires_reasoning,
                     "request_evidence": profile,
-                },
-                sort_keys=True,
-                default=str,
-            ),
-        )
+                }), sort_keys=True, ensure_ascii=False),
+            )
+        except Exception:
+            logger.debug("execution_plan %s", repr({
+                "classification": plan.classification,
+                "queue": [s.value for s in plan.execution_queue],
+                "repository": plan.requires_repository,
+                "web": plan.requires_web,
+                "vision": plan.requires_vision,
+                "tools": plan.requires_tools,
+                "code": plan.requires_code,
+                "reasoning": plan.requires_reasoning,
+                "request_evidence": profile,
+            }))
 
         _log_planner_plan(plan)
 
@@ -524,21 +546,29 @@ class ControllerEngine:
             logger.exception("failed_to_validate_execution_result")
             validation = ValidationResult()
 
-        logger.debug(
-            "execution_validation %s",
-            json.dumps(
-                {
+        try:
+            from ..serialization import sanitize_for_json
+
+            logger.debug(
+                "execution_validation %s",
+                json.dumps(sanitize_for_json({
                     "last_step": step_text,
                     "action": validation.action.value,
                     "complete": validation.complete,
                     "retry": validation.retry,
                     "current_index": runtime.current_index,
                     "completed": [ item.value for item in runtime.completed ],
-                },
-                sort_keys=True,
-                default=str,
-            ),
-        )
+                }), sort_keys=True, ensure_ascii=False),
+            )
+        except Exception:
+            logger.debug("execution_validation %s", repr({
+                "last_step": step_text,
+                "action": validation.action.value,
+                "complete": validation.complete,
+                "retry": validation.retry,
+                "current_index": runtime.current_index,
+                "completed": [ item.value for item in runtime.completed ],
+            }))
 
         return validation
 
@@ -563,18 +593,23 @@ class ControllerEngine:
             evidence_context=context_json,
         )
 
-        logger.debug(
-            "finalizer_context %s",
-            json.dumps(
-                {
+        try:
+            from ..serialization import sanitize_for_json
+
+            logger.debug(
+                "finalizer_context %s",
+                json.dumps(sanitize_for_json({
                     "prompt_tokens": estimate_text_tokens(finalizer_prompt),
                     "context_tokens": estimate_text_tokens(context_json),
                     "sources": len(finalizer_context.get("sources", [])),
-                },
-                sort_keys=True,
-                default=str,
-            ),
-        )
+                }), sort_keys=True, ensure_ascii=False),
+            )
+        except Exception:
+            logger.debug("finalizer_context %s", repr({
+                "prompt_tokens": estimate_text_tokens(finalizer_prompt),
+                "context_tokens": estimate_text_tokens(context_json),
+                "sources": len(finalizer_context.get("sources", [])),
+            }))
 
         model_name = self.models.controller().name
 
