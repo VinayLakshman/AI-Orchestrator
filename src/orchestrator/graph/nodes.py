@@ -110,6 +110,44 @@ def _select_next_node(
     return current.value if current else "finalize"
 
 
+def _specialist_supports_runtime_execution(
+    specialist: SpecialistType,
+    settings: Settings,
+) -> tuple[bool, str]:
+    if specialist == SpecialistType.VISION and not settings.enable_vision:
+        return False, "vision_disabled"
+    if specialist == SpecialistType.KNOWLEDGE and not settings.enable_rag:
+        return False, "knowledge_disabled"
+    if specialist == SpecialistType.WEB and not settings.web_search_enabled:
+        return False, "web_disabled"
+    return True, ""
+
+
+def _specialist_already_scheduled_or_completed(
+    execution: ExecutionState,
+    specialist: SpecialistType,
+) -> tuple[bool, str]:
+    if specialist in execution.runtime.completed:
+        return True, "already_executed"
+
+    pending = execution.runtime.queue[execution.runtime.current_index :]
+    if specialist in pending:
+        return True, "already_pending"
+
+    return False, ""
+
+
+def _append_specialist_to_runtime(
+    execution: ExecutionState,
+    specialist: SpecialistType,
+) -> ExecutionState:
+    runtime = execution.runtime.model_copy(deep=True)
+    runtime.queue.append(specialist)
+    if runtime.current_specialist is None and runtime.current_index < len(runtime.queue):
+        runtime.current_specialist = runtime.queue[runtime.current_index]
+    return execution.model_copy(update={"runtime": runtime})
+
+
 def _state_snapshot(
     state: OrchestratorState,
 ) -> dict[str, Any]:
@@ -714,13 +752,65 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
 
         validation = await controller.validate(state, last_step=last_step)
 
+        queue_before = [step.value for step in execution.runtime.queue]
+        runtime_decision = "continue_existing"
+        runtime_decision_reason = ""
+
         if validation.retry:
             execution = _rewind_runtime(execution)
+            runtime_decision = "retry"
+        elif validation.action == ControllerAction.CONTINUE and validation.selected_specialist:
+            try:
+                selected_specialist = SpecialistType(str(validation.selected_specialist).strip().lower())
+            except ValueError:
+                selected_specialist = None
+
+            if selected_specialist is None:
+                runtime_decision = "ignored"
+                runtime_decision_reason = "invalid_selected_specialist"
+            else:
+                supported, support_reason = _specialist_supports_runtime_execution(
+                    selected_specialist,
+                    settings,
+                )
+                if not supported:
+                    runtime_decision = "ignored"
+                    runtime_decision_reason = support_reason
+                else:
+                    already, already_reason = _specialist_already_scheduled_or_completed(
+                        execution,
+                        selected_specialist,
+                    )
+                    if already:
+                        runtime_decision = "ignored"
+                        runtime_decision_reason = already_reason
+                    else:
+                        execution = _append_specialist_to_runtime(
+                            execution,
+                            selected_specialist,
+                        )
+                        runtime_decision = "append_specialist"
+                        runtime_decision_reason = selected_specialist.value
+        elif validation.action == ControllerAction.FINALIZE:
+            runtime_decision = "finalize"
+        elif validation.action == ControllerAction.CLARIFY:
+            runtime_decision = "clarify"
+        elif validation.action == ControllerAction.REASON:
+            runtime_decision = "reason"
+        elif execution.runtime.current_specialist is None:
+            runtime_decision = "finalize"
+
+        queue_after = [step.value for step in execution.runtime.queue]
 
         execution.validation = validation
         execution.runtime.metadata["validation_action"] = validation.action.value if hasattr(validation.action, "value") else str(validation.action)
         execution.runtime.metadata["validation_confidence"] = float(validation.confidence or 0.0)
         execution.runtime.metadata["validation_summary"] = validation.summary
+        execution.runtime.metadata["validation_selected_specialist"] = validation.selected_specialist
+        execution.runtime.metadata["validation_goal"] = validation.goal
+        execution.runtime.metadata["validation_missing_evidence"] = validation.missing_evidence
+        execution.runtime.metadata["validation_decision"] = runtime_decision
+        execution.runtime.metadata["validation_decision_reason"] = runtime_decision_reason
         execution.runtime.metadata["controller_model"] = controller.models.controller().name
         state.execution = execution
         state.debug.validator_prompt = build_controller_validation_prompt()
@@ -737,6 +827,13 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         _log_transition(
             "controller_validated",
             controller_decision=selected_next_node,
+            runtime_decision=runtime_decision,
+            runtime_decision_reason=runtime_decision_reason,
+            validator_goal=validation.goal,
+            validator_selected_specialist=validation.selected_specialist,
+            validator_missing_evidence=validation.missing_evidence,
+            runtime_queue_before=queue_before,
+            runtime_queue_after=queue_after,
             selected_next_node=selected_next_node,
             **_state_snapshot(state),
         )

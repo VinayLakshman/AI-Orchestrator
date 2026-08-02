@@ -368,24 +368,10 @@ def _normalized_validation_payload(parsed: dict[str, Any]) -> dict[str, Any]:
             parsed.get("fallback_to_general")
         ),
         "reason": str(parsed.get("reason") or "").strip(),
-        "issues": list(parsed.get("issues") or []),
-        "notes": str(parsed.get("notes") or "").strip(),
-        "next_specialist": _normalize_step(
-            parsed.get("next_specialist") or parsed.get("next_step")
-        ),
-        "pending_specialists": _unique_steps(
-            parsed.get("pending_specialists") or []
-        ),
-        "execution_queue": _unique_steps(
-            parsed.get("execution_queue")
-            or parsed.get("pending_specialists")
-            or []
-        ),
-        "final_answer_ready": _bool_from_any(parsed.get("final_answer_ready")),
-        "knowledge_sufficient": parsed.get("knowledge_sufficient"),
-        "use_web_search": _bool_from_any(
-            parsed.get("use_web_search") or parsed.get("requires_web")
-        ),
+            "goal": str(parsed.get("goal") or "").strip(),
+            "current_evidence": list(parsed.get("current_evidence") or []),
+            "missing_evidence": list(parsed.get("missing_evidence") or []),
+            "selected_specialist": str(parsed.get("selected_specialist") or "").strip(),
         "classification": str(parsed.get("classification") or "GENERAL").strip().upper(),
     }
 
@@ -563,6 +549,15 @@ class ControllerEngine:
                     "action": validation.action.value,
                     "complete": validation.complete,
                     "retry": validation.retry,
+                    "requires_reasoning": validation.requires_reasoning,
+                    "requires_clarification": validation.requires_clarification,
+                    "goal": validation.goal,
+                    "current_evidence": validation.current_evidence,
+                    "missing_evidence": validation.missing_evidence,
+                    "selected_specialist": validation.selected_specialist,
+                    "notes": validation.notes,
+                    "reason": validation.reason,
+                    "issues": validation.issues,
                     "current_index": runtime.current_index,
                     "completed": [ item.value for item in runtime.completed ],
                 }), sort_keys=True, ensure_ascii=False),
@@ -573,6 +568,15 @@ class ControllerEngine:
                 "action": validation.action.value,
                 "complete": validation.complete,
                 "retry": validation.retry,
+                "requires_reasoning": validation.requires_reasoning,
+                "requires_clarification": validation.requires_clarification,
+                "goal": validation.goal,
+                "current_evidence": validation.current_evidence,
+                "missing_evidence": validation.missing_evidence,
+                "selected_specialist": validation.selected_specialist,
+                "notes": validation.notes,
+                "reason": validation.reason,
+                "issues": validation.issues,
                 "current_index": runtime.current_index,
                 "completed": [ item.value for item in runtime.completed ],
             }))

@@ -166,6 +166,14 @@ class ValidationResult(BaseModel):
 
     reason: str = ""
 
+    goal: str = ""
+
+    current_evidence: list[str] = Field(default_factory=list)
+
+    missing_evidence: list[str] = Field(default_factory=list)
+
+    selected_specialist: str = ""
+
     issues: list[str] = Field(default_factory=list)
 
     notes: str = ""
