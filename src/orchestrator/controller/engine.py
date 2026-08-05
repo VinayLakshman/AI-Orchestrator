@@ -646,16 +646,33 @@ class ControllerEngine:
         structured_context = render_structured_context(state)
         latest_user_message = state.request.user_message
 
-        messages = [
+        # Exactly one SYSTEM message is emitted. All orchestration metadata is
+        # merged into it to remain compatible with llama.cpp, Qwen and other
+        # OpenAI-compatible chat APIs that reject multiple SYSTEM messages.
+        system_sections: list[str] = [build_reasoning_prompt().strip()]
+
+        # Pretty-print the structured context JSON for readability when possible.
+        try:
+            parsed_context = json.loads(structured_context)
+            rendered_context = json.dumps(
+                parsed_context,
+                indent=2,
+                ensure_ascii=False,
+            )
+        except Exception:
+            rendered_context = structured_context
+
+        system_sections.append(
+            f"""## Structured Context
+
+{rendered_context}"""
+        )
+
+        messages: list[ChatMessage] = [
             ChatMessage(
                 role=ChatRole.SYSTEM,
-                content=build_reasoning_prompt(),
-            ),
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "orchestrator_state"},
-                content=structured_context,
-            ),
+                content="\n\n".join(system_sections),
+            )
         ]
 
         if latest_user_message:

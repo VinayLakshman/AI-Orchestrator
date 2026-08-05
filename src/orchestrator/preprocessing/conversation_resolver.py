@@ -301,20 +301,32 @@ def _build_resolver_messages(
     latest_user_message: str,
     structured_context: dict[str, Any],
 ) -> list[ChatMessage]:
-    messages: list[ChatMessage] = [
-        ChatMessage(role=ChatRole.SYSTEM, content=RESOLVER_SYSTEM_PROMPT)
-    ]
-    structured_context_json = json.dumps(
-        structured_context,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    messages.append(
-        ChatMessage(
-            role=ChatRole.SYSTEM,
-            content=f"Structured conversation context:\n{structured_context_json}",
+    # Exactly one SYSTEM message is emitted. All orchestration metadata is
+    # merged into it to remain compatible with llama.cpp, Qwen and other
+    # OpenAI-compatible chat APIs that reject multiple SYSTEM messages.
+    try:
+        structured_context_json = json.dumps(
+            structured_context,
+            ensure_ascii=False,
+            indent=2,
         )
+    except Exception:
+        structured_context_json = json.dumps(
+            structured_context,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    system_sections: list[str] = [RESOLVER_SYSTEM_PROMPT.strip()]
+    system_sections.append(
+        f"""## Structured Conversation Context
+
+{structured_context_json}"""
     )
+
+    messages: list[ChatMessage] = [
+        ChatMessage(role=ChatRole.SYSTEM, content="\n\n".join(system_sections))
+    ]
     messages.extend(context_history)
     if latest_user_message:
         messages.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
