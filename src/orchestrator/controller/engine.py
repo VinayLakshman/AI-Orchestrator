@@ -7,7 +7,6 @@ from typing import Any, Iterable
 from orchestrator.models.state import OrchestratorState
 from orchestrator.streaming.publisher import StreamPublisher
 
-from ..clients.ollama import OllamaClient
 from ..common.enums import ChatRole, SpecialistType
 from ..common.utils import _extract_json_object
 from ..context.builder import (
@@ -391,7 +390,6 @@ def _normalized_validation_payload(parsed: dict[str, Any]) -> dict[str, Any]:
 @dataclass(slots=True)
 class ControllerEngine:
     settings: Settings
-    ollama: OllamaClient
     models: ModelManager
 
     async def plan(self, state: OrchestratorState) -> ExecutionPlan:
@@ -423,7 +421,7 @@ class ControllerEngine:
             messages=messages,
         )
 
-        response = await self.ollama.chat(
+        response = await self.models.client("controller").chat(
             model=self.models.controller().name,
             messages=messages,
             temperature=self.settings.controller_plan_temperature,
@@ -511,7 +509,7 @@ class ControllerEngine:
             structured_context=render_structured_context(state),
         )
 
-        response = await self.ollama.chat(
+        response = await self.models.client("controller").chat(
             model=self.models.controller().name,
             messages=validation_messages,
             temperature=self.settings.controller_validate_temperature,
@@ -590,6 +588,7 @@ class ControllerEngine:
         )
 
         model_name = self.models.controller().name
+        controller_client = self.models.client("controller")
 
         try:
             if publisher is not None:
@@ -598,7 +597,7 @@ class ControllerEngine:
                 parts: list[str] = []
                 raw: dict[str, Any] | None = None
 
-                async for chunk in self.ollama.stream_chat(
+                async for chunk in controller_client.stream_chat(
                     model=model_name,
                     messages=messages,
                     temperature=self.settings.controller_finalize_temperature,
@@ -620,7 +619,7 @@ class ControllerEngine:
                     raw=raw,
                 )
 
-            response = await self.ollama.chat(
+            response = await controller_client.chat(
                 model=model_name,
                 messages=messages,
                 temperature=self.settings.controller_finalize_temperature,
@@ -667,7 +666,7 @@ class ControllerEngine:
                 )
             )
 
-        response = await self.ollama.chat(
+        response = await self.models.client("reasoning").chat(
             model=self.models.reasoning().name,
             messages=messages,
             temperature=self.settings.reasoning_temperature,

@@ -55,13 +55,13 @@ async def lifespan(app: FastAPI):
         disabled.append("web")
     logger.info("runtime dependencies registered enabled_specialists=%s disabled_specialists=%s", enabled, disabled)
     logger.debug(
-        "runtime dependency map settings=%s model_manager=%s controller=%s knowledge_client=%s searxng_client=%s ollama_client=%s vision_pipeline=%s stream_hub=%s graph=%s checkpointer=%s",
+        "runtime dependency map settings=%s model_manager=%s controller=%s knowledge_client=%s searxng_client=%s client_registry=%s vision_pipeline=%s stream_hub=%s graph=%s checkpointer=%s",
         type(runtime.settings).__name__,
         type(runtime.model_manager).__name__,
         type(runtime.controller).__name__,
         type(runtime.knowledge_client).__name__,
         type(runtime.searxng_client).__name__ if runtime.searxng_client else None,
-        type(runtime.ollama_client).__name__,
+        type(runtime.client_registry).__name__,
         type(runtime.vision_pipeline).__name__,
         type(runtime.stream_hub).__name__,
         type(runtime.graph).__name__,
@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
 
     # Keep the resident controller loaded before serving traffic.
     with suppress(Exception):
-        await runtime.model_manager.warm_controller()
+        await runtime.model_lifecycle.ensure_warm("controller")
 
     cleanup_task = asyncio.create_task(_cleanup_streams(runtime))
 

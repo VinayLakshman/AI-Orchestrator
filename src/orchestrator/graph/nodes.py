@@ -564,7 +564,7 @@ def make_coder_node(controller: ControllerEngine, settings: Settings, model_life
         messages = _build_coder_prompt(state)
 
         async with model_lifecycle.active_inference("coder"):
-            response = await controller.ollama.chat(
+            response = await controller.models.client("coder").chat(
                 model=settings.coder_model,
                 messages=messages,
                 temperature=0.15,

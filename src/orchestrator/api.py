@@ -286,7 +286,7 @@ async def _input_state_from_request(
         request_state,
         settings=runtime.settings,
         model_manager=runtime.model_manager,
-        ollama_client=runtime.ollama_client,
+        client_registry=runtime.client_registry,
     )
     return _input_state_from_request_state(
         resolved.request,
@@ -339,7 +339,7 @@ async def openai_chat_completions(
         request_state,
         settings=runtime.settings,
         model_manager=runtime.model_manager,
-        ollama_client=runtime.ollama_client,
+        client_registry=runtime.client_registry,
     )
     thread_id = str(uuid4())
     started_at = perf_counter()

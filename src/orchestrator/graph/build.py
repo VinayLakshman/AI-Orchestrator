@@ -7,11 +7,13 @@ import httpx
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from ..clients.llama_cpp import LlamaCppClient
 from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import SearXNGClient
-from ..clients.ollama import OllamaClient
+from ..clients.registry import ClientRegistry
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
+from ..runtime.docker_runtime import DockerRuntime
 from ..runtime.model_lifecycle import ModelLifecycle
 
 from ..models.state import OrchestratorState
@@ -116,7 +118,7 @@ class OrchestratorRuntime:
 
     controller: ControllerEngine
     knowledge_client: KnowledgeClient
-    ollama_client: OllamaClient
+    client_registry: ClientRegistry
     vision_pipeline: VisionPipeline
     stream_hub: StreamHub
     graph: Any
@@ -129,7 +131,7 @@ class OrchestratorRuntime:
             "model_manager": self.model_manager,
             "controller": self.controller,
             "knowledge_client": self.knowledge_client,
-            "ollama_client": self.ollama_client,
+            "client_registry": self.client_registry,
             "vision_pipeline": self.vision_pipeline,
             "stream_hub": self.stream_hub,
             "graph": self.graph,
@@ -146,10 +148,13 @@ class OrchestratorRuntime:
     async def close(self) -> None:
         """Close runtime-owned transports exactly once."""
         await self.model_lifecycle.close()
-        clients = [self.ollama_client.client, self.knowledge_client.client]
+        clients = [self.knowledge_client.client]
 
         if self.searxng_client is not None:
             clients.append(self.searxng_client.client)
+        vision_fetch = getattr(self.vision_pipeline, "client", None)
+        if vision_fetch is not None:
+            clients.append(vision_fetch)
         closed: set[int] = set()
         for client in clients:
             if client is None or id(client) in closed:
@@ -180,7 +185,7 @@ def build_graph(
     settings: Settings,
     controller: ControllerEngine,
     knowledge_client: KnowledgeClient,
-    ollama_client: OllamaClient,
+    client_registry: ClientRegistry,
     vision_pipeline: VisionPipeline,
     model_lifecycle: ModelLifecycle,
     searxng_client: SearXNGClient | None = None,
@@ -348,16 +353,22 @@ def build_graph(
 
 async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     logger.info("registering runtime dependencies")
-    ollama_http = httpx.AsyncClient(
-        base_url=settings.ollama_base_url,
-        timeout=settings.request_timeout_s,
-    )
+
     knowledge_http = httpx.AsyncClient(
         base_url=settings.knowledge_service_url,
         timeout=settings.request_timeout_s,
     )
 
-    ollama_client = OllamaClient(settings=settings, client=ollama_http)
+    # Build one llama.cpp client per model role, each pointed at its own container.
+    client_registry = ClientRegistry()
+    for role in ("controller", "reasoning", "coder", "vision"):
+        endpoint = settings.models[role].endpoint
+        client = LlamaCppClient(
+            settings=settings,
+            base_url=endpoint,
+        )
+        client_registry.register(role, client)
+
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
 
     searxng_client: SearXNGClient | None = None
@@ -367,16 +378,28 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
             timeout=settings.web_search_timeout_s,
         )
         searxng_client = SearXNGClient(settings=settings, client=web_http)
-    model_manager = ModelManager(settings=settings, ollama_client=ollama_client)
-    controller = ControllerEngine(settings=settings, ollama=ollama_client, models=model_manager)
-    vision_pipeline = VisionPipeline(settings=settings, client=ollama_http)
+
+    model_manager = ModelManager(settings=settings, client_registry=client_registry)
+    controller = ControllerEngine(settings=settings, models=model_manager)
+
+    vision_fetch_http = httpx.AsyncClient(
+        base_url=settings.vision_fetch_base_url,
+        timeout=settings.vision_timeout_s,
+    )
+    vision_pipeline = VisionPipeline(
+        settings=settings,
+        client=vision_fetch_http,
+        model_client=client_registry.get("vision"),
+    )
     stream_hub = StreamHub()
+
+    docker = DockerRuntime()
 
     # Build lifecycle first so graph node factories can receive the shared instance.
     model_lifecycle = ModelLifecycle(
         settings=settings,
         models=model_manager,
-        ollama_client=ollama_client,
+        docker=docker,
     )
     model_lifecycle.start_background_cleanup()
 
@@ -384,24 +407,19 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         settings=settings,
         controller=controller,
         knowledge_client=knowledge_client,
-        ollama_client=ollama_client,
+        client_registry=client_registry,
         vision_pipeline=vision_pipeline,
         model_lifecycle=model_lifecycle,
         searxng_client=searxng_client,
     )
 
-
-
-
     runtime = OrchestratorRuntime(
-
         settings=settings,
         model_manager=model_manager,
         model_lifecycle=model_lifecycle,
         controller=controller,
-
         knowledge_client=knowledge_client,
-        ollama_client=ollama_client,
+        client_registry=client_registry,
         vision_pipeline=vision_pipeline,
         stream_hub=stream_hub,
         graph=graph,

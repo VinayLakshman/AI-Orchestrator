@@ -7,7 +7,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ..clients.ollama import OllamaClient
 from ..common.enums import ChatRole
 from ..logging import get_logger
 from ..models.chat import ChatMessage
@@ -405,7 +404,7 @@ async def resolve_conversation_context(
     *,
     settings: Settings,
     model_manager: ModelManager,
-    ollama_client: OllamaClient,
+    client_registry: Any,
 ) -> ResolverResult:
     original_query = str(request.original_query or request.user_message or "").strip()
     resolution = ConversationResolution(
@@ -467,7 +466,7 @@ async def resolve_conversation_context(
     )
 
     try:
-        response = await ollama_client.chat(
+        response = await client_registry.get("controller").chat(
             model=model_manager.controller().name,
             messages=messages,
             temperature=0.0,

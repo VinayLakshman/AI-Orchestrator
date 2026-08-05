@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
+import httpx
 
 from ..logging import get_logger
-from ..models.chat import ChatMessage
-from ..common.enums import ChatRole
-from ..models.manager import ManagedModel, ModelManager
+from ..models.manager import ModelManager
 from ..settings import Settings
+from .docker_runtime import DockerRuntime, DockerError
 from .model_catalog import CODER, CONTROLLER, REASONING, VISION, ModelPolicy
 
 logger = get_logger(__name__)
@@ -26,20 +27,17 @@ class ModelRuntimeState:
     role: str
     name: str
 
-    # State machine
-    # COLD -> LOADING -> WARM -> IDLE -> UNLOADED
+    # Explicit state machine:
+    # UNLOADED -> STARTING -> WARM -> IDLE -> STOPPING -> UNLOADED
 
-    status: str = "COLD"
+    status: str = "UNLOADED"
 
     # Timestamps
     last_used_at: float | None = None
     keep_warm_until: float | None = None
 
-    # Async coordination
-    pending_load_task: asyncio.Task[None] | None = None
-
     # Active inference tracking.
-    # Eviction is only allowed when this count is zero.
+    # Stopping/eviction is only allowed when this count is zero.
     active_inference_count: int = 0
 
     # Used for informational/logging.
@@ -47,9 +45,8 @@ class ModelRuntimeState:
     touch_invocations: int = 0
 
 
-
 def _parse_keep_alive_seconds(value: str) -> int:
-    """Parse ollama-like keep_alive values (e.g. "30m", "15s", "3600")."""
+    """Parse residency keep-alive values (e.g. "30m", "15s", "3600")."""
     if value is None:
         return 0
     text = str(value).strip().lower()
@@ -77,12 +74,14 @@ def _parse_keep_alive_seconds(value: str) -> int:
 
 
 class ModelLifecycle:
-    """Model residency + warm-state manager.
+    """Model residency + warm-state manager backed by Docker containers.
 
     Important:
-    - No inference/prompting beyond a minimal warm-up call.
+    - No inference/prompting beyond a minimal start/health cycle.
     - No orchestration logic.
-    - Avoids duplicate loads via pending_load_task.
+    - Treats Docker as the source of truth; reconciles internal state.
+    - Uses a per-model lifecycle lock so different models can start
+      concurrently while a single model can only ever start once.
     """
 
     def __init__(
@@ -90,13 +89,13 @@ class ModelLifecycle:
         *,
         settings: Settings,
         models: ModelManager,
-        ollama_client: Any,
+        docker: DockerRuntime,
         catalog_overrides: dict[str, ModelPolicy] | None = None,
         poll_interval_s: float = 60.0,
     ) -> None:
         self.settings = settings
         self.models = models
-        self.ollama = ollama_client
+        self.docker = docker
         self._poll_interval_s = poll_interval_s
 
         self._catalog: dict[str, ModelPolicy] = {
@@ -123,7 +122,6 @@ class ModelLifecycle:
             can_evict=self._catalog["reasoning"].can_evict,
             preload_enabled=self._catalog["reasoning"].preload_enabled,
         )
-        # Coder/vision keep-alive are now explicit settings.
         self._catalog["coder"] = ModelPolicy(
             role="coder",
             priority=self._catalog["coder"].priority,
@@ -139,10 +137,31 @@ class ModelLifecycle:
             preload_enabled=self._catalog["vision"].preload_enabled,
         )
 
-        self._lock = asyncio.Lock()
+        # Lock protecting the runtime-state dict and per-role state fields for
+        # brief mutations (inference counters, touch, keep_warm, transitions).
+        self._state_lock = asyncio.Lock()
+
+        # Lock protecting the per-model lock registry itself (held only briefly
+        # to look up or create a role's lock).
+        self._registry_lock = asyncio.Lock()
+
+        # Per-model lifecycle locks. Warming/stopping a specific model is
+        # serialized under its own lock so only one startup / health poll /
+        # transition occurs per model, while different models use independent
+        # locks and can proceed concurrently.
+        self._locks: dict[str, asyncio.Lock] = {}
+
         self._runtime: dict[str, ModelRuntimeState] = {}
         self._closing = False
         self._cleanup_task: asyncio.Task[None] | None = None
+
+    async def _get_lock(self, role: str) -> asyncio.Lock:
+        async with self._registry_lock:
+            lock = self._locks.get(role)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[role] = lock
+            return lock
 
     def start_background_cleanup(self) -> None:
         if self._cleanup_task is not None:
@@ -150,11 +169,38 @@ class ModelLifecycle:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def close(self) -> None:
+        """Gracefully stop the lifecycle.
+
+        Cancels the background cleanup loop and stops any containers that
+        are still running so no orphaned Docker operations remain.
+        """
         self._closing = True
         if self._cleanup_task is not None:
             self._cleanup_task.cancel()
-            with asyncio.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._cleanup_task
+
+        # Stop any containers still believed to be warm/idle/starting/stopping.
+        async with self._state_lock:
+            roles = list(self._runtime.keys())
+        for role in roles:
+            lock = await self._get_lock(role)
+            async with lock:
+                async with self._state_lock:
+                    st = self._runtime.get(role)
+                    if st is None or st.status not in {"WARM", "IDLE", "STARTING", "STOPPING"}:
+                        continue
+                container_name = self.models.container_for_role(role)
+                with contextlib.suppress(Exception):
+                    await self.docker.stop(container_name)
+                with contextlib.suppress(Exception):
+                    await self.docker.wait_stopped(container_name, timeout_s=self.settings.health_timeout_s)
+                async with self._state_lock:
+                    state = self._runtime.get(role)
+                    if state is not None:
+                        state.status = "UNLOADED"
+                        state.keep_warm_until = None
+                logger.info("model_container_stopped_on_shutdown role=%s container=%s", role, container_name)
 
     def _ensure_state(self, role: str, name: str) -> ModelRuntimeState:
         existing = self._runtime.get(role)
@@ -167,108 +213,136 @@ class ModelLifecycle:
     def _policy(self, role: str) -> ModelPolicy:
         return self._catalog[role]
 
-    def _model_managed(self, role: str) -> ManagedModel:
-        if role == "controller":
-            return self.models.controller()
-        if role == "reasoning":
-            return self.models.reasoning()
-        if role == "coder":
-            return self.models.coder()
-        if role == "vision":
-            return self.models.vision()
-        raise KeyError(f"Unknown model role: {role}")
+    def _model_managed(self, role: str) -> Any:
+        return self.models.__getattribute__(role)()
+
+    async def _is_healthy(self, role: str) -> bool:
+        """Check the container's /health endpoint with an explicit timeout."""
+        endpoint = self.models.endpoint_for_role(role).rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.health_timeout_s) as client:
+                resp = await client.get(f"{endpoint}/health")
+                return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def _start_container(self, role: str) -> None:
+        container_name = self.models.container_for_role(role)
+        await self.docker.start(container_name)
+
+    async def _wait_healthy(self, role: str) -> None:
+        """Poll /health until ready or timeout."""
+        deadline = asyncio.get_running_loop().time() + self.settings.health_timeout_s
+        interval = self.settings.health_poll_interval_s
+        while True:
+            if await self._is_healthy(role):
+                logger.info("model_health_ok role=%s", role)
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise LifecycleError(f"Health check timed out for model role: {role}")
+            await asyncio.sleep(interval)
+
+    async def _reconcile(self, role: str) -> bool:
+        """Return True if the container is running and healthy.
+
+        Docker is the source of truth. This performs network/docker I/O and
+        must not be called while holding self._state_lock.
+        """
+        container_name = self.models.container_for_role(role)
+        status = await self.docker.status(container_name)
+        if not status.exists:
+            return False
+
+        if not status.running:
+            return False
+
+        if not await self._is_healthy(role):
+            return False
+
+        return True
 
     async def ensure_warm(self, role: str) -> None:
-        """Make sure the model is warm before use."""
-        role = role.lower().strip()
-        async with self._lock:
-            model = self._model_managed(role)
-            state = self._ensure_state(role, model.name)
+        """Make sure the model is warm before use.
 
-            policy = self._policy(role)
-            now = time.time()
-
-            if state.status in {"WARM"} and state.keep_warm_until and state.keep_warm_until > now:
-
-                logger.info("model_already_warm role=%s model=%s status=%s", role, state.name, state.status)
-                state.status = "WARM"
-                state.last_used_at = now
-
-                state.touch_invocations += 1
-                state.keep_warm_until = now + policy.keep_alive_seconds
-                return
-
-            if state.status == "LOADING" and state.pending_load_task is not None:
-                logger.info("model_already_loading role=%s model=%s", role, state.name)
-                task = state.pending_load_task
-            else:
-                state.status = "LOADING"
-                state.pending_load_task = asyncio.create_task(self._warm_impl(role))
-                state.warm_invocations += 1
-                task = state.pending_load_task
-                logger.info("model_loading_started role=%s model=%s", role, state.name)
-
-        # Await outside lock.
-        try:
-            await task
-        except Exception as exc:
-            logger.exception("model_loading_failed role=%s model=%s", role, state.name)
-            raise LifecycleError(str(exc)) from exc
-
-        async with self._lock:
-            # state should now be WARM
-            state = self._runtime[role]
-            policy = self._policy(role)
-            state.status = "WARM"
-            state.last_used_at = time.time()
-
-            state.keep_warm_until = state.last_used_at + policy.keep_alive_seconds
-            state.touch_invocations += 1
-
-    async def _warm_impl(self, role: str) -> None:
-        """Warm up the model.
-
-        For now we rely on a minimal Ollama chat call.
-        This is the only place lifecycle manager interacts with LLMs.
+        Serialized per model via its own lifecycle lock: only one startup,
+        one health-polling loop, and one transition per model can occur at a
+        time. Different models use independent locks and can warm concurrently.
         """
+        role = role.lower().strip()
+        lock = await self._get_lock(role)
+        async with lock:
+            await self._ensure_warm_locked(role)
+
+    async def _ensure_warm_locked(self, role: str) -> None:
         model = self._model_managed(role)
         policy = self._policy(role)
 
-        # Warm-up prompt: keep it short and generic.
-        # Controller warm-up is handled separately by existing warm_controller()
-        # to preserve existing behavior exactly.
-        if role == "controller":
-            # Should never happen because controller is kept resident.
-            await self.ollama.chat(
-                model=model.name,
-                messages=[
-                    ChatMessage(role=ChatRole.SYSTEM, content="You are a resident controller. Reply with OK."),
-                    ChatMessage(role=ChatRole.USER, content="Warm up and stay resident."),
-                ],
-                temperature=0.0,
-                max_tokens=4,
-                stream=False,
-                keep_alive=self.settings.controller_keep_alive,
-            )
-        else:
-            await self.ollama.chat(
-                model=model.name,
-                messages=[
-                    ChatMessage(role=ChatRole.SYSTEM, content="Warm the model. Respond with OK."),
-                    ChatMessage(role=ChatRole.USER, content="Warm up"),
-                ],
-                temperature=0.0,
-                max_tokens=4,
-                stream=False,
-                # keep_alive handled by residency policy once ACTIVE/keep_warm_until is set.
-                keep_alive=str(policy.keep_alive_seconds) + "s",
+        # Fast path: if we believe the model is warm, reconcile against Docker
+        # (the source of truth). Never trust stale in-memory state.
+        async with self._state_lock:
+            state = self._ensure_state(role, model.name)
+            warm = (
+                state.status in {"WARM", "IDLE"}
+                and state.keep_warm_until is not None
+                and state.keep_warm_until > time.time()
             )
 
-        async with self._lock:
+        if warm:
+            healthy = await self._reconcile(role)
+            if healthy:
+                async with self._state_lock:
+                    state = self._runtime[role]
+                    state.status = "WARM"
+                    state.last_used_at = time.time()
+                    state.touch_invocations += 1
+                    state.keep_warm_until = time.time() + policy.keep_alive_seconds
+                logger.info("model_already_warm role=%s model=%s status=%s", role, state.name, "WARM")
+                return
+
+            # Container is down; repair stale state and fall through to restart.
+            async with self._state_lock:
+                state = self._runtime[role]
+                state.status = "UNLOADED"
+                state.keep_warm_until = None
+            logger.info("model_warm_stale_reconcile role=%s model=%s", role, state.name)
+
+        # Acquire the STARTING transition (guarded by the per-model lock held
+        # by the caller, plus the state lock for the dict mutation).
+        async with self._state_lock:
             state = self._runtime[role]
-            state.status = "WARM"
-            state.pending_load_task = None
-            logger.info("model_became_warm role=%s model=%s", role, state.name)
+            if state.status == "STARTING":
+                logger.info("model_already_starting role=%s model=%s", role, state.name)
+                return
+            state.status = "STARTING"
+            state.warm_invocations += 1
+        logger.info("model_starting_started role=%s model=%s", role, state.name)
+
+        container_name = self.models.container_for_role(role)
+        try:
+            await self._start_container(role)
+            await self._wait_healthy(role)
+        except Exception as exc:
+            # Startup failed: stop the container and clear runtime state so no
+            # partially-initialized model is ever left behind.
+            logger.error("container_start_failed role=%s model=%s container=%s", role, state.name, container_name)
+            with contextlib.suppress(Exception):
+                await self.docker.stop(container_name)
+            async with self._state_lock:
+                st = self._runtime.get(role)
+                if st is not None:
+                    st.status = "UNLOADED"
+            logger.exception("model_start_failed role=%s model=%s", role, state.name)
+            raise LifecycleError(str(exc)) from exc
+
+        async with self._state_lock:
+            st = self._runtime.get(role)
+            if st is None:
+                st = self._ensure_state(role, model.name)
+            st.status = "WARM"
+            st.last_used_at = time.time()
+            st.keep_warm_until = st.last_used_at + policy.keep_alive_seconds
+            st.touch_invocations += 1
+        logger.info("model_became_warm role=%s model=%s", role, model.name)
 
     def touch(self, role: str) -> None:
         """Extend keep-warm window based on last usage."""
@@ -277,7 +351,7 @@ class ModelLifecycle:
 
         # touch is sync for ease of integration; schedule coroutine under the hood.
         async def _touch() -> None:
-            async with self._lock:
+            async with self._state_lock:
                 if role not in self._runtime:
                     return
                 policy = self._policy(role)
@@ -287,13 +361,12 @@ class ModelLifecycle:
                 state.status = "IDLE"
                 state.touch_invocations += 1
 
-
         asyncio.create_task(_touch())
 
     async def keep_warm(self, role: str) -> None:
         """Mark model as IDLE but not evictable until keep_alive expires."""
         role = role.lower().strip()
-        async with self._lock:
+        async with self._state_lock:
             if role not in self._runtime:
                 return
             state = self._runtime[role]
@@ -313,54 +386,46 @@ class ModelLifecycle:
         async def _preload() -> None:
             try:
                 await self.ensure_warm(role)
-                async with self._lock:
+                async with self._state_lock:
                     state = self._runtime[role]
-                    # keep it warm but not ACTIVE
                     state.status = "IDLE"
                 logger.info("model_preload_finished role=%s model=%s", role, self._runtime[role].name)
             except Exception:
                 logger.exception("model_preload_failed role=%s", role)
 
-        async def _kickoff() -> None:
-            async with self._lock:
-                model = self._model_managed(role)
-                state = self._ensure_state(role, model.name)
-                if state.status == "COLD":
-                    state.status = "LOADING"
-                    if state.pending_load_task is None:
-                        logger.info("model_preload_started role=%s model=%s", role, state.name)
-                        state.pending_load_task = asyncio.create_task(_preload())
-
-        asyncio.create_task(_kickoff())
+        asyncio.create_task(_preload())
 
     async def _begin_inference(self, role: str) -> None:
         role = role.lower().strip()
-        async with self._lock:
-            state = self._runtime.get(role)
-            if state is None:
-                # Inference without warm: create state to keep counters consistent.
-                state = self._ensure_state(role, self._model_managed(role).name)
-            state.active_inference_count += 1
-            logger.info(
-                "model_inference_started role=%s model=%s active_inference_count=%d",
-                role,
-                state.name,
-                state.active_inference_count,
-            )
+        lock = await self._get_lock(role)
+        async with lock:
+            async with self._state_lock:
+                state = self._runtime.get(role)
+                if state is None:
+                    state = self._ensure_state(role, self._model_managed(role).name)
+                state.active_inference_count += 1
+                logger.info(
+                    "model_inference_started role=%s model=%s active_inference_count=%d",
+                    role,
+                    state.name,
+                    state.active_inference_count,
+                )
 
     async def _end_inference(self, role: str) -> None:
         role = role.lower().strip()
-        async with self._lock:
-            state = self._runtime.get(role)
-            if state is None:
-                return
-            state.active_inference_count = max(0, state.active_inference_count - 1)
-            logger.info(
-                "model_inference_finished role=%s model=%s active_inference_count=%d",
-                role,
-                state.name,
-                state.active_inference_count,
-            )
+        lock = await self._get_lock(role)
+        async with lock:
+            async with self._state_lock:
+                state = self._runtime.get(role)
+                if state is None:
+                    return
+                state.active_inference_count = max(0, state.active_inference_count - 1)
+                logger.info(
+                    "model_inference_finished role=%s model=%s active_inference_count=%d",
+                    role,
+                    state.name,
+                    state.active_inference_count,
+                )
 
     def active_inference(self, role: str):
         """Async context manager protecting against eviction during inference."""
@@ -373,16 +438,20 @@ class ModelLifecycle:
         st = self._runtime.get(role)
         if st is None:
             return False
-        return st.status in {"WARM", "IDLE", "LOADING"}
-
-
+        return st.status in {"WARM", "IDLE", "STARTING"}
 
     async def evict_if_needed(self) -> None:
-        """Evict models whose keep-warm window has expired."""
-        now = time.time()
-        candidates: list[ModelRuntimeState] = []
+        """Evict models whose keep-warm window has expired.
 
-        async with self._lock:
+        Candidates are collected under the state lock (briefly), then evicted
+        one at a time under each model's own lifecycle lock. This avoids
+        holding a global lock during container I/O and lets eviction and
+        inference for the same model serialize safely.
+        """
+        now = time.time()
+        candidates: list[str] = []
+
+        async with self._state_lock:
             for role, state in self._runtime.items():
                 if state.status not in {"IDLE", "WARM"}:
                     continue
@@ -399,78 +468,60 @@ class ModelLifecycle:
                         state.active_inference_count,
                     )
                     continue
-                candidates.append(state)
-
+                candidates.append(role)
 
         # Evict lowest priority first
-        candidates.sort(key=lambda s: self._policy(s.role).priority)
+        candidates.sort(key=lambda role: self._policy(role).priority)
 
-        for state in candidates:
-            await self._evict(role=state.role)
+        for role in candidates:
+            await self._evict(role=role)
 
     async def _evict(self, role: str) -> None:
-        async with self._lock:
-            state = self._runtime.get(role)
-            if state is None:
-                return
-            policy = self._policy(role)
+        lock = await self._get_lock(role)
+        async with lock:
+            async with self._state_lock:
+                state = self._runtime.get(role)
+                if state is None:
+                    return
+                policy = self._policy(role)
 
-            if not policy.can_evict:
-                return
-            now = time.time()
-            if state.keep_warm_until is not None and state.keep_warm_until > now:
-                logger.info("model_eviction_skipped role=%s model=%s still_warm", role, state.name)
-                return
-            if state.status == "LOADING" and state.pending_load_task is not None:
-                # avoid interrupting load
-                return
-            state.status = "EVICTABLE"
+                if not policy.can_evict:
+                    return
+                now = time.time()
+                if state.keep_warm_until is not None and state.keep_warm_until > now:
+                    logger.info("model_eviction_skipped role=%s model=%s still_warm", role, state.name)
+                    return
+                if state.status in {"STARTING", "STOPPING"}:
+                    return
+                if state.active_inference_count > 0:
+                    logger.info(
+                        "model_eviction_skipped_active_inference role=%s model=%s active_inference_count=%d",
+                        role,
+                        state.name,
+                        state.active_inference_count,
+                    )
+                    return
+                state.status = "STOPPING"
             logger.info("model_eviction_started role=%s model=%s", role, state.name)
 
-        # Best-effort: ask Ollama to unload model.
-        # Ollama supports /api/unload; this client doesn't wrap it yet.
-        # We call via a raw endpoint if available through client transport.
-        try:
-            await self._call_unload_model(state.name)
-        except Exception:
-            logger.exception("model_eviction_failed role=%s model=%s", role, state.name)
-            async with self._lock:
-                state = self._runtime.get(role)
-                if state is not None:
-                    state.status = "IDLE"
-            return
+            container_name = self.models.container_for_role(role)
+            try:
+                await self.docker.stop(container_name)
+                await self.docker.wait_stopped(container_name, timeout_s=self.settings.health_timeout_s)
+            except Exception:
+                logger.exception("model_eviction_failed role=%s model=%s", role, state.name)
+                async with self._state_lock:
+                    st = self._runtime.get(role)
+                    if st is not None:
+                        st.status = "IDLE"
+                return
 
-        async with self._lock:
-            state = self._runtime.get(role)
-            if state is not None:
-                state.status = "UNLOADED"
-                state.pending_load_task = None
-                state.keep_warm_until = None
-            logger.info("model_evicted role=%s model=%s", role, state.name if state else "")
-
-    async def _call_unload_model(self, model_name: str) -> None:
-        """Attempt to unload a model.
-
-        The current OllamaClient doesn't provide an explicit unload API.
-        This lifecycle manager is isolated from orchestration; eviction is
-        best-effort. If the endpoint isn't available, eviction becomes a
-        no-op.
-        """
-        # Preferred: if underlying client exposes httpx AsyncClient at .client
-        raw_client = getattr(self.ollama, "client", None)
-        base_url = getattr(self.ollama.settings, "ollama_base_url", None) if hasattr(self.ollama, "settings") else None
-
-        if raw_client is None or base_url is None:
-            # No transport; no-op.
-            return
-
-        # Construct request directly.
-        # Note: Ollama API: POST /api/unload {"name": "model"}
-        resp = await raw_client.post(
-            "/api/unload",
-            json={"name": model_name},
-        )
-        resp.raise_for_status()
+            async with self._state_lock:
+                st = self._runtime.get(role)
+                if st is not None:
+                    st.status = "UNLOADED"
+                    st.keep_warm_until = None
+                logger.info("model_evicted role=%s model=%s", role, st.name if st else "")
 
     async def _cleanup_loop(self) -> None:
         while not self._closing:
@@ -481,4 +532,3 @@ class ModelLifecycle:
                 raise
             except Exception:
                 logger.exception("model_lifecycle_cleanup_loop_error")
-
