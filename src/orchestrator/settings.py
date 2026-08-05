@@ -38,19 +38,19 @@ class Settings(BaseSettings):
     # server container exposing an OpenAI-compatible API.
     models: dict[str, LlamaCppModelConfig] = {
         "controller": LlamaCppModelConfig(
-            endpoint="http://llama-controller:8081",
+            endpoint="http://llama-controller:8080",
             container_name="llama-controller",
         ),
         "reasoning": LlamaCppModelConfig(
-            endpoint="http://llama-reasoning:8082",
+            endpoint="http://llama-reasoning:8080",
             container_name="llama-reasoning",
         ),
         "coder": LlamaCppModelConfig(
-            endpoint="http://llama-coder:8083",
+            endpoint="http://llama-coder:8080",
             container_name="llama-coder",
         ),
         "vision": LlamaCppModelConfig(
-            endpoint="http://llama-vision:8084",
+            endpoint="http://llama-vision:8080",
             container_name="llama-vision",
         ),
     }
