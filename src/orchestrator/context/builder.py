@@ -482,46 +482,73 @@ def build_controller_messages(
     structured_context: str = "",
     additional_context: str = "",
 ) -> list[ChatMessage]:
-    history_messages, latest_user_message, conversation_info = _build_conversation_history(messages)
-    outgoing: list[ChatMessage] = [ChatMessage(role=ChatRole.SYSTEM, content=system_prompt)]
+    """
+    Build the controller conversation.
 
-    if request_context:
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "request_context"},
-                content=request_context,
+    Exactly one SYSTEM message is emitted. All orchestration metadata is merged
+    into that message to remain compatible with llama.cpp, Qwen, Llama, Gemma,
+    Mistral and OpenAI-compatible chat APIs.
+    """
+
+    history_messages, latest_user_message, conversation_info = (
+        _build_conversation_history(messages)
+    )
+
+    system_sections: list[str] = [system_prompt.strip()]
+
+    def append_section(title: str, content: str) -> None:
+        content = content.strip()
+        if not content:
+            return
+
+        # Pretty-print JSON when possible for readability.
+        try:
+            parsed = json.loads(content)
+            content = json.dumps(
+                parsed,
+                indent=2,
+                ensure_ascii=False,
             )
+        except Exception:
+            pass
+
+        system_sections.append(
+            f"""## {title}
+
+{content}"""
         )
 
-    if structured_context:
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "structured_context"},
-                content=structured_context,
-            )
-        )
+    append_section("Request Context", request_context)
+    append_section("Structured Context", structured_context)
+    append_section("Additional Context", additional_context)
 
-    if additional_context:
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "additional_context"},
-                content=additional_context,
-            )
+    outgoing: list[ChatMessage] = [
+        ChatMessage(
+            role=ChatRole.SYSTEM,
+            content="\n\n".join(system_sections),
         )
+    ]
 
     outgoing.extend(history_messages)
-    outgoing.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
+
+    if latest_user_message:
+        outgoing.append(
+            ChatMessage(
+                role=ChatRole.USER,
+                content=latest_user_message,
+            )
+        )
 
     logger.debug(
         "conversation_assembly %s",
-        json.dumps(conversation_info, sort_keys=True, default=str),
+        json.dumps(
+            conversation_info,
+            sort_keys=True,
+            default=str,
+        ),
     )
 
     return outgoing
-
 
 def build_finalizer_messages(
     *,
