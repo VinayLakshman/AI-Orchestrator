@@ -99,6 +99,10 @@ class ModelLifecycle:
     - Docker is treated as the source of truth; stale in-memory state is reconciled.
     - Per-model locks allow different models to warm concurrently while a single
       model can only transition once at a time.
+    - Multiple logical roles may map to the same physical container. Runtime
+      state remains tracked per logical role, while Docker operations
+      (start/stop/health/reconcile/shutdown) are serialized once per unique
+      container.
     """
 
     def __init__(
@@ -163,6 +167,14 @@ class ModelLifecycle:
         # Per-role lifecycle locks.
         self._locks: dict[str, asyncio.Lock] = {}
 
+        # Protects the per-container lock registry.
+        self._container_registry_lock = asyncio.Lock()
+
+        # Per-container locks serialize Docker operations so multiple logical
+        # roles mapping to the same physical container do not issue duplicate
+        # start/stop/health/shutdown commands.
+        self._container_locks: dict[str, asyncio.Lock] = {}
+
         # Runtime state for each model role.
         self._runtime: dict[str, ModelRuntimeState] = {}
 
@@ -176,6 +188,14 @@ class ModelLifecycle:
             if lock is None:
                 lock = asyncio.Lock()
                 self._locks[role] = lock
+            return lock
+
+    async def _get_container_lock(self, container_name: str) -> asyncio.Lock:
+        async with self._container_registry_lock:
+            lock = self._container_locks.get(container_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._container_locks[container_name] = lock
             return lock
 
     def start_background_cleanup(self) -> None:
@@ -221,7 +241,9 @@ class ModelLifecycle:
         """Gracefully stop the lifecycle.
 
         Cancels the background cleanup loop and stops any containers that are
-        still tracked as active so no orphaned Docker operations remain.
+        still tracked as active so no orphaned Docker operations remain. Each
+        unique physical container is stopped at most once, even when multiple
+        logical roles share it.
         """
         self._closing = True
 
@@ -234,28 +256,32 @@ class ModelLifecycle:
         async with self._state_lock:
             roles = list(self._runtime.keys())
 
-        for role in roles:
-            lock = await self._get_lock(role)
-            async with lock:
-                async with self._state_lock:
-                    st = self._runtime.get(role)
-                    if st is None or st.status not in {
-                        LifecycleState.WARM,
-                        LifecycleState.IDLE,
-                        LifecycleState.STARTING,
-                        LifecycleState.STOPPING,
-                    }:
-                        continue
-                    st.status = LifecycleState.STOPPING
+        containers = {self.models.container_for_role(role) for role in roles}
 
-                container_name = self.models.container_for_role(role)
+        for container_name in containers:
+            container_lock = await self._get_container_lock(container_name)
+            async with container_lock:
+                async with self._state_lock:
+                    for role in roles:
+                        if self.models.container_for_role(role) != container_name:
+                            continue
+                        st = self._runtime.get(role)
+                        if st is None or st.status not in {
+                            LifecycleState.WARM,
+                            LifecycleState.IDLE,
+                            LifecycleState.STARTING,
+                            LifecycleState.STOPPING,
+                        }:
+                            continue
+                        st.status = LifecycleState.STOPPING
+
                 try:
                     await asyncio.wait_for(
                         self.docker.stop(container_name),
                         timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
                     )
                 except Exception:
-                    logger.exception("model_container_stop_failed_on_shutdown role=%s container=%s", role, container_name)
+                    logger.exception("model_container_stop_failed_on_shutdown container=%s", container_name)
 
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(
@@ -267,12 +293,15 @@ class ModelLifecycle:
                     )
 
                 async with self._state_lock:
-                    state = self._runtime.get(role)
-                    if state is not None:
-                        state.status = LifecycleState.UNLOADED
-                        state.keep_warm_until = None
+                    for role in roles:
+                        if self.models.container_for_role(role) != container_name:
+                            continue
+                        state = self._runtime.get(role)
+                        if state is not None:
+                            state.status = LifecycleState.UNLOADED
+                            state.keep_warm_until = None
 
-                logger.info("model_container_stopped_on_shutdown role=%s container=%s", role, container_name)
+                logger.info("model_container_stopped_on_shutdown container=%s", container_name)
 
         await self._close_health_client()
 
@@ -394,6 +423,26 @@ class ModelLifecycle:
             return False
         return await self._probe_health(role)
 
+    async def _sibling_roles_active(self, container_name: str, *, exclude_role: str) -> bool:
+        """Return True if any role other than exclude_role still maps to the
+        given container and is in an active (keep-alive) runtime state.
+
+        Must not be called while holding self._state_lock.
+        """
+        async with self._state_lock:
+            for role, st in self._runtime.items():
+                if role == exclude_role:
+                    continue
+                if self.models.container_for_role(role) != container_name:
+                    continue
+                if st.status in {
+                    LifecycleState.WARM,
+                    LifecycleState.IDLE,
+                    LifecycleState.STARTING,
+                }:
+                    return True
+        return False
+
     async def ensure_warm(self, role: str) -> None:
         """Make sure the model is warm before use."""
         role = role.lower().strip()
@@ -434,30 +483,36 @@ class ModelLifecycle:
 
         logger.info("model_starting_started role=%s model=%s container=%s", role, state.name, container_name)
 
-        try:
-            await self._start_container(role)
-            await self._wait_healthy(role)
-        except Exception as exc:
-            # Startup failed: stop the container and clear runtime state so no
-            # partially-initialized model is ever left behind.
-            logger.error(
-                "container_start_failed role=%s model=%s container=%s",
-                role,
-                state.name,
-                container_name,
-            )
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(
-                    self.docker.stop(container_name),
-                    timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
+        # Serialize Docker start/health per unique container so sibling roles
+        # sharing the same physical backend do not trigger duplicate starts.
+        container_lock = await self._get_container_lock(container_name)
+        async with container_lock:
+            try:
+                # A sibling role may have already brought this container up.
+                if not await self._reconcile(role):
+                    await self._start_container(role)
+                    await self._wait_healthy(role)
+            except Exception as exc:
+                # Startup failed: stop the container and clear runtime state so no
+                # partially-initialized model is ever left behind.
+                logger.error(
+                    "container_start_failed role=%s model=%s container=%s",
+                    role,
+                    state.name,
+                    container_name,
                 )
-            async with self._state_lock:
-                st = self._runtime.get(role)
-                if st is not None:
-                    st.status = LifecycleState.UNLOADED
-                    st.keep_warm_until = None
-            logger.exception("model_start_failed role=%s model=%s", role, state.name)
-            raise LifecycleError(str(exc)) from exc
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        self.docker.stop(container_name),
+                        timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
+                    )
+                async with self._state_lock:
+                    st = self._runtime.get(role)
+                    if st is not None:
+                        st.status = LifecycleState.UNLOADED
+                        st.keep_warm_until = None
+                logger.exception("model_start_failed role=%s model=%s", role, state.name)
+                raise LifecycleError(str(exc)) from exc
 
         now = time.time()
         async with self._state_lock:
@@ -640,35 +695,70 @@ class ModelLifecycle:
             logger.info("model_eviction_started role=%s model=%s", role, state.name)
 
             container_name = self.models.container_for_role(role)
-            try:
-                await asyncio.wait_for(
-                    self.docker.stop(container_name),
-                    timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
+
+            # If a sibling logical role still needs this physical container,
+            # keep it running and only unload this role's runtime state.
+            if await self._sibling_roles_active(container_name, exclude_role=role):
+                async with self._state_lock:
+                    st = self._runtime.get(role)
+                    if st is not None:
+                        st.status = LifecycleState.UNLOADED
+                        st.keep_warm_until = None
+                logger.info(
+                    "model_evicted_shared_container_kept role=%s model=%s container=%s",
+                    role,
+                    state.name,
+                    container_name,
                 )
-                await asyncio.wait_for(
-                    self.docker.wait_stopped(
-                        container_name,
-                        timeout_s=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
-                    ),
-                    timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
-                )
-            except Exception:
-                logger.exception("model_eviction_failed role=%s model=%s", role, state.name)
-                # Reconcile with actual Docker state so runtime isn't left stale.
-                try:
-                    status = await self.docker.status(container_name)
+                return
+
+            container_lock = await self._get_container_lock(container_name)
+            async with container_lock:
+                # Re-check after acquiring the container lock in case a sibling
+                # role warmed up the shared container while we were waiting.
+                if await self._sibling_roles_active(container_name, exclude_role=role):
                     async with self._state_lock:
                         st = self._runtime.get(role)
                         if st is not None:
-                            if status.running:
-                                st.status = LifecycleState.WARM
-                            elif status.exists:
-                                st.status = LifecycleState.IDLE
-                            else:
-                                st.status = LifecycleState.UNLOADED
+                            st.status = LifecycleState.UNLOADED
+                            st.keep_warm_until = None
+                    logger.info(
+                        "model_evicted_shared_container_kept role=%s model=%s container=%s",
+                        role,
+                        state.name,
+                        container_name,
+                    )
+                    return
+
+                try:
+                    await asyncio.wait_for(
+                        self.docker.stop(container_name),
+                        timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
+                    )
+                    await asyncio.wait_for(
+                        self.docker.wait_stopped(
+                            container_name,
+                            timeout_s=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
+                        ),
+                        timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
+                    )
                 except Exception:
-                    pass
-                return
+                    logger.exception("model_eviction_failed role=%s model=%s", role, state.name)
+                    # Reconcile with actual Docker state so runtime isn't left stale.
+                    try:
+                        status = await self.docker.status(container_name)
+                        async with self._state_lock:
+                            st = self._runtime.get(role)
+                            if st is not None:
+                                if status.running:
+                                    st.status = LifecycleState.WARM
+                                elif status.exists:
+                                    st.status = LifecycleState.IDLE
+                                else:
+                                    st.status = LifecycleState.UNLOADED
+                    except Exception:
+                        pass
+                    return
 
             async with self._state_lock:
                 st = self._runtime.get(role)

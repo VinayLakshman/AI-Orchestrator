@@ -359,15 +359,22 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         timeout=settings.request_timeout_s,
     )
 
-    # Build one llama.cpp client per model role, each pointed at its own container.
+    # Build one llama.cpp client per physical backend container. The reasoning
+    # and coder logical roles resolve to the same llama-expert backend, so they
+    # reuse a single shared client instance.
     client_registry = ClientRegistry()
-    for role in ("controller", "reasoning", "coder", "vision"):
-        endpoint = settings.models[role].endpoint
+
+    def _register_client(roles: tuple[str, ...], *, endpoint: str) -> None:
         client = LlamaCppClient(
             settings=settings,
             base_url=endpoint,
         )
-        client_registry.register(role, client)
+        for role in roles:
+            client_registry.register(role, client)
+
+    _register_client(("controller",), endpoint=settings.models["controller"].endpoint)
+    _register_client(("reasoning", "coder"), endpoint=settings.models["reasoning"].endpoint)
+    _register_client(("vision",), endpoint=settings.models["vision"].endpoint)
 
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
 

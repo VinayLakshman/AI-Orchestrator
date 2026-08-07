@@ -30,27 +30,28 @@ class Settings(BaseSettings):
     port: int = 8001
 
     # Llama CPP default base URL (fallback when no per-model endpoint is set).
-    llama_cpp_base_url: str = "http://llama-controller:8081"
+    llama_cpp_base_url: str = "http://llama-expert:8080"
     llama_controller_model: str = "controller"
     llama_cpp_api_key: str | None = None
 
-    # Structured per-role model configuration. Each role runs its own llama.cpp
-    # server container exposing an OpenAI-compatible API.
+    # Structured per-role model configuration. The reasoning and coder logical
+    # roles share the same physical llama-expert backend container exposing an
+    # OpenAI-compatible API. The vision role runs its own container.
     models: dict[str, LlamaCppModelConfig] = {
         "controller": LlamaCppModelConfig(
             endpoint="http://llama-controller:8080",
             container_name="llama-controller",
         ),
         "reasoning": LlamaCppModelConfig(
-            endpoint="http://llama-reasoning:8080",
-            container_name="llama-reasoning",
+            endpoint="http://llama-expert:8080",
+            container_name="llama-expert",
         ),
         "coder": LlamaCppModelConfig(
-            endpoint="http://llama-coder:8080",
-            container_name="llama-coder",
+            endpoint="http://llama-expert:8080",
+            container_name="llama-expert",
         ),
         "vision": LlamaCppModelConfig(
-            endpoint="http://llama-vision:8080",
+            endpoint="http://llama-vision:8083",
             container_name="llama-vision",
         ),
     }
