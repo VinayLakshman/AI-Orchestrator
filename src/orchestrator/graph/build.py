@@ -387,7 +387,21 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         searxng_client = SearXNGClient(settings=settings, client=web_http)
 
     model_manager = ModelManager(settings=settings, client_registry=client_registry)
-    controller = ControllerEngine(settings=settings, models=model_manager)
+
+    # Build lifecycle first so the controller engine can re-warm the (transient)
+    # controller before each direct controller-client call.
+    docker = DockerRuntime()
+    model_lifecycle = ModelLifecycle(
+        settings=settings,
+        models=model_manager,
+        docker=docker,
+    )
+
+    controller = ControllerEngine(
+        settings=settings,
+        models=model_manager,
+        lifecycle=model_lifecycle,
+    )
 
     vision_fetch_http = httpx.AsyncClient(
         base_url=settings.vision_fetch_base_url,
@@ -400,14 +414,6 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     )
     stream_hub = StreamHub()
 
-    docker = DockerRuntime()
-
-    # Build lifecycle first so graph node factories can receive the shared instance.
-    model_lifecycle = ModelLifecycle(
-        settings=settings,
-        models=model_manager,
-        docker=docker,
-    )
     model_lifecycle.start_background_cleanup()
 
     graph, checkpointer = build_graph(

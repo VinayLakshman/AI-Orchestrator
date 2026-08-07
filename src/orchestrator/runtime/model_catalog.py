@@ -34,7 +34,11 @@ class ModelPolicy:
     preload_enabled: bool
 
 
-# Controller is expected to remain resident.
+# Controller is no longer permanently resident. GPU residency is now exclusive
+# and transient — only ONE llama.cpp container owns GPU memory at a time. The
+# lifecycle manager re-warms the controller before each direct controller-client
+# call. `can_evict=False` here merely prevents idle eviction from racing that
+# re-warm path; it does not keep the controller resident alongside specialists.
 CONTROLLER: Final[ModelPolicy] = ModelPolicy(
     role="controller",
     priority=100,

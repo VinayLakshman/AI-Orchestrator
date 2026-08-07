@@ -103,6 +103,10 @@ class ModelLifecycle:
       state remains tracked per logical role, while Docker operations
       (start/stop/health/reconcile/shutdown) are serialized once per unique
       container.
+    - GPU residency is exclusive: exactly ONE llama.cpp container may own the
+      GPU at a time. The lifecycle manager transfers GPU ownership between
+      containers on demand (expert/vision/controller are transient, never
+      simultaneously resident).
     """
 
     def __init__(
@@ -160,6 +164,18 @@ class ModelLifecycle:
 
         # Protects runtime state mutations.
         self._state_lock = asyncio.Lock()
+
+        # Tracks which physical llama.cpp container currently owns GPU residency.
+        # Exactly one container may own the GPU at any point in time. Ownership is
+        # keyed by physical container name (NOT logical role), so sibling roles
+        # sharing a container (e.g. reasoning/coder -> llama-expert) share the same
+        # owner and never trigger mutual stop/start.
+        self._gpu_owner: str | None = None
+
+        # Serializes all GPU residency transitions (stop current owner -> start new
+        # owner). Only one ownership transition may execute at a time; this prevents
+        # two threads from racing to start/stop different containers simultaneously.
+        self._ownership_lock = asyncio.Lock()
 
         # Protects the per-role lock registry.
         self._registry_lock = asyncio.Lock()
@@ -243,7 +259,7 @@ class ModelLifecycle:
         Cancels the background cleanup loop and stops any containers that are
         still tracked as active so no orphaned Docker operations remain. Each
         unique physical container is stopped at most once, even when multiple
-        logical roles share it.
+        logical roles share it. GPU ownership is reset to None.
         """
         self._closing = True
 
@@ -301,6 +317,9 @@ class ModelLifecycle:
                             state.status = LifecycleState.UNLOADED
                             state.keep_warm_until = None
 
+                if self._gpu_owner == container_name:
+                    self._gpu_owner = None
+
                 logger.info("model_container_stopped_on_shutdown container=%s", container_name)
 
         await self._close_health_client()
@@ -355,6 +374,23 @@ class ModelLifecycle:
         except (httpx.HTTPError, asyncio.TimeoutError, OSError) as exc:
             logger.debug("health_check_failed role=%s endpoint=%s error=%r", role, url, exc)
             return False
+
+    async def _stop_container_gracefully(self, container_name: str) -> None:
+        """Stop a container and wait until it is fully stopped.
+
+        Centralized stop helper reused by ownership transitions, eviction, and
+        shutdown so container stop + wait_stopped remain in one place.
+        """
+        timeout_s = float(getattr(self.settings, "container_start_timeout_s", 30.0))
+        try:
+            await asyncio.wait_for(self.docker.stop(container_name), timeout=timeout_s)
+        except Exception:
+            logger.exception("model_container_stop_failed container=%s", container_name)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                self.docker.wait_stopped(container_name, timeout_s=timeout_s),
+                timeout=timeout_s,
+            )
 
     async def _start_container(self, role: str) -> None:
         container_name = self.models.container_for_role(role)
@@ -458,19 +494,30 @@ class ModelLifecycle:
         async with self._state_lock:
             state = self._ensure_state(role, model_name)
 
-        # First, reconcile against Docker. If the container is already running
-        # and healthy, adopt it immediately regardless of local keep-warm state.
+        # Fast path: reconcile against Docker. If this role's container is already
+        # running, healthy, AND is the current GPU owner (or no owner is recorded),
+        # adopt it immediately without any stop/start or extra health polling.
         healthy = await self._reconcile(role)
         if healthy:
-            now = time.time()
-            async with self._state_lock:
-                state = self._runtime[role]
-                state.status = LifecycleState.WARM
-                state.last_used_at = now
-                state.keep_warm_until = now + policy.keep_alive_seconds
-                state.touch_invocations += 1
-            logger.info("model_already_warm role=%s model=%s status=%s", role, state.name, state.status)
-            return
+            async with self._ownership_lock:
+                # Re-check owner under the ownership lock so we never adopt a
+                # container that a concurrent transition is about to replace.
+                if self._gpu_owner is None or self._gpu_owner == container_name:
+                    now = time.time()
+                    async with self._state_lock:
+                        state = self._runtime[role]
+                        state.status = LifecycleState.WARM
+                        state.last_used_at = now
+                        state.keep_warm_until = now + policy.keep_alive_seconds
+                        state.touch_invocations += 1
+                    self._gpu_owner = container_name
+                    logger.info(
+                        "model_already_warm role=%s model=%s owner=%s",
+                        role,
+                        state.name,
+                        container_name,
+                    )
+                    return
 
         # Acquire the STARTING transition.
         async with self._state_lock:
@@ -481,17 +528,76 @@ class ModelLifecycle:
             state.status = LifecycleState.STARTING
             state.warm_invocations += 1
 
-        logger.info("model_starting_started role=%s model=%s container=%s", role, state.name, container_name)
-
-        # Serialize Docker start/health per unique container so sibling roles
-        # sharing the same physical backend do not trigger duplicate starts.
-        container_lock = await self._get_container_lock(container_name)
-        async with container_lock:
+        # GPU residency is exclusive: exactly one llama.cpp container may own the
+        # GPU at a time. Serialize all ownership transitions so two threads can
+        # never race stop/start across different containers (invariant preserved).
+        async with self._ownership_lock:
             try:
-                # A sibling role may have already brought this container up.
-                if not await self._reconcile(role):
-                    await self._start_container(role)
-                    await self._wait_healthy(role)
+                # If a sibling logical role already brought this same physical
+                # container up and it is healthy, simply adopt it.
+                if await self._reconcile(role):
+                    now = time.time()
+                    async with self._state_lock:
+                        st = self._runtime[role]
+                        st.status = LifecycleState.WARM
+                        st.last_used_at = now
+                        st.keep_warm_until = now + policy.keep_alive_seconds
+                        st.touch_invocations += 1
+                    self._gpu_owner = container_name
+                    logger.info(
+                        "model_adopted_shared_container role=%s model=%s owner=%s",
+                        role,
+                        model_name,
+                        container_name,
+                    )
+                    return
+
+                # Stop whatever currently owns the GPU so the target container can
+                # take exclusive residency. Only one owner may exist at a time.
+                if self._gpu_owner is not None and self._gpu_owner != container_name:
+                    previous_owner = self._gpu_owner
+                    logger.info(
+                        "gpu_ownership_transfer from=%s to=%s via_role=%s",
+                        previous_owner,
+                        container_name,
+                        role,
+                    )
+                    container_lock = await self._get_container_lock(previous_owner)
+                    async with container_lock:
+                        await self._stop_container_gracefully(previous_owner)
+                    # Mark all roles mapping to the previous owner as unloaded.
+                    async with self._state_lock:
+                        for other_role, st in self._runtime.items():
+                            if self.models.container_for_role(other_role) == previous_owner:
+                                if st.status != LifecycleState.STARTING:
+                                    st.status = LifecycleState.UNLOADED
+                                    st.keep_warm_until = None
+                    self._gpu_owner = None
+
+                # Start the target container and wait for health.
+                container_lock = await self._get_container_lock(container_name)
+                async with container_lock:
+                    if not await self._reconcile(role):
+                        await self._start_container(role)
+                        await self._wait_healthy(role)
+
+                now = time.time()
+                async with self._state_lock:
+                    st = self._runtime.get(role)
+                    if st is None:
+                        st = self._ensure_state(role, model_name)
+                    st.status = LifecycleState.WARM
+                    st.last_used_at = now
+                    st.keep_warm_until = now + policy.keep_alive_seconds
+                    st.touch_invocations += 1
+                self._gpu_owner = container_name
+
+                logger.info(
+                    "model_became_warm role=%s model=%s owner=%s",
+                    role,
+                    model_name,
+                    container_name,
+                )
             except Exception as exc:
                 # Startup failed: stop the container and clear runtime state so no
                 # partially-initialized model is ever left behind.
@@ -511,20 +617,10 @@ class ModelLifecycle:
                     if st is not None:
                         st.status = LifecycleState.UNLOADED
                         st.keep_warm_until = None
+                if self._gpu_owner == container_name:
+                    self._gpu_owner = None
                 logger.exception("model_start_failed role=%s model=%s", role, state.name)
                 raise LifecycleError(str(exc)) from exc
-
-        now = time.time()
-        async with self._state_lock:
-            st = self._runtime.get(role)
-            if st is None:
-                st = self._ensure_state(role, model_name)
-            st.status = LifecycleState.WARM
-            st.last_used_at = now
-            st.keep_warm_until = now + policy.keep_alive_seconds
-            st.touch_invocations += 1
-
-        logger.info("model_became_warm role=%s model=%s", role, model_name)
 
     def touch(self, role: str) -> None:
         """Extend keep-warm window based on last usage."""
@@ -559,14 +655,31 @@ class ModelLifecycle:
             state.status = LifecycleState.IDLE
 
     def request_preload(self, role: str) -> None:
-        """Schedule a background warm without awaiting."""
+        """Schedule a background warm without awaiting.
+
+        Preload now means: "if no other container currently owns GPU residency,
+        proactively start this model." It must never violate the single-owner
+        invariant, so if another container owns the GPU it is skipped.
+        """
         role = role.lower().strip()
         policy = self._policy(role)
         if not policy.preload_enabled or self._closing:
             return
 
+        container_name = self.models.container_for_role(role)
+
         async def _preload() -> None:
             try:
+                # Only preload when no other container owns the GPU. Holding the
+                # ownership lock here guarantees the invariant is not violated.
+                async with self._ownership_lock:
+                    if self._gpu_owner is not None and self._gpu_owner != container_name:
+                        logger.info(
+                            "model_preload_skipped_owner_conflict role=%s owner=%s",
+                            role,
+                            self._gpu_owner,
+                        )
+                        return
                 await self.ensure_warm(role)
                 async with self._state_lock:
                     state = self._runtime.get(role)
@@ -730,35 +843,15 @@ class ModelLifecycle:
                     )
                     return
 
-                try:
-                    await asyncio.wait_for(
-                        self.docker.stop(container_name),
-                        timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
-                    )
-                    await asyncio.wait_for(
-                        self.docker.wait_stopped(
-                            container_name,
-                            timeout_s=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
-                        ),
-                        timeout=float(getattr(self.settings, "container_start_timeout_s", 30.0)),
-                    )
-                except Exception:
-                    logger.exception("model_eviction_failed role=%s model=%s", role, state.name)
-                    # Reconcile with actual Docker state so runtime isn't left stale.
+                # GPU ownership transition for eviction: serialize so it never
+                # races a concurrent start. Only clear the owner if this container
+                # is in fact the current GPU owner.
+                async with self._ownership_lock:
                     try:
-                        status = await self.docker.status(container_name)
-                        async with self._state_lock:
-                            st = self._runtime.get(role)
-                            if st is not None:
-                                if status.running:
-                                    st.status = LifecycleState.WARM
-                                elif status.exists:
-                                    st.status = LifecycleState.IDLE
-                                else:
-                                    st.status = LifecycleState.UNLOADED
-                    except Exception:
-                        pass
-                    return
+                        await self._stop_container_gracefully(container_name)
+                    finally:
+                        if self._gpu_owner == container_name:
+                            self._gpu_owner = None
 
             async with self._state_lock:
                 st = self._runtime.get(role)

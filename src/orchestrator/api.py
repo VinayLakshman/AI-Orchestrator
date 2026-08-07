@@ -287,6 +287,7 @@ async def _input_state_from_request(
         settings=runtime.settings,
         model_manager=runtime.model_manager,
         client_registry=runtime.client_registry,
+        model_lifecycle=runtime.model_lifecycle,
     )
     return _input_state_from_request_state(
         resolved.request,
@@ -340,6 +341,7 @@ async def openai_chat_completions(
         settings=runtime.settings,
         model_manager=runtime.model_manager,
         client_registry=runtime.client_registry,
+        model_lifecycle=runtime.model_lifecycle,
     )
     thread_id = str(uuid4())
     started_at = perf_counter()

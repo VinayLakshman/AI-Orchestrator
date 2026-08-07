@@ -392,8 +392,20 @@ def _normalized_validation_payload(parsed: dict[str, Any]) -> dict[str, Any]:
 class ControllerEngine:
     settings: Settings
     models: ModelManager
+    lifecycle: Any = None
+
+    async def _ensure_controller_warm(self) -> None:
+        """Ensure the controller container owns the GPU before any controller call.
+
+        With transient (single-GPU-owner) containers, the controller may have been
+        unloaded in favor of another model. Re-warm it here so plan/validate/finalize
+        always have a resident controller.
+        """
+        if self.lifecycle is not None:
+            await self.lifecycle.ensure_warm("controller")
 
     async def plan(self, state: OrchestratorState) -> ExecutionPlan:
+        await self._ensure_controller_warm()
         profile = {
             "has_images": bool(state.request.images),
             "has_files": bool(state.request.metadata.get("attachments")),
@@ -503,6 +515,8 @@ class ControllerEngine:
 
         step_text = last_step.value if last_step else "unknown"
 
+        await self._ensure_controller_warm()
+
         validation_messages = build_controller_messages(
             system_prompt=build_controller_validation_prompt(),
             messages=_request_messages(state),
@@ -559,6 +573,8 @@ class ControllerEngine:
         state: OrchestratorState,
         publisher: StreamPublisher | None = None,
     ) -> ModelGenerationResponse:
+        await self._ensure_controller_warm()
+
         finalizer_context = build_finalize_context(state)
 
         context_json = json.dumps(
