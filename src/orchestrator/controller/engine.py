@@ -9,6 +9,7 @@ from orchestrator.streaming.publisher import StreamPublisher
 
 from ..common.enums import ChatRole, SpecialistType
 from ..common.utils import _extract_json_object
+from ..context.assembler import build_conversation
 from ..context.builder import (
     build_controller_messages,
     build_finalize_context,
@@ -646,42 +647,15 @@ class ControllerEngine:
         structured_context = render_structured_context(state)
         latest_user_message = state.request.user_message
 
-        # Exactly one SYSTEM message is emitted. All orchestration metadata is
-        # merged into it to remain compatible with llama.cpp, Qwen and other
-        # OpenAI-compatible chat APIs that reject multiple SYSTEM messages.
-        system_sections: list[str] = [build_reasoning_prompt().strip()]
-
-        # Pretty-print the structured context JSON for readability when possible.
-        try:
-            parsed_context = json.loads(structured_context)
-            rendered_context = json.dumps(
-                parsed_context,
-                indent=2,
-                ensure_ascii=False,
-            )
-        except Exception:
-            rendered_context = structured_context
-
-        system_sections.append(
-            f"""## Structured Context
-
-{rendered_context}"""
+        # Delegate to the centralized assembler. Exactly one SYSTEM message is
+        # emitted, the structured context is merged into it, and the latest
+        # user request becomes a real USER message (compatible with llama.cpp,
+        # Qwen and other OpenAI-compatible chat APIs).
+        messages = build_conversation(
+            system_prompt=build_reasoning_prompt(),
+            structured_context=structured_context,
+            latest_user_message=latest_user_message,
         )
-
-        messages: list[ChatMessage] = [
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                content="\n\n".join(system_sections),
-            )
-        ]
-
-        if latest_user_message:
-            messages.append(
-                ChatMessage(
-                    role=ChatRole.USER,
-                    content=latest_user_message,
-                )
-            )
 
         response = await self.models.client("reasoning").chat(
             model=self.models.reasoning().name,

@@ -8,7 +8,8 @@ from typing import Any
 import httpx
 
 from ..logging import get_logger
-from ..common.enums import ChatRole, VisionTaskType
+from ..common.enums import VisionTaskType
+from ..context.assembler import build_conversation
 from ..settings import Settings
 from .detector import infer_vision_task
 from .fetcher import (
@@ -259,10 +260,9 @@ class VisionPipeline:
                 len(user_prompt),
             )
 
-        # Build OpenAI-compatible multimodal messages for the generic client.
-        chat_messages: list[ChatMessage] = [
-            ChatMessage(role=ChatRole.SYSTEM, content=system_prompt)
-        ]
+        # Build OpenAI-compatible multimodal messages via the centralized
+        # assembler. Exactly one SYSTEM message is emitted and the latest user
+        # request (including image parts) becomes a real USER message.
         user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
         for img in resolved_images:
             user_parts.append(
@@ -271,7 +271,10 @@ class VisionPipeline:
                     "image_url": {"url": f"data:{img.mime_type};base64,{img.base64_data}"},
                 }
             )
-        chat_messages.append(ChatMessage(role=ChatRole.USER, content=user_parts))
+        chat_messages: list[ChatMessage] = build_conversation(
+            system_prompt=system_prompt,
+            latest_user_message=user_parts,
+        )
 
         try:
             # Use the generic OpenAI-compatible llama.cpp client for inference.

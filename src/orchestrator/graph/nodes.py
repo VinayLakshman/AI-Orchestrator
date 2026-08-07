@@ -7,14 +7,16 @@ from orchestrator.controller.engine import ControllerEngine
 
 from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import normalize_query
-from ..common.enums import ChatRole, ControllerAction, SpecialistType
+from ..common.enums import ControllerAction, SpecialistType
 from ..common.utils import _extract_json_object
+from ..context.assembler import build_conversation
+from ..context.parser import split_conversation
+from ..models.chat import ChatMessage
 from .prompts import (
     build_controller_plan_prompt,
     build_controller_validation_prompt,
 )
 from ..logging import get_logger
-from ..models.chat import ChatMessage
 from ..models.evidence import (
     CodeEvidence,
     EvidenceLedger,
@@ -508,42 +510,56 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
 
 
 def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
-    request_text = _request_user_text(state)
     execution = state.execution
     evidence = state.evidence
 
-    context_parts = [
-        "You are the coding specialist.",
-        "Return STRICT JSON ONLY with this schema:",
-        '{ "task": "...", "summary": "...", "code": "...", "files": [], "tests": [], "warnings": [], "confidence": 0.0 }',
-        "",
-        f"User request:\n{request_text}",
-    ]
+    structured_sections: list[str] = []
 
     classification = execution.plan.classification
     if classification:
-        context_parts.append(f"Classification: {classification}")
+        structured_sections.append(f"Classification: {classification}")
 
     if evidence.repository and evidence.repository.context:
-        context_parts.append(f"Knowledge context:\n{evidence.repository.context}")
+        structured_sections.append(f"Knowledge context:\n{evidence.repository.context}")
 
     if evidence.web and evidence.web.summary:
-        context_parts.append(f"Web summary:\n{evidence.web.summary}")
+        structured_sections.append(f"Web summary:\n{evidence.web.summary}")
 
     if evidence.vision and evidence.vision.context:
-        context_parts.append(f"Vision context:\n{evidence.vision.context}")
+        structured_sections.append(f"Vision context:\n{evidence.vision.context}")
 
     if evidence.reasoning and evidence.reasoning.summary:
-        context_parts.append(
+        structured_sections.append(
             "Reasoning conclusions:\n" + "\n".join(evidence.reasoning.conclusions or [evidence.reasoning.summary])
         )
 
-    return [
-        ChatMessage(
-            role=ChatRole.SYSTEM,
-            content="\n".join(context_parts).strip(),
-        )
-    ]
+    system_prompt = (
+        "You are the coding specialist.\n"
+        "Return STRICT JSON ONLY with this schema:\n"
+        '{ "task": "...", "summary": "...", "code": "...", "files": [], "tests": [], "warnings": [], "confidence": 0.0 }'
+    )
+
+    return build_conversation(
+        system_prompt=system_prompt,
+        structured_context="\n\n".join(structured_sections),
+        history=_coder_history(state),
+        latest_user_message=_request_user_text(state),
+    )
+
+
+def _coder_history(state: OrchestratorState) -> list[ChatMessage]:
+    """Recover conversation history for the coder.
+
+    The coder is a specialist operating inside the orchestration graph. It
+    receives the full request conversation; the request's own latest user
+    message is supplied as the actual user message, so everything before it is
+    treated purely as history.
+    """
+    try:
+        history_messages, _, _ = split_conversation(state.request.messages)
+        return history_messages
+    except ValueError:
+        return []
 
 
 def make_coder_node(controller: ControllerEngine, settings: Settings, model_lifecycle: Any):

@@ -1,55 +1,27 @@
+"""Context rendering and compatibility wrappers.
+
+This module retains the context *rendering* helpers (structured context,
+request context, finalize context) and exposes thin compatibility wrappers
+for the historical message-builder names. All conversation construction now
+delegates to ``orchestrator.context.assembler`` and all conversation parsing
+delegates to ``orchestrator.context.parser``.
+"""
+
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
-from ..common.enums import ChatRole
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.evidence import (
     EvidenceLedger,
 )
 from ..models.state import OrchestratorState, RequestState
+from .assembler import build_conversation
+from .parser import estimate_text_tokens, split_conversation
 
 logger = get_logger(__name__)
-
-CONVERSATION_HISTORY_TOKEN_BUDGET = 2400
-
-
-def estimate_text_tokens(text: str | None) -> int:
-    value = (text or "").strip()
-    if not value:
-        return 0
-    return max(1, len(re.findall(r"\S+", value)))
-
-
-def _normalize_text(text: str | None) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
-
-
-def _truncate(text: str, limit: int = 220) -> str:
-    cleaned = _normalize_text(text)
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: max(0, limit - 1)].rstrip() + "…"
-
-
-def _dedupe_text_items(values: list[str]) -> tuple[list[str], int]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    removed = 0
-    for value in values:
-        item = _normalize_text(value)
-        if not item:
-            continue
-        key = item.lower()
-        if key in seen:
-            removed += 1
-            continue
-        seen.add(key)
-        deduped.append(item)
-    return deduped, removed
 
 
 def _evidence_to_text(value: Any) -> str:
@@ -83,6 +55,44 @@ def _first_text(values: list[Any], *, limit: int = 220) -> str:
         if text:
             return text
     return ""
+
+
+def _normalize_text(text: str | None) -> str:
+    return " ".join(str(text or "").split()).strip()
+
+
+def _truncate(text: str, limit: int = 220) -> str:
+    cleaned = _normalize_text(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _dedupe_text_items(values: list[str]) -> tuple[list[str], int]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    removed = 0
+    for value in values:
+        item = _normalize_text(value)
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped, removed
+
+
+def _compact_lines(text: str | None, *, max_items: int, max_chars: int) -> list[str]:
+    lines = [
+        _truncate(line.strip(" -•\t"), max_chars)
+        for line in str(text or "").splitlines()
+        if line.strip()
+    ]
+    deduped, _ = _dedupe_text_items(lines)
+    return deduped[:max_items]
 
 
 def _structured_source_entry(
@@ -303,104 +313,6 @@ def _build_validated_evidence_sources(evidence: EvidenceLedger) -> list[dict[str
     return sources
 
 
-def _compact_lines(text: str | None, *, max_items: int, max_chars: int) -> list[str]:
-    lines = [
-        _truncate(line.strip(" -•\t"), max_chars)
-        for line in str(text or "").splitlines()
-        if line.strip()
-    ]
-    deduped, _ = _dedupe_text_items(lines)
-    return deduped[:max_items]
-
-
-def _message_role(message: dict[str, Any] | ChatMessage) -> str:
-    if isinstance(message, ChatMessage):
-        return str(message.role.value)
-    return str(message.get("role") or "")
-
-
-def _message_content_text(message: dict[str, Any] | ChatMessage) -> str:
-    content: Any
-    if isinstance(message, ChatMessage):
-        content = message.content
-    else:
-        content = message.get("content")
-
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                for key in ("text", "content", "url"):
-                    value = part.get(key)
-                    if isinstance(value, str) and value.strip():
-                        parts.append(value.strip())
-                        break
-        return "\n".join(parts).strip()
-    if content is None:
-        return ""
-    return str(content).strip()
-
-
-def _message_token_count(message: dict[str, Any] | ChatMessage) -> int:
-    return estimate_text_tokens(_message_content_text(message))
-
-
-def _message_sequence(messages: list[dict[str, Any] | ChatMessage]) -> list[str]:
-    return [_message_role(message) for message in messages]
-
-
-def _build_conversation_history(
-    messages: list[dict[str, Any] | ChatMessage] | None,
-) -> tuple[list[ChatMessage], str, dict[str, Any]]:
-    raw_messages = list(messages or [])
-    if not raw_messages:
-        raise ValueError("Conversation is empty")
-
-    role_sequence = _message_sequence(raw_messages)
-
-    latest_user_index: int | None = None
-    for index in range(len(raw_messages) - 1, -1, -1):
-        message = raw_messages[index]
-        role = message.role if isinstance(message, ChatMessage) else message.get("role")
-        if role == ChatRole.USER.value or role == ChatRole.USER:
-            latest_user_index = index
-            break
-
-    if latest_user_index is None:
-        raise ValueError("Conversation contains no user message")
-
-    latest_user_text = _message_content_text(raw_messages[latest_user_index])
-
-    history_messages = list(raw_messages[:latest_user_index])
-
-    history_token_count = sum(_message_token_count(message) for message in history_messages)
-
-    truncated = False
-    while history_messages and history_token_count > CONVERSATION_HISTORY_TOKEN_BUDGET:
-        history_messages.pop(0)
-        history_token_count = sum(_message_token_count(message) for message in history_messages)
-        truncated = True
-
-    history_chat_messages = [
-        ChatMessage.model_validate(message) for message in history_messages
-    ]
-
-    conversation_info = {
-        "total_message_count": len(raw_messages),
-        "role_sequence": role_sequence,
-        "latest_user_index": latest_user_index,
-        "latest_user_message_length": len(latest_user_text),
-        "history_token_count": history_token_count,
-        "truncation_occurred": truncated,
-        "latest_user_survived_truncation": True,
-        "history_message_count": len(history_chat_messages),
-    }
-
-    return history_chat_messages, latest_user_text, conversation_info
-
-
 def render_structured_context(state: OrchestratorState) -> str:
     return json.dumps(
         build_finalize_context(state),
@@ -482,62 +394,24 @@ def build_controller_messages(
     structured_context: str = "",
     additional_context: str = "",
 ) -> list[ChatMessage]:
-    """
-    Build the controller conversation.
+    """Build the controller/finalizer conversation.
 
-    Exactly one SYSTEM message is emitted. All orchestration metadata is merged
-    into that message to remain compatible with llama.cpp, Qwen, Llama, Gemma,
-    Mistral and OpenAI-compatible chat APIs.
+    Delegates to the assembler. The conversation is parsed to recover history
+    and the latest user message, then assembled into a single valid outbound
+    conversation.
     """
-
-    history_messages, latest_user_message, conversation_info = (
-        _build_conversation_history(messages)
+    history_messages, latest_user_message, conversation_info = split_conversation(
+        messages
     )
 
-    system_sections: list[str] = [system_prompt.strip()]
-
-    def append_section(title: str, content: str) -> None:
-        content = content.strip()
-        if not content:
-            return
-
-        # Pretty-print JSON when possible for readability.
-        try:
-            parsed = json.loads(content)
-            content = json.dumps(
-                parsed,
-                indent=2,
-                ensure_ascii=False,
-            )
-        except Exception:
-            pass
-
-        system_sections.append(
-            f"""## {title}
-
-{content}"""
-        )
-
-    append_section("Request Context", request_context)
-    append_section("Structured Context", structured_context)
-    append_section("Additional Context", additional_context)
-
-    outgoing: list[ChatMessage] = [
-        ChatMessage(
-            role=ChatRole.SYSTEM,
-            content="\n\n".join(system_sections),
-        )
-    ]
-
-    outgoing.extend(history_messages)
-
-    if latest_user_message:
-        outgoing.append(
-            ChatMessage(
-                role=ChatRole.USER,
-                content=latest_user_message,
-            )
-        )
+    outgoing = build_conversation(
+        system_prompt=system_prompt,
+        request_context=request_context,
+        structured_context=structured_context,
+        additional_context=additional_context,
+        history=history_messages,
+        latest_user_message=latest_user_message,
+    )
 
     logger.debug(
         "conversation_assembly %s",
@@ -549,6 +423,7 @@ def build_controller_messages(
     )
 
     return outgoing
+
 
 def build_finalizer_messages(
     *,

@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ..common.enums import ChatRole
+from ..context.assembler import build_conversation
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.manager import ModelManager
@@ -301,9 +302,11 @@ def _build_resolver_messages(
     latest_user_message: str,
     structured_context: dict[str, Any],
 ) -> list[ChatMessage]:
-    # Exactly one SYSTEM message is emitted. All orchestration metadata is
-    # merged into it to remain compatible with llama.cpp, Qwen and other
-    # OpenAI-compatible chat APIs that reject multiple SYSTEM messages.
+    # Delegate to the centralized assembler. All orchestration metadata is
+    # merged into the SYSTEM message so exactly one SYSTEM message is emitted,
+    # the latest user request is a real USER message, and history order is
+    # preserved (compatible with llama.cpp, Qwen and other OpenAI-compatible
+    # chat APIs).
     try:
         structured_context_json = json.dumps(
             structured_context,
@@ -317,20 +320,12 @@ def _build_resolver_messages(
             separators=(",", ":"),
         )
 
-    system_sections: list[str] = [RESOLVER_SYSTEM_PROMPT.strip()]
-    system_sections.append(
-        f"""## Structured Conversation Context
-
-{structured_context_json}"""
+    return build_conversation(
+        system_prompt=RESOLVER_SYSTEM_PROMPT,
+        structured_context=structured_context_json,
+        history=context_history,
+        latest_user_message=latest_user_message,
     )
-
-    messages: list[ChatMessage] = [
-        ChatMessage(role=ChatRole.SYSTEM, content="\n\n".join(system_sections))
-    ]
-    messages.extend(context_history)
-    if latest_user_message:
-        messages.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
-    return messages
 
 
 def _rewrite_latest_user_message(
