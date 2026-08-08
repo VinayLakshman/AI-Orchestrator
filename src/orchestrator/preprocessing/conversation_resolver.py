@@ -7,8 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from ..clients.ollama import OllamaClient
 from ..common.enums import ChatRole
+from ..context.assembler import build_conversation
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.manager import ModelManager
@@ -302,24 +302,30 @@ def _build_resolver_messages(
     latest_user_message: str,
     structured_context: dict[str, Any],
 ) -> list[ChatMessage]:
-    messages: list[ChatMessage] = [
-        ChatMessage(role=ChatRole.SYSTEM, content=RESOLVER_SYSTEM_PROMPT)
-    ]
-    structured_context_json = json.dumps(
-        structured_context,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    messages.append(
-        ChatMessage(
-            role=ChatRole.SYSTEM,
-            content=f"Structured conversation context:\n{structured_context_json}",
+    # Delegate to the centralized assembler. All orchestration metadata is
+    # merged into the SYSTEM message so exactly one SYSTEM message is emitted,
+    # the latest user request is a real USER message, and history order is
+    # preserved (compatible with llama.cpp, Qwen and other OpenAI-compatible
+    # chat APIs).
+    try:
+        structured_context_json = json.dumps(
+            structured_context,
+            ensure_ascii=False,
+            indent=2,
         )
+    except Exception:
+        structured_context_json = json.dumps(
+            structured_context,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    return build_conversation(
+        system_prompt=RESOLVER_SYSTEM_PROMPT,
+        structured_context=structured_context_json,
+        history=context_history,
+        latest_user_message=latest_user_message,
     )
-    messages.extend(context_history)
-    if latest_user_message:
-        messages.append(ChatMessage(role=ChatRole.USER, content=latest_user_message))
-    return messages
 
 
 def _rewrite_latest_user_message(
@@ -405,7 +411,8 @@ async def resolve_conversation_context(
     *,
     settings: Settings,
     model_manager: ModelManager,
-    ollama_client: OllamaClient,
+    client_registry: Any,
+    model_lifecycle: Any = None,
 ) -> ResolverResult:
     original_query = str(request.original_query or request.user_message or "").strip()
     resolution = ConversationResolution(
@@ -467,7 +474,10 @@ async def resolve_conversation_context(
     )
 
     try:
-        response = await ollama_client.chat(
+        if model_lifecycle is not None:
+            await model_lifecycle.ensure_warm("controller")
+
+        response = await client_registry.get("controller").chat(
             model=model_manager.controller().name,
             messages=messages,
             temperature=0.0,

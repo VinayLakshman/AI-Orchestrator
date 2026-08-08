@@ -9,12 +9,14 @@ import httpx
 
 from ..logging import get_logger
 from ..common.enums import VisionTaskType
+from ..context.assembler import build_conversation
 from ..settings import Settings
 from .detector import infer_vision_task
 from .fetcher import (
     resolve_image_ref,
     strip_images_from_messages,
 )
+from ..models.chat import ChatMessage
 from ..models.vision import ResolvedImage, VisionAnalysis, VisionResult
 from ..models.ollama import extract_assistant_text
 from ..models.state import OrchestratorState
@@ -27,6 +29,7 @@ logger = get_logger(__name__)
 class VisionPipeline:
     settings: Settings
     client: httpx.AsyncClient
+    model_client: Any
     _cache: dict[str, VisionResult] = field(default_factory=dict)
 
     def _image_source_kind(self, ref: str) -> str:
@@ -54,9 +57,6 @@ class VisionPipeline:
             return json.loads(candidate)
         except Exception:
             return {}
-
-    def _parse_ollama_content(self, data: dict[str, Any]) -> str:
-        return extract_assistant_text(data)
 
     def _build_no_resolved_images_result(
         self,
@@ -260,31 +260,32 @@ class VisionPipeline:
                 len(user_prompt),
             )
 
-        payload = {
-            "model": self.settings.vision_model,
-            "stream": False,
-            "messages": [
+        # Build OpenAI-compatible multimodal messages via the centralized
+        # assembler. Exactly one SYSTEM message is emitted and the latest user
+        # request (including image parts) becomes a real USER message.
+        user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        for img in resolved_images:
+            user_parts.append(
                 {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                    "images": [img.base64_data for img in resolved_images],
-                },
-            ],
-            "options": {
-                "temperature": 0.15,
-                "num_predict": 1200,
-            },
-        }
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img.mime_type};base64,{img.base64_data}"},
+                }
+            )
+        chat_messages: list[ChatMessage] = build_conversation(
+            system_prompt=system_prompt,
+            latest_user_message=user_parts,
+        )
 
         try:
-            resp = await self.client.post("/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            raw_content = self._parse_ollama_content(data)
+            # Use the generic OpenAI-compatible llama.cpp client for inference.
+            response = await self.model_client.chat(
+                model=self.settings.vision_model,
+                messages=chat_messages,
+                temperature=0.15,
+                max_tokens=1200,
+                stream=False,
+            )
+            raw_content = extract_assistant_text(response.content)
 
             analysis = self._parse_analysis(
                 task_type=task_type,

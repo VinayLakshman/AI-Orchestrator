@@ -3,9 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..common.enums import ChatRole
 from ..settings import Settings
-from ..models.chat import ChatMessage
 
 
 @dataclass(slots=True)
@@ -16,14 +14,21 @@ class ManagedModel:
 
 class ModelManager:
     """
-    Role-based model registry.
+    Central model metadata registry.
 
-    The orchestrator references model roles, never raw model names.
+    Owns the mappings from model role to:
+    - model name
+    - endpoint
+    - container name
+    - inference client
+
+    The lifecycle manager and other components obtain model metadata from
+    here rather than maintaining their own copies.
     """
 
-    def __init__(self, settings: Settings, ollama_client: Any) -> None:
+    def __init__(self, settings: Settings, client_registry: Any) -> None:
         self.settings = settings
-        self.ollama_client = ollama_client
+        self.client_registry = client_registry
 
     def controller(self) -> ManagedModel:
         return ManagedModel("controller", self.settings.controller_model)
@@ -53,18 +58,23 @@ class ModelManager:
             raise KeyError(f"Unknown model role: {role}")
         return mapping[role]
 
-    async def warm_controller(self) -> None:
-        """
-        Load the controller into VRAM and keep it warm.
-        """
-        await self.ollama_client.chat(
-            model=self.settings.controller_model,
-            messages=[
-                ChatMessage(role=ChatRole.SYSTEM, content="You are a resident controller. Reply with OK."),
-                ChatMessage(role=ChatRole.USER, content="Warm up and stay resident."),
-            ],
-            temperature=0.0,
-            max_tokens=4,
-            stream=False,
-            keep_alive=self.settings.controller_keep_alive,
-        )
+    def endpoint_for_role(self, role: str) -> str:
+        role = role.lower().strip()
+        model_config = self._model_config(role)
+        return model_config.endpoint
+
+    def container_for_role(self, role: str) -> str:
+        role = role.lower().strip()
+        model_config = self._model_config(role)
+        return model_config.container_name
+
+    def client(self, role: str) -> Any:
+        """Return the inference client for a model role."""
+        return self.client_registry.get(role)
+
+    def _model_config(self, role: str) -> Any:
+        role = role.lower().strip()
+        models = getattr(self.settings, "models", {}) or {}
+        if role not in models:
+            raise KeyError(f"Unknown model role: {role}")
+        return models[role]

@@ -3,8 +3,15 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class LlamaCppModelConfig(BaseModel):
+    """Endpoint + container metadata for a single llama.cpp model role."""
+
+    endpoint: str
+    container_name: str
 
 
 class Settings(BaseSettings):
@@ -22,16 +29,42 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8001
 
-    # Ollama / local models
-    ollama_base_url: str = "http://ollama:11434"
-    ollama_keep_alive: str = "30m"
-    ollama_num_parallel: int = 1
-    ollama_max_loaded_models: int = 2
+    # Llama CPP default base URL (fallback when no per-model endpoint is set).
+    llama_cpp_base_url: str = "http://llama-expert:8080"
+    llama_controller_model: str = "controller"
+    llama_cpp_api_key: str | None = None
 
-    controller_model: str = "qwen3:4b"
-    reasoning_model: str = "qwen3:14b"
-    coder_model: str = "qwen2.5-coder:7b"
-    vision_model: str = "qwen2.5-vl:7b"
+    # Structured per-role model configuration. The reasoning and coder logical
+    # roles share the same physical llama-expert backend container exposing an
+    # OpenAI-compatible API. The vision role runs its own container.
+    models: dict[str, LlamaCppModelConfig] = {
+        "controller": LlamaCppModelConfig(
+            endpoint="http://llama-controller:8080",
+            container_name="llama-controller",
+        ),
+        "reasoning": LlamaCppModelConfig(
+            endpoint="http://llama-expert:8080",
+            container_name="llama-expert",
+        ),
+        "coder": LlamaCppModelConfig(
+            endpoint="http://llama-expert:8080",
+            container_name="llama-expert",
+        ),
+        "vision": LlamaCppModelConfig(
+            endpoint="http://llama-vision:8080",
+            container_name="llama-vision",
+        ),
+    }
+
+    # Container lifecycle / health tuning.
+    container_start_timeout_s: float = 120.0
+    health_poll_interval_s: float = 2.0
+    health_timeout_s: float = 120.0
+
+    controller_model: str = "controller"
+    reasoning_model: str = "reasoning"
+    coder_model: str = "coder"
+    vision_model: str = "vision"
     embedding_model: str = "nomic-embed-text"
 
     controller_keep_alive: str = "30m"

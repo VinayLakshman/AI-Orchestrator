@@ -7,9 +7,9 @@ from typing import Any, Iterable
 from orchestrator.models.state import OrchestratorState
 from orchestrator.streaming.publisher import StreamPublisher
 
-from ..clients.ollama import OllamaClient
 from ..common.enums import ChatRole, SpecialistType
 from ..common.utils import _extract_json_object
+from ..context.assembler import build_conversation
 from ..context.builder import (
     build_controller_messages,
     build_finalize_context,
@@ -391,10 +391,21 @@ def _normalized_validation_payload(parsed: dict[str, Any]) -> dict[str, Any]:
 @dataclass(slots=True)
 class ControllerEngine:
     settings: Settings
-    ollama: OllamaClient
     models: ModelManager
+    lifecycle: Any = None
+
+    async def _ensure_controller_warm(self) -> None:
+        """Ensure the controller container owns the GPU before any controller call.
+
+        With transient (single-GPU-owner) containers, the controller may have been
+        unloaded in favor of another model. Re-warm it here so plan/validate/finalize
+        always have a resident controller.
+        """
+        if self.lifecycle is not None:
+            await self.lifecycle.ensure_warm("controller")
 
     async def plan(self, state: OrchestratorState) -> ExecutionPlan:
+        await self._ensure_controller_warm()
         profile = {
             "has_images": bool(state.request.images),
             "has_files": bool(state.request.metadata.get("attachments")),
@@ -423,7 +434,7 @@ class ControllerEngine:
             messages=messages,
         )
 
-        response = await self.ollama.chat(
+        response = await self.models.client("controller").chat(
             model=self.models.controller().name,
             messages=messages,
             temperature=self.settings.controller_plan_temperature,
@@ -504,6 +515,8 @@ class ControllerEngine:
 
         step_text = last_step.value if last_step else "unknown"
 
+        await self._ensure_controller_warm()
+
         validation_messages = build_controller_messages(
             system_prompt=build_controller_validation_prompt(),
             messages=_request_messages(state),
@@ -511,7 +524,7 @@ class ControllerEngine:
             structured_context=render_structured_context(state),
         )
 
-        response = await self.ollama.chat(
+        response = await self.models.client("controller").chat(
             model=self.models.controller().name,
             messages=validation_messages,
             temperature=self.settings.controller_validate_temperature,
@@ -560,6 +573,8 @@ class ControllerEngine:
         state: OrchestratorState,
         publisher: StreamPublisher | None = None,
     ) -> ModelGenerationResponse:
+        await self._ensure_controller_warm()
+
         finalizer_context = build_finalize_context(state)
 
         context_json = json.dumps(
@@ -590,6 +605,7 @@ class ControllerEngine:
         )
 
         model_name = self.models.controller().name
+        controller_client = self.models.client("controller")
 
         try:
             if publisher is not None:
@@ -598,7 +614,7 @@ class ControllerEngine:
                 parts: list[str] = []
                 raw: dict[str, Any] | None = None
 
-                async for chunk in self.ollama.stream_chat(
+                async for chunk in controller_client.stream_chat(
                     model=model_name,
                     messages=messages,
                     temperature=self.settings.controller_finalize_temperature,
@@ -620,7 +636,7 @@ class ControllerEngine:
                     raw=raw,
                 )
 
-            response = await self.ollama.chat(
+            response = await controller_client.chat(
                 model=model_name,
                 messages=messages,
                 temperature=self.settings.controller_finalize_temperature,
@@ -647,27 +663,17 @@ class ControllerEngine:
         structured_context = render_structured_context(state)
         latest_user_message = state.request.user_message
 
-        messages = [
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                content=build_reasoning_prompt(),
-            ),
-            ChatMessage(
-                role=ChatRole.SYSTEM,
-                metadata={"source": "orchestrator_state"},
-                content=structured_context,
-            ),
-        ]
+        # Delegate to the centralized assembler. Exactly one SYSTEM message is
+        # emitted, the structured context is merged into it, and the latest
+        # user request becomes a real USER message (compatible with llama.cpp,
+        # Qwen and other OpenAI-compatible chat APIs).
+        messages = build_conversation(
+            system_prompt=build_reasoning_prompt(),
+            structured_context=structured_context,
+            latest_user_message=latest_user_message,
+        )
 
-        if latest_user_message:
-            messages.append(
-                ChatMessage(
-                    role=ChatRole.USER,
-                    content=latest_user_message,
-                )
-            )
-
-        response = await self.ollama.chat(
+        response = await self.models.client("reasoning").chat(
             model=self.models.reasoning().name,
             messages=messages,
             temperature=self.settings.reasoning_temperature,
