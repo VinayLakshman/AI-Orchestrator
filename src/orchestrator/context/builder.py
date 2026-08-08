@@ -19,6 +19,7 @@ from ..models.evidence import (
 )
 from ..models.state import OrchestratorState, RequestState
 from .assembler import build_conversation
+from .conversation_state import render_conversation_state
 from .parser import estimate_text_tokens, split_conversation
 
 logger = get_logger(__name__)
@@ -379,8 +380,33 @@ def build_finalize_context(state: OrchestratorState) -> dict[str, Any]:
         "validation": execution.validation.model_dump(exclude_none=True) if execution.validation else None,
     }
 
+    conversation = state.conversation
+
+    conversation_context = {
+        "current_topic": conversation.current_topic,
+        "topic_confidence": conversation.topic_confidence,
+        "last_specialist": (
+            conversation.last_specialist.value
+            if conversation.last_specialist is not None
+            else None
+        ),
+        "active_resources": [
+            {
+                "resource_id": resource.resource_id,
+                "resource_type": resource.resource_type,
+                "reference": resource.reference,
+                "name": resource.name,
+            }
+            for resource in conversation.active_resources
+        ],
+        "has_web_results": conversation.has_web_results,
+        "last_web_query": conversation.last_web_query,
+    }
+
     return {
         "question": question,
+        "conversation": conversation_context,
+        "conversation_text": render_conversation_state(conversation),
         "execution": execution_summary,
         "sources": _build_validated_evidence_sources(evidence),
     }

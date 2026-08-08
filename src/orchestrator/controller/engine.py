@@ -18,6 +18,7 @@ from ..context.builder import (
     render_request_context,
     render_structured_context,
 )
+from ..context.conversation_state import render_conversation_state
 from ..context.parser import split_conversation
 from ..logging import get_logger
 from ..models.chat import ChatMessage
@@ -414,11 +415,13 @@ class ControllerEngine:
 
         system_prompt = build_controller_plan_prompt()
         request_context = render_request_context(state.request)
+        conversation_context = render_conversation_state(state.conversation)
 
         messages = build_controller_messages(
             system_prompt=system_prompt,
             messages=_request_messages(state),
             request_context=request_context,
+            additional_context=conversation_context,
         )
 
         logger.debug(

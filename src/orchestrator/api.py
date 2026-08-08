@@ -103,6 +103,18 @@ def _input_state_from_request_state(
     return OrchestratorState(request=request_state)
 
 
+def _graph_input(state_input: OrchestratorState) -> dict[str, Any]:
+    """Build a partial graph input that preserves the checkpointed conversation.
+
+    The graph schema owns a ``conversation`` channel that is conversation-level
+    (persisted per ``thread_id``) and must NOT be overwritten on every request.
+    Passing a partial dict that updates only the ``request`` channel lets the
+    existing LangGraph checkpointer keep the prior ``conversation`` for the
+    same thread while this request supplies only fresh request-level data.
+    """
+    return {"request": state_input.request}
+
+
 def _final_answer_from_state(state: OrchestratorState) -> str:
     answer = state.response.final_response.strip()
     return answer or "I could not generate a complete answer for that request. Please try again with a little more detail."
@@ -188,7 +200,7 @@ async def _run_graph_with_stream(
             await publisher.graph_started()
             logger.debug("GRAPH: invoking graph")
             result = await runtime.graph.ainvoke(
-                state_input,
+                _graph_input(state_input),
                 config={"configurable": {"thread_id": thread_id}},
             )
             logger.debug("GRAPH: graph finished")
@@ -260,7 +272,7 @@ async def chat(
     started_at = perf_counter()
 
     result: OrchestratorState = await runtime.graph.ainvoke(
-        state_input,
+        _graph_input(state_input),
         config={"configurable": {"thread_id": thread_id}},
     )
 
@@ -502,7 +514,7 @@ async def openai_chat_completions(
         )
 
     result: OrchestratorState = await runtime.graph.ainvoke(
-        state_input,
+        _graph_input(state_input),
         config={"configurable": {"thread_id": thread_id}},
     )
 
@@ -522,3 +534,4 @@ async def openai_chat_completions(
 
     await stream.close()
     return completion
+

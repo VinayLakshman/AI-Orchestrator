@@ -28,6 +28,13 @@ from ..models.evidence import (
 )
 from ..models.ollama import extract_assistant_text
 from ..models.state import DebugState, OrchestratorState, ResponseState
+from ..context.conversation_state import (
+    merge_request_resources,
+    record_specialist_success,
+    record_web_success,
+    record_thread,
+    update_topic,
+)
 from ..models.execution import (
     ExecutionState,
     RetryState,
@@ -156,11 +163,30 @@ def _update_used_tools(
 
 def make_prepare_node(settings: Settings):
     async def prepare_node(state: OrchestratorState) -> OrchestratorState:
+        # Execution-scoped state is reset for the new request.
         state.execution = ExecutionState()
         state.execution.validation = ValidationResult()
         state.evidence = EvidenceLedger()
         state.response = ResponseState()
         state.debug = DebugState()
+
+        # ConversationState is conversation-level state and MUST survive between
+        # requests sharing the same thread_id. It is intentionally NOT reset.
+        request = state.request
+        conversation = record_thread(state.conversation, request.thread_id)
+        conversation = update_topic(conversation, request)
+        conversation = merge_request_resources(conversation, request)
+        state.conversation = conversation
+
+        logger.debug(
+            "conversation_prepared thread_id=%s topic=%r last_specialist=%s active_resources=%d has_web_results=%s last_web_query=%r",
+            request.thread_id,
+            state.conversation.current_topic,
+            state.conversation.last_specialist.value if state.conversation.last_specialist else None,
+            state.conversation.resource_count,
+            state.conversation.has_web_results,
+            state.conversation.last_web_query,
+        )
         return state
 
     return prepare_node
@@ -304,6 +330,7 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
         execution = _advance_runtime(execution, SpecialistType.VISION, success=True)
 
         state.execution = execution
+        state.conversation = record_specialist_success(state.conversation, SpecialistType.VISION)
         _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
         _update_used_models(state, str(getattr(analysis, "source_model", "") or settings.vision_model))
         return state
@@ -400,6 +427,7 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
 
         execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=True)
         state.execution = execution
+        state.conversation = record_specialist_success(state.conversation, SpecialistType.KNOWLEDGE)
         _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
         _update_used_tools(state, "knowledge.retrieve")
         return state
@@ -500,8 +528,11 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
             },
         )
 
+        actual_query = str(getattr(result, "query", "") or query).strip() or query
         execution = _advance_runtime(execution, SpecialistType.WEB, success=True)
         state.execution = execution
+        state.conversation = record_specialist_success(state.conversation, SpecialistType.WEB)
+        state.conversation = record_web_success(state.conversation, query=actual_query)
         _log_transition("specialist_complete", specialist=SpecialistType.WEB.value, **_state_snapshot(state))
         _update_used_tools(state, "web.search")
         return state
@@ -618,9 +649,12 @@ def make_coder_node(controller: ControllerEngine, settings: Settings, model_life
 
         model_lifecycle.touch("coder")
         model_lifecycle.keep_warm("coder")
-        execution = _advance_runtime(execution, SpecialistType.CODER, success=bool(code or explanation))
+        success = bool(code or explanation)
+        execution = _advance_runtime(execution, SpecialistType.CODER, success=success)
 
         state.execution = execution
+        if success:
+            state.conversation = record_specialist_success(state.conversation, SpecialistType.CODER)
         _log_transition("specialist_complete", specialist=SpecialistType.CODER.value, **_state_snapshot(state))
         _update_used_models(state, settings.coder_model)
         return state
@@ -676,6 +710,7 @@ def make_tools_node(settings: Settings):
 
         execution = _advance_runtime(execution, SpecialistType.TOOLS, success=True)
         state.execution = execution
+        state.conversation = record_specialist_success(state.conversation, SpecialistType.TOOLS)
         _log_transition("specialist_complete", specialist=SpecialistType.TOOLS.value, **_state_snapshot(state))
         _update_used_tools(state, "mcp.plan")
         return state
@@ -783,6 +818,8 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings, model_
         state.execution = execution
         if stream:
             await stream.reasoning_finished()
+
+        state.conversation = record_specialist_success(state.conversation, SpecialistType.REASONING)
 
         _log_transition("specialist_complete", specialist=SpecialistType.REASONING.value, **_state_snapshot(state))
 
