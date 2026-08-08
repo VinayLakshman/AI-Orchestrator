@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class NormalizedAttachment(BaseModel):
     attachment_type: str
     placeholder: str
+    reference: str = ""
     raw: dict[str, Any] = Field(default_factory=dict)
 
 

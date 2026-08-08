@@ -68,9 +68,13 @@ def extract_resources_from_request(
     """Derive lightweight resource references from a normalized request.
 
     Uses the existing normalized attachment info in
-    ``RequestState.metadata["attachments"]`` and ``RequestState.images``.
+    ``RequestState.metadata["attachments"]``.
 
-    Only identity/reference metadata is stored; never the contents.
+    Only identity/reference metadata is stored; never the contents. The
+    controller-facing ``reference`` is the safe placeholder text (e.g.
+    ``[Image Attached]``); the raw data URL / base64 payload is never stored
+    here. Specialists resolve the original attachment via
+    ``RequestState.images`` / the attachment ``raw`` metadata.
     """
     resources: list[ConversationResource] = []
 
@@ -80,14 +84,18 @@ def extract_resources_from_request(
             if not isinstance(item, dict):
                 continue
             resource_type = str(item.get("attachment_type") or "").strip() or "file"
+            # Controller-safe placeholder text (e.g. "[Image Attached]").
             reference = str(item.get("placeholder") or "").strip()
-            name = str(item.get("reference") or "").strip()
+            # Lightweight display name from the raw part metadata (filename),
+            # never the raw data URL / base64 body.
+            name = ""
+            raw = item.get("raw")
+            if isinstance(raw, dict):
+                name = _reference_from_name(str(
+                    raw.get("filename") or raw.get("name") or raw.get("path") or ""
+                ))
 
             if not reference:
-                raw = item.get("raw")
-                name = name or _reference_from_name(str(
-                    (raw.get("filename") if isinstance(raw, dict) else "") or ""
-                ))
                 reference = name or resource_type
 
             if not reference:
@@ -102,25 +110,6 @@ def extract_resources_from_request(
                     metadata={"source": "request"},
                 )
             )
-
-    # Images are also recorded directly from RequestState.images (these are the
-    # image placeholders/references). Skip any already captured via attachments.
-    known_ids = {resource.resource_id for resource in resources}
-    for reference in request.images or []:
-        if not isinstance(reference, str) or not reference.strip():
-            continue
-        resource_id = _stable_id(reference, "image")
-        if resource_id in known_ids:
-            continue
-        resources.append(
-            ConversationResource(
-                resource_id=resource_id,
-                resource_type="image",
-                reference=reference.strip(),
-                name="",
-                metadata={"source": "images"},
-            )
-        )
 
     return resources
 

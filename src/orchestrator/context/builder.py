@@ -420,7 +420,10 @@ def build_finalize_context(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
-_DATA_URL_RE = re.compile(r"data:[^,;]+(?:;[^,]*)?,", re.IGNORECASE)
+# Matches a complete data URL including its base64 payload body, so the raw
+# attachment bytes are removed entirely rather than leaving the base64 body
+# behind after stripping only the "data:...;base64," prefix.
+_DATA_URL_RE = re.compile(r"data:[^,;]+(?:;[^,]*)?,[A-Za-z0-9+/=\s]+", re.IGNORECASE)
 
 
 def _mime_kind_from_data_url(url: str) -> str:

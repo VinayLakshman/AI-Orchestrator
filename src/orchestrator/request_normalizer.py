@@ -61,13 +61,26 @@ def _attachment_type(part: dict[str, Any]) -> str:
     return str(part.get("type") or "attachment").lower()
 
 
-def _placeholder_for_attachment(attachment_type: str) -> str:
+def _placeholder_for_attachment(attachment_type: str, filename: str = "") -> str:
+    """Controller-safe placeholder text for an attachment.
+
+    Uses the square-bracket convention (``[Image Attached]``) so the text-only
+    controller sees a compact, consistent attachment indicator. When a
+    lightweight filename is available it is included for pdf/document/file
+    attachments. Never includes the raw data URL or base64 body.
+    """
+    if filename and attachment_type in {"pdf", "document", "file"}:
+        return {
+            "pdf": f"[PDF Attached: {filename}]",
+            "document": f"[Document Attached: {filename}]",
+            "file": f"[File Attached: {filename}]",
+        }.get(attachment_type, f"[File Attached: {filename}]")
     return {
-        "image": "<Image Attached>",
-        "pdf": "<PDF Attached>",
-        "document": "<Document Attached>",
-        "file": "<File Attached>",
-    }.get(attachment_type, "<Attachment Attached>")
+        "image": "[Image Attached]",
+        "pdf": "[PDF Attached]",
+        "document": "[Document Attached]",
+        "file": "[File Attached]",
+    }.get(attachment_type, "[Attachment Attached]")
 
 
 def _extract_attachment_reference(part: dict[str, Any]) -> str:
@@ -86,10 +99,27 @@ def _extract_attachment_reference(part: dict[str, Any]) -> str:
     return ""
 
 
-def _attachment_reference(part: dict[str, Any], attachment_type: str) -> str:
-    reference = _extract_attachment_reference(part)
-    if reference:
-        return reference
+def _attachment_reference(part: dict[str, Any]) -> str:
+    """The raw reference (data URL / http URL / file id) specialists need.
+
+    This is the actual attachment payload reference. It must never be placed
+    into controller-facing text; it is stored separately on
+    ``NormalizedAttachment.reference`` so the Vision/Knowledge specialists can
+    still resolve the original attachment.
+    """
+    return _extract_attachment_reference(part)
+
+
+def _placeholder_for_type(part: dict[str, Any], attachment_type: str) -> str:
+    """Controller-safe placeholder text derived from attachment metadata.
+
+    Uses the existing placeholder convention with square brackets and, when
+    available, a lightweight filename (never the raw data URL/base64 body).
+    """
+    filename = str(part.get("filename") or part.get("name") or part.get("path") or "").strip()
+    if filename:
+        base = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        return _placeholder_for_attachment(attachment_type, base)
     return _placeholder_for_attachment(attachment_type)
 
 
@@ -112,11 +142,12 @@ def _content_to_text(content: Any, *, attachments: list[NormalizedAttachment]) -
                 attachments.append(
                     NormalizedAttachment(
                         attachment_type=attachment_type,
-                        placeholder=_attachment_reference(item, attachment_type),
+                        placeholder=_placeholder_for_type(item, attachment_type),
+                        reference=_attachment_reference(item),
                         raw=copy.deepcopy(item),
                     )
                 )
-                parts.append(_placeholder_for_attachment(attachment_type))
+                parts.append(_placeholder_for_type(item, attachment_type))
                 continue
             value = item.get("text") or item.get("content") or item.get("url")
             if value:
@@ -193,11 +224,11 @@ def normalize_openai_request(
         sum(1 for item in attachments if item.attachment_type == "image"),
         [
             "data_uri"
-            if item.placeholder.startswith("data:image/")
+            if item.reference.startswith("data:image/")
             else "http_url"
-            if item.placeholder.startswith(("http://", "https://"))
+            if item.reference.startswith(("http://", "https://"))
             else "placeholder"
-            if item.placeholder.startswith("<")
+            if item.placeholder.startswith("[")
             else "other"
             for item in attachments
             if item.attachment_type == "image"
@@ -239,7 +270,10 @@ def normalize_openai_request(
         resolved_query=user_query,
         is_followup=False,
         followup_confidence=0.0,
-        images=[item.placeholder for item in attachments if item.attachment_type == "image"],
+        # The Vision specialist needs the actual image reference (data URL /
+        # http URL). The controller-facing placeholder text stays in the message
+        # content; the raw reference never reaches the controller.
+        images=[item.reference for item in attachments if item.attachment_type == "image"],
         metadata={
             **metadata,
             "attachments": [item.model_dump(exclude_none=True) for item in attachments],
