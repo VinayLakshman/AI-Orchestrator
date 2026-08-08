@@ -173,8 +173,19 @@ IMPORTANT ROUTING CONTRACT
 - `route` (graph route) is ONLY for coarse orchestration routes and MUST NOT be used to represent specialists.
 - Do NOT output `route: "reasoning"` or any specialist name in the `route` field.
 - Represent reasoning ONLY via `execution_queue` and/or `requires_reasoning`.
+- `GENERAL` is a RouteType / classification ONLY. It is NEVER a specialist and MUST NEVER appear in `execution_queue`.
+- When `classification` is `GENERAL` (or `route` is `GENERAL`) and no specialist work is required, `execution_queue` MUST be `[]` (empty array). Do not emit "GENERAL" as a queue token.
 
 Correct examples:
+
+{
+  "classification":"GENERAL",
+  "route":"GENERAL",
+  "confidence":0.0,
+  "requires_reasoning":false,
+  "execution_queue":[]
+}
+
 {
   "classification":"GENERAL",
   "confidence":0.0,
@@ -189,6 +200,13 @@ Correct examples:
   "execution_queue":["REASONING"]
 }
 
+INVALID - GENERAL must never appear in execution_queue:
+{
+  "classification":"GENERAL",
+  "route":"GENERAL",
+  "confidence":0.0,
+  "execution_queue":["GENERAL"]
+}
 
 --------------------------------------------------
 PLANNING DECISION PROCESS
@@ -314,12 +332,13 @@ DECISION EXAMPLES (do not answer; only route)
 Example 1
 User: "Compare Grafana and Netdata."
 Route: GENERAL
-Execution queue: (none / GENERAL only)
+Execution queue: []
 Knowledge: NO
 
 Example 2
 User: "Explain Kubernetes networking."
 Route: GENERAL
+Execution queue: []
 Knowledge: NO
 
 Example 3
@@ -344,18 +363,20 @@ KNOWLEDGE -> REASONING
 
 Example 9
 User: "Compare Grafana and Netdata."
-Execution queue: (none)
+Route: GENERAL
+Execution queue: []
 Knowledge: NO
-
 
 Example 7
 User: "Explain OAuth2."
 Route: GENERAL
+Execution queue: []
 Knowledge: NO
 
 Example 8
 User: "Compare OAuth2 and JWT."
 Route: GENERAL
+Execution queue: []
 Knowledge: NO
 
 --------------------------------------------------
