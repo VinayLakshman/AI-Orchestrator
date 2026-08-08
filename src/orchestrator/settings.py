@@ -129,6 +129,14 @@ class Settings(BaseSettings):
     enable_rag: bool = True
     enable_vision: bool = True
 
+    # Persistent conversation evidence (Feature 3)
+    # Bounds for reusable specialist evidence stored in the LangGraph
+    # checkpoint. These are operational limits; the state model itself stays a
+    # simple container.
+    conversation_evidence_max_items: int = 12
+    conversation_evidence_max_content_length: int = 4000
+    conversation_evidence_max_total_chars: int = 24000
+
     @property
     def reasoning_think(self) -> bool:
         return self.reasoning_model_think

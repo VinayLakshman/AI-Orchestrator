@@ -10,6 +10,15 @@ from ..clients.searxng import normalize_query
 from ..common.enums import ControllerAction, SpecialistType
 from ..common.utils import _extract_json_object
 from ..context.assembler import build_conversation
+from ..context.conversation_evidence import (
+    lookup_document_evidence,
+    lookup_vision_evidence,
+    lookup_web_evidence,
+    persist_document_evidence,
+    persist_vision_evidence,
+    persist_web_evidence,
+    promote_evidence,
+)
 from ..context.parser import split_conversation
 from ..models.chat import ChatMessage
 from .prompts import (
@@ -178,14 +187,19 @@ def make_prepare_node(settings: Settings):
         conversation = merge_request_resources(conversation, request)
         state.conversation = conversation
 
+        # conversation_evidence is conversation-level reusable specialist
+        # evidence and MUST survive between requests sharing the same
+        # thread_id. It is intentionally NOT reset here (the execution-scoped
+        # EvidenceLedger above is the per-request store).
         logger.debug(
-            "conversation_prepared thread_id=%s topic=%r last_specialist=%s active_resources=%d has_web_results=%s last_web_query=%r",
+            "conversation_prepared thread_id=%s topic=%r last_specialist=%s active_resources=%d has_web_results=%s last_web_query=%r reusable_evidence_items=%d",
             request.thread_id,
             state.conversation.current_topic,
             state.conversation.last_specialist.value if state.conversation.last_specialist else None,
             state.conversation.resource_count,
             state.conversation.has_web_results,
             state.conversation.last_web_query,
+            state.conversation_evidence.count,
         )
         return state
 
@@ -260,6 +274,23 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
             _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
             return state
 
+        # Specialist-level reuse gate: if reusable vision evidence exists for an
+        # active image resource and no fresh analysis was requested, promote and
+        # skip the actual vision execution entirely.
+        reusable = lookup_vision_evidence(state, settings)
+        if reusable is not None:
+            evidence = promote_evidence(reusable, evidence)
+            execution = _advance_runtime(execution, SpecialistType.VISION, success=True)
+            execution.runtime.metadata["reused"] = True
+            state.execution = execution
+            state.conversation = record_specialist_success(state.conversation, SpecialistType.VISION)
+            logger.debug(
+                "specialist_execution_skipped specialist=vision evidence_id=%s",
+                reusable.evidence_id,
+            )
+            _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
+            return state
+
         stream = get_current_stream()
         image_refs = state.request.images[: settings.vision_max_images]
 
@@ -331,6 +362,14 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
 
         state.execution = execution
         state.conversation = record_specialist_success(state.conversation, SpecialistType.VISION)
+        # Persist reusable vision evidence keyed by the active image resource ids.
+        image_resource_ids = [
+            resource.resource_id
+            for resource in state.conversation.active_resources
+            if resource.resource_id and resource.resource_type == "image"
+        ]
+        if image_resource_ids:
+            state = persist_vision_evidence(state, evidence, image_resource_ids, settings)
         _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
         _update_used_models(state, str(getattr(analysis, "source_model", "") or settings.vision_model))
         return state
@@ -386,6 +425,23 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
             _update_used_tools(state, "knowledge.retrieve")
             return state
 
+        # Specialist-level reuse gate: only applies when the request is actually
+        # associated with an uploaded file/document resource. Arbitrary
+        # repository/RAG questions never reuse persistent document evidence.
+        reusable = lookup_document_evidence(state, settings)
+        if reusable is not None:
+            evidence = promote_evidence(reusable, evidence)
+            execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=True)
+            execution.runtime.metadata["reused"] = True
+            state.execution = execution
+            state.conversation = record_specialist_success(state.conversation, SpecialistType.KNOWLEDGE)
+            logger.debug(
+                "specialist_execution_skipped specialist=document evidence_id=%s",
+                reusable.evidence_id,
+            )
+            _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
+            return state
+
         stream = get_current_stream()
         if stream:
             await stream.knowledge_started(query=query[:200])
@@ -428,6 +484,15 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
         execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=True)
         state.execution = execution
         state.conversation = record_specialist_success(state.conversation, SpecialistType.KNOWLEDGE)
+        # Persist reusable document evidence ONLY when the request is associated
+        # with an uploaded file/document resource (Feature 2 resource identity).
+        document_resource_ids = [
+            resource.resource_id
+            for resource in state.conversation.active_resources
+            if resource.resource_id and resource.resource_type in {"pdf", "document", "file"}
+        ]
+        if document_resource_ids:
+            state = persist_document_evidence(state, evidence, document_resource_ids, settings)
         _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
         _update_used_tools(state, "knowledge.retrieve")
         return state
@@ -475,6 +540,25 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
             )
             execution = _advance_runtime(execution, SpecialistType.WEB, success=False, error="web_disabled_or_empty_query")
             state.execution = execution
+            _log_transition("specialist_complete", specialist=SpecialistType.WEB.value, **_state_snapshot(state))
+            return state
+
+        # Specialist-level reuse gate: reuse existing web evidence for a
+        # follow-up when relevance can be established deterministically. This
+        # prevents unnecessary re-searches even when the controller routed WEB.
+        reusable = lookup_web_evidence(state, settings)
+        if reusable is not None and evidence.web is None:
+            evidence = promote_evidence(reusable, evidence)
+            execution = _advance_runtime(execution, SpecialistType.WEB, success=True)
+            execution.runtime.metadata["reused"] = True
+            state.execution = execution
+            state.conversation = record_specialist_success(state.conversation, SpecialistType.WEB)
+            state.conversation = record_web_success(state.conversation, query=reusable.query or query)
+            logger.debug(
+                "specialist_execution_skipped specialist=web evidence_id=%s query=%r",
+                reusable.evidence_id,
+                (reusable.query or query)[:120],
+            )
             _log_transition("specialist_complete", specialist=SpecialistType.WEB.value, **_state_snapshot(state))
             return state
 
@@ -533,6 +617,10 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
         state.execution = execution
         state.conversation = record_specialist_success(state.conversation, SpecialistType.WEB)
         state.conversation = record_web_success(state.conversation, query=actual_query)
+        # Persist reusable web evidence only when the search genuinely succeeded
+        # (non-empty results). Failed/empty searches are never cached.
+        if results:
+            state = persist_web_evidence(state, evidence, actual_query, settings)
         _log_transition("specialist_complete", specialist=SpecialistType.WEB.value, **_state_snapshot(state))
         _update_used_tools(state, "web.search")
         return state

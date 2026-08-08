@@ -7,7 +7,10 @@ from orchestrator.common.enums import SpecialistType
 from orchestrator.models.chat import ChatMessage
 from pydantic import BaseModel, Field
 
-from orchestrator.models.evidence import EvidenceLedger
+from orchestrator.models.evidence import (
+    ConversationEvidenceState,
+    EvidenceLedger,
+)
 from orchestrator.models.execution import ExecutionState
 
 
@@ -171,7 +174,11 @@ request
         Planner + execution engine.
 
     evidence
-        Specialists.
+        Current execution evidence (Specialists).
+
+    conversation_evidence
+        Reusable evidence across turns, persisted via the LangGraph
+        checkpoint. Never reset by prepare.
 
     response
         Finalizer.
@@ -187,6 +194,10 @@ request
     execution: ExecutionState = Field(default_factory=ExecutionState)
 
     evidence: EvidenceLedger = Field(default_factory=EvidenceLedger)
+
+    conversation_evidence: ConversationEvidenceState = Field(
+        default_factory=ConversationEvidenceState
+    )
 
     response: ResponseState = Field(default_factory=ResponseState)
 

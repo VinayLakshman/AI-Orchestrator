@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -225,3 +226,53 @@ class EvidenceLedger(BaseModel):
 
     def model_context(self) -> dict[str, Any]:
         return self.populated()
+
+
+class ConversationEvidenceItem(BaseModel):
+    """
+    A single reusable specialist evidence item persisted across turns.
+
+    Persistence is owned by the existing LangGraph checkpoint. This model
+    represents state only; matching/reuse/persistence policy lives in
+    ``orchestrator.context.conversation_evidence``.
+
+    Stores only the specialist's useful result (the rendered evidence), never
+    raw image bytes, base64, PDF binaries, uploaded payloads or credentials.
+    """
+
+    evidence_id: str = ""
+
+    evidence_type: str = ""  # "vision" | "web" | "document"
+
+    specialist: str = ""  # SpecialistType.value
+
+    resource_ids: list[str] = Field(default_factory=list)
+
+    query: str = ""
+
+    content: str = ""  # JSON-serialized evidence representation
+
+    turn_metadata: dict[str, Any] = Field(default_factory=dict)
+
+    created_at: datetime | None = None
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationEvidenceState(BaseModel):
+    """
+    Bounded container of reusable conversation evidence.
+
+    Simple state container. Operational limits (max items, max content length,
+    max total chars) are configuration owned by Settings, not hard-coded here.
+    """
+
+    items: list[ConversationEvidenceItem] = Field(default_factory=list)
+
+    @property
+    def count(self) -> int:
+        return len(self.items)
+
+    @property
+    def total_chars(self) -> int:
+        return sum(len(item.content or "") + len(item.query or "") for item in self.items)

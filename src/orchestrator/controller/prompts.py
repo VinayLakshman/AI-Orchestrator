@@ -39,6 +39,16 @@ request.
 - Choose specialists based on the current request and available context.
 - Prefer reusing existing conversational context when it is sufficient.
 - Only request new external evidence when it is actually required.
+- Reusable specialist evidence may exist for the current conversation
+  (VISION / DOCUMENT / WEB). If the request is a follow-up to an existing
+  resource/search and relevant reusable evidence already exists, prefer reuse
+  and do NOT schedule the same specialist again.
+- Explicit fresh/repeated analysis requests (e.g. "analyze again", "search
+  again", "fresh search", "re-read") override reuse: schedule the specialist.
+- Do NOT assume has_web_results means every web request can reuse the result.
+  When relevance is uncertain, prefer a fresh specialist execution.
+- The specialist nodes independently enforce the reuse gate. Your routing is
+  an advisory hint; they are the authoritative safety boundary.
 
 IMPORTANT: Conversation State must NOT override the user's latest explicit
 request. If the user clearly changes subject (e.g. "Forget Docker. Explain
