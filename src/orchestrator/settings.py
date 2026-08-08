@@ -51,7 +51,7 @@ class Settings(BaseSettings):
             container_name="llama-expert",
         ),
         "vision": LlamaCppModelConfig(
-            endpoint="http://llama-vision:8083",
+            endpoint="http://llama-vision:8080",
             container_name="llama-vision",
         ),
     }
