@@ -13,21 +13,15 @@ Construction is the responsibility of ``orchestrator.context.assembler``.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from ..common.enums import ChatRole
 from ..models.chat import ChatMessage
-
-CONVERSATION_HISTORY_TOKEN_BUDGET = 2400
-
-
-def estimate_text_tokens(text: str | None) -> int:
-    """Estimate the number of tokens in ``text`` using a simple word count."""
-    value = (text or "").strip()
-    if not value:
-        return 0
-    return max(1, len(re.findall(r"\S+", value)))
+from .conversation_builder import (
+    ConversationContextBuilder,
+    estimate_text_tokens,
+    DEFAULT_HISTORY_TOKEN_BUDGET as CONVERSATION_HISTORY_TOKEN_BUDGET,
+)
 
 
 def _message_role(message: dict[str, Any] | ChatMessage) -> str:
@@ -75,21 +69,16 @@ def truncate_history(
     *,
     token_budget: int = CONVERSATION_HISTORY_TOKEN_BUDGET,
 ) -> tuple[list[ChatMessage], bool]:
-    """Trim ``messages`` from the front until it fits within ``token_budget``.
+    """Trim ``messages`` without exceeding ``token_budget``.
 
-    History is dropped oldest-first. The returned tuple is
-    ``(kept_messages, truncated)``.
+    Delegates to :class:`ConversationContextBuilder` so a single authoritative,
+    deterministic, O(n) implementation owns all conversation-history assembly.
+    History is dropped oldest-first while always preserving the newest content.
+    The returned tuple is ``(kept_messages, truncated)``.
     """
-    kept = list(messages)
-    token_count = sum(_message_token_count(message) for message in kept)
-    truncated = False
-
-    while kept and token_count > token_budget:
-        kept.pop(0)
-        token_count = sum(_message_token_count(message) for message in kept)
-        truncated = True
-
-    return kept, truncated
+    builder = ConversationContextBuilder(token_budget=token_budget)
+    kept, info = builder.build(messages)
+    return kept, bool(info.truncated)
 
 
 def split_conversation(
@@ -124,40 +113,31 @@ def split_conversation(
 
     latest_user_text = _message_content_text(raw_messages[latest_user_index])
 
-    # History is everything before the latest user message. SYSTEM messages are
-    # intentionally excluded: the assembler emits its own SYSTEM message, so
-    # carrying a prior SYSTEM into history would produce a duplicated SYSTEM
-    # (rejected by Qwen/llama.cpp). Other roles (USER, ASSISTANT, tool,
-    # function, developer) are preserved verbatim to keep ordering intact.
-    history_messages = [
+    # Everything before the latest user message is treated as history. SYSTEM
+    # messages are intentionally excluded: the assembler emits its own SYSTEM
+    # message, so carrying a prior SYSTEM into history would produce a
+    # duplicated SYSTEM (rejected by Qwen/llama.cpp). Other roles (USER,
+    # ASSISTANT, tool, function, developer) are preserved verbatim by the
+    # ConversationContextBuilder to keep ordering intact.
+    raw_history = [
         message
         for message in raw_messages[:latest_user_index]
         if _message_role(message) != ChatRole.SYSTEM.value
     ]
 
-    history_token_count = sum(
-        _message_token_count(message) for message in history_messages
-    )
-
-    truncated = False
-    while history_messages and history_token_count > token_budget:
-        history_messages.pop(0)
-        history_token_count = sum(
-            _message_token_count(message) for message in history_messages
-        )
-        truncated = True
-
-    history_chat_messages = [
-        ChatMessage.model_validate(message) for message in history_messages
-    ]
+    # Token-budget-driven, deterministic, O(n) trimming via the single
+    # authoritative ConversationContextBuilder. Newest messages are always
+    # preserved; oldest are discarded first.
+    builder = ConversationContextBuilder(token_budget=token_budget)
+    history_chat_messages, info = builder.build(raw_history)
 
     conversation_info = {
         "total_message_count": len(raw_messages),
         "role_sequence": role_sequence,
         "latest_user_index": latest_user_index,
         "latest_user_message_length": len(latest_user_text),
-        "history_token_count": history_token_count,
-        "truncation_occurred": truncated,
+        "history_token_count": info.estimated_tokens,
+        "truncation_occurred": bool(info.truncated),
         "latest_user_survived_truncation": True,
         "history_message_count": len(history_chat_messages),
     }

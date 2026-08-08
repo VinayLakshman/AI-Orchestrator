@@ -18,6 +18,7 @@ from ..context.builder import (
     render_request_context,
     render_structured_context,
 )
+from ..context.parser import split_conversation
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.manager import ModelManager
@@ -663,13 +664,25 @@ class ControllerEngine:
         structured_context = render_structured_context(state)
         latest_user_message = state.request.user_message
 
+        # Build conversation history through the single authoritative
+        # ConversationContextBuilder (via split_conversation, which uses the
+        # token-budget-driven builder behind the scenes). This keeps the
+        # Reasoning Specialist consistent with every other orchestrator node.
+        history_messages: list[ChatMessage] = []
+        try:
+            history_messages, _, _ = split_conversation(state.request.messages)
+        except ValueError:
+            history_messages = []
+
         # Delegate to the centralized assembler. Exactly one SYSTEM message is
         # emitted, the structured context is merged into it, and the latest
         # user request becomes a real USER message (compatible with llama.cpp,
-        # Qwen and other OpenAI-compatible chat APIs).
+        # Qwen and other OpenAI-compatible chat APIs). History is passed
+        # through unchanged and chronologically ordered.
         messages = build_conversation(
             system_prompt=build_reasoning_prompt(),
             structured_context=structured_context,
+            history=history_messages,
             latest_user_message=latest_user_message,
         )
 

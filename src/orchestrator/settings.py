@@ -117,7 +117,9 @@ class Settings(BaseSettings):
     checkpoint_sqlite_path: str = "/data/checkpoints.sqlite3"
 
     # Runtime limits
-    max_context_messages: int = 24
+    # Conversation-history token budget (NOT the total model context budget).
+    # Conversation history is trimmed oldest-first until it fits this budget.
+    max_context_history_tokens: int = 12000
     max_controller_cycles: int = 6
     max_specialist_executions: int = 12
     max_specialist_retries: int = 1
