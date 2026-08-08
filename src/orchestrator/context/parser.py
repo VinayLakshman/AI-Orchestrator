@@ -64,23 +64,6 @@ def _message_sequence(
     return [_message_role(message) for message in messages]
 
 
-def truncate_history(
-    messages: list[ChatMessage],
-    *,
-    token_budget: int = CONVERSATION_HISTORY_TOKEN_BUDGET,
-) -> tuple[list[ChatMessage], bool]:
-    """Trim ``messages`` without exceeding ``token_budget``.
-
-    Delegates to :class:`ConversationContextBuilder` so a single authoritative,
-    deterministic, O(n) implementation owns all conversation-history assembly.
-    History is dropped oldest-first while always preserving the newest content.
-    The returned tuple is ``(kept_messages, truncated)``.
-    """
-    builder = ConversationContextBuilder(token_budget=token_budget)
-    kept, info = builder.build(messages)
-    return kept, bool(info.truncated)
-
-
 def split_conversation(
     messages: list[dict[str, Any] | ChatMessage] | None,
     *,

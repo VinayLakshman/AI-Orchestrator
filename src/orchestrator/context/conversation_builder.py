@@ -230,13 +230,3 @@ class ConversationContextBuilder:
         )
         return history
 
-
-def build_conversation_history(
-    messages: Iterable[dict[str, Any] | ChatMessage] | None,
-    *,
-    token_budget: int = DEFAULT_HISTORY_TOKEN_BUDGET,
-    exclude_roles: Iterable[str] | None = None,
-) -> tuple[list[ChatMessage], ConversationContextInfo]:
-    """Module-level helper that builds history through ``ConversationContextBuilder``."""
-    builder = ConversationContextBuilder(token_budget=token_budget)
-    return builder.build(messages, exclude_roles=exclude_roles)

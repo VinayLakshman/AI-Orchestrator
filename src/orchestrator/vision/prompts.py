@@ -98,25 +98,3 @@ def render_vision_context(analysis: VisionAnalysis) -> str:
 
     return "\n".join(parts).strip()
 
-
-def build_vision_injection_message(context_markdown: str, user_text: str = "") -> str:
-    system_block = f"""
-You have already analyzed the image(s) in this conversation.
-
-Use the analysis below as authoritative context when answering questions about the image(s).
-
---- VISION ANALYSIS START ---
-{context_markdown.strip()}
---- VISION ANALYSIS END ---
-
-Important:
-- Answer naturally and directly.
-- Use the vision analysis directly.
-- Do not say you cannot see the image.
-- If the analysis includes OCR, metrics, layout, or errors, use those values exactly where relevant.
-""".strip()
-
-    if user_text.strip():
-        system_block += f"\n\nThe user's original text was:\n{user_text.strip()}"
-
-    return system_block

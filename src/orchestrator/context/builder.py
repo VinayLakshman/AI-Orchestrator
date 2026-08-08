@@ -10,7 +10,8 @@ delegates to ``orchestrator.context.parser``.
 from __future__ import annotations
 
 import json
-from typing import Any
+import re
+from typing import Any, Iterable
 
 from ..logging import get_logger
 from ..models.chat import ChatMessage
@@ -18,6 +19,13 @@ from ..models.evidence import (
     EvidenceLedger,
 )
 from ..models.state import OrchestratorState, RequestState
+from ..request_normalizer import (
+    _attachment_type,
+    _extract_attachment_reference,
+    _is_file_part,
+    _is_image_part,
+    _placeholder_for_attachment,
+)
 from .assembler import build_conversation
 from .conversation_state import render_conversation_state
 from .parser import estimate_text_tokens, split_conversation
@@ -412,6 +420,190 @@ def build_finalize_context(state: OrchestratorState) -> dict[str, Any]:
     }
 
 
+_DATA_URL_RE = re.compile(r"data:[^,;]+(?:;[^,]*)?,", re.IGNORECASE)
+
+
+def _mime_kind_from_data_url(url: str) -> str:
+    """Best-effort media-type detection from a data URL prefix.
+
+    Returns a lightweight attachment kind (image/pdf/document/audio/video/file)
+    or ``""`` when the media type cannot be determined. Never returns the raw
+    payload itself.
+    """
+    header = url.split(",", 1)[0].lower()
+    mime = header.split(";", 1)[0].replace("data:", "", 1).strip()
+    if not mime:
+        return ""
+    if mime.startswith("image/"):
+        return "image"
+    if mime in {"application/pdf", "application/x-pdf"}:
+        return "pdf"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    if mime.startswith("text/") or mime in {
+        "application/json",
+        "application/xml",
+        "application/yaml",
+        "application/x-yaml",
+        "application/csv",
+        "text/csv",
+    }:
+        return "document"
+    if mime.startswith("application/"):
+        return "file"
+    return ""
+
+
+def _placeholder_for_kind(kind: str) -> str:
+    """Map a normalized attachment kind to its lightweight textual placeholder.
+
+    Mirrors the existing ``request_normalizer`` placeholder convention so the
+    controller sees a consistent, compact attachment indicator.
+    """
+    return {
+        "image": "[Image Attached]",
+        "pdf": "[PDF Attached]",
+        "document": "[Document Attached]",
+        "file": "[File Attached]",
+        "audio": "[Audio Attached]",
+        "video": "[Video Attached]",
+        "attachment": "[Attachment Attached]",
+    }.get(kind, "[File Attached]")
+
+
+def _safe_part_reference(part: dict[str, Any], kind: str) -> str:
+    """Build a compact, safe textual reference for a single content part.
+
+    Prefers an existing lightweight reference (filename/name/path/file id) and
+    never exposes raw data URLs or binary payloads.
+    """
+    reference = _extract_attachment_reference(part)
+    if reference:
+        lowered = reference.lower()
+        if lowered.startswith("data:") or "base64" in lowered:
+            reference = ""
+    if reference:
+        return f"{_placeholder_for_kind(kind)}: {reference}"
+    return _placeholder_for_kind(kind)
+
+
+def _sanitize_content_string(content: str) -> str:
+    """Sanitize a plain string message body.
+
+    Preserves normal text verbatim. Any embedded ``data:...;base64,...`` URL is
+    replaced by a lightweight attachment placeholder so a raw multimodal
+    payload can never reach the text-only controller.
+    """
+    if "data:" not in content:
+        return content
+    replaced = _DATA_URL_RE.sub(
+        lambda m: _placeholder_for_kind(_mime_kind_from_data_url(m.group(0))),
+        content,
+    )
+    return replaced
+
+
+def _sanitize_content_parts(content: Any) -> Any:
+    """Sanitize OpenAI-style multimodal content arrays.
+
+    Text parts are preserved exactly. Image/file/media parts are reduced to a
+    lightweight placeholder (optionally with a stable reference). The original
+    specialist-facing payload is untouched: this only affects the representation
+    sent to the controller.
+    """
+    if isinstance(content, str):
+        return _sanitize_content_string(content)
+    if not isinstance(content, list):
+        return content
+    if not content:
+        return content
+
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").lower()
+        if item_type == "text":
+            text = str(item.get("text") or item.get("content") or "").strip()
+            if text:
+                parts.append(_sanitize_content_string(text))
+            continue
+        if _is_image_part(item) or _is_file_part(item):
+            kind = _attachment_type(item)
+            parts.append(_safe_part_reference(item, kind))
+            continue
+        # image_url / file / input_image / unknown part types with a value
+        value = item.get("text") or item.get("content") or item.get("url")
+        if isinstance(value, str) and value.strip():
+            parts.append(_sanitize_content_string(value.strip()))
+    return "\n".join(parts).strip()
+
+
+def _sanitize_raw_message(
+    message: dict[str, Any] | ChatMessage,
+) -> dict[str, Any] | ChatMessage:
+    """Sanitize a single raw (pre-split) message's content representation.
+
+    Converts OpenAI-style multimodal content arrays / embedded data URLs into a
+    safe textual form (with lightweight attachment placeholders) while
+    preserving the role and any name/tool_call_id. This runs before
+    conversation splitting so the latest-user-message and history extraction
+    both see the sanitized, placeholder-bearing text.
+    """
+    if isinstance(message, ChatMessage):
+        content = _sanitize_content_parts(message.content)
+        if content == message.content:
+            return message
+        return message.model_copy(update={"content": content})
+
+    content = _sanitize_content_parts(message.get("content"))
+    if content == message.get("content"):
+        return message
+    updated = dict(message)
+    updated["content"] = content
+    return updated
+
+
+def sanitize_controller_messages(
+    messages: Iterable[ChatMessage] | None,
+) -> list[ChatMessage]:
+    """Sanitize an outbound controller message list.
+
+    This is the controller-facing boundary: it guarantees the text-only
+    controller never receives raw binary/file/multimodal payloads while
+    preserving roles, chronological order and normal text exactly.
+
+    Roles (system/user/assistant/tool/...) are preserved; only the content
+    representation is made safe. The original request is NOT modified, so
+    specialist paths (e.g. vision) keep access to the original attachments.
+    """
+    if not messages:
+        return list(messages or [])
+
+    sanitized: list[ChatMessage] = []
+    faults = 0
+    for message in messages:
+        content = _sanitize_content_parts(message.content)
+        if content != message.content:
+            faults += 1
+        sanitized.append(
+            message.model_copy(update={"content": content})
+            if content != message.content
+            else message
+        )
+
+    if faults:
+        logger.debug(
+            "controller_messages_sanitized count=%s total=%s",
+            faults,
+            len(sanitized),
+        )
+
+    return sanitized
+
+
 def build_controller_messages(
     *,
     system_prompt: str,
@@ -424,10 +616,11 @@ def build_controller_messages(
 
     Delegates to the assembler. The conversation is parsed to recover history
     and the latest user message, then assembled into a single valid outbound
-    conversation.
+    conversation. The final controller-facing representation is sanitized so
+    the text-only controller never sees raw multimodal/file payloads.
     """
     history_messages, latest_user_message, conversation_info = split_conversation(
-        messages
+        [_sanitize_raw_message(m) for m in (messages or [])]
     )
 
     outgoing = build_conversation(
@@ -438,6 +631,8 @@ def build_controller_messages(
         history=history_messages,
         latest_user_message=latest_user_message,
     )
+
+    outgoing = sanitize_controller_messages(outgoing)
 
     logger.debug(
         "conversation_assembly %s",
