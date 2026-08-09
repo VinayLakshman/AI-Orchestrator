@@ -20,12 +20,6 @@ class RouteType(str, Enum):
     CLARIFY = "clarify"
 
 
-class ToolType(str, Enum):
-    MCP = "mcp"
-    KNOWLEDGE = "knowledge"
-    OLLAMA = "ollama"
-
-
 class SpecialistType(StrEnum):
     KNOWLEDGE = "knowledge"
     WEB = "web"

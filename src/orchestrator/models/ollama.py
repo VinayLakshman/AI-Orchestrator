@@ -12,12 +12,6 @@ class ModelGenerationResponse(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
-class OllamaStreamChunk(BaseModel):
-    content: str
-    done: bool
-    raw: dict[str, Any] = Field(default_factory=dict)
-
-
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_INLINE_RE = re.compile(r"</?think\b[^>]*>", re.IGNORECASE)
 

@@ -3,10 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from orchestrator.common.enums import SpecialistType
 from orchestrator.models.chat import ChatMessage
 from pydantic import BaseModel, Field
 
-from orchestrator.models.evidence import EvidenceLedger
+from orchestrator.models.evidence import (
+    ConversationEvidenceState,
+    EvidenceLedger,
+)
 from orchestrator.models.execution import ExecutionState
 
 
@@ -63,6 +67,67 @@ class ResponseState(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ConversationResource(BaseModel):
+    """
+    Lightweight reference to a conversation-level resource.
+
+    Identifies a resource (image, pdf, document, file) associated with the
+    conversation WITHOUT storing its contents, extracted text, OCR, embeddings
+    or web result payloads.
+
+    ``resource_id`` provides a stable identity for de-duplication.
+    """
+
+    resource_id: str = ""
+
+    resource_type: str = ""
+
+    reference: str = ""
+
+    name: str = ""
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationState(BaseModel):
+    """
+    Conversation-level state.
+
+    Deliberately small. Provides the controller with a compact structured view
+    of the ongoing conversation so it can make better routing decisions.
+
+    Responsibility boundary:
+
+    - request: RequestState  (what is happening right now)
+    - conversation: ConversationState  (what the conversation is about)
+    - evidence: EvidenceLedger  (what specialists discovered this request)
+
+    ConversationState survives across requests sharing the same ``thread_id``
+    via the existing LangGraph checkpoint mechanism.
+
+    It must NOT become a dumping ground (no summaries, embeddings, web result
+    payloads, extracted document text, or per-request evidence caches).
+    """
+
+    current_topic: str = ""
+
+    topic_confidence: float = 0.0
+
+    last_specialist: SpecialistType | None = None
+
+    active_resources: list[ConversationResource] = Field(default_factory=list)
+
+    has_web_results: bool = False
+
+    last_web_query: str = ""
+
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def resource_count(self) -> int:
+        return len(self.active_resources)
+
+
 class DebugState(BaseModel):
     """
     Internal debugging information.
@@ -99,14 +164,21 @@ class OrchestratorState(BaseModel):
 
     Nodes should ONLY modify the section they own.
 
-    request
+request
         Immutable.
+
+    conversation
+        Conversation-level state (survives across requests sharing a thread).
 
     execution
         Planner + execution engine.
 
     evidence
-        Specialists.
+        Current execution evidence (Specialists).
+
+    conversation_evidence
+        Reusable evidence across turns, persisted via the LangGraph
+        checkpoint. Never reset by prepare.
 
     response
         Finalizer.
@@ -117,9 +189,15 @@ class OrchestratorState(BaseModel):
 
     request: RequestState = Field(default_factory=RequestState)
 
+    conversation: ConversationState = Field(default_factory=ConversationState)
+
     execution: ExecutionState = Field(default_factory=ExecutionState)
 
     evidence: EvidenceLedger = Field(default_factory=EvidenceLedger)
+
+    conversation_evidence: ConversationEvidenceState = Field(
+        default_factory=ConversationEvidenceState
+    )
 
     response: ResponseState = Field(default_factory=ResponseState)
 

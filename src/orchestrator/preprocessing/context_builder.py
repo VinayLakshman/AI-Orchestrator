@@ -4,12 +4,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..common.enums import ChatRole
+from ..context.conversation_builder import (
+    ConversationContextBuilder,
+    DEFAULT_HISTORY_TOKEN_BUDGET,
+)
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 
 logger = get_logger(__name__)
 
-RESOLVER_HISTORY_MESSAGE_LIMIT = 6
+# Resolver history is token-budget driven (not a fixed message count).
+RESOLVER_HISTORY_TOKEN_BUDGET = DEFAULT_HISTORY_TOKEN_BUDGET
 
 
 def _normalize_text(text: str | None) -> str:
@@ -132,7 +137,7 @@ class ResolverContext:
 def build_resolver_context(
     messages: list[dict[str, Any] | ChatMessage] | None,
     *,
-    history_message_limit: int = RESOLVER_HISTORY_MESSAGE_LIMIT,
+    token_budget: int = RESOLVER_HISTORY_TOKEN_BUDGET,
 ) -> ResolverContext:
     raw_messages = list(messages or [])
     if not raw_messages:
@@ -173,18 +178,43 @@ def build_resolver_context(
 
     latest_user_message = _message_content_text(raw_messages[latest_user_index])
 
-    history_messages: list[dict[str, Any] | ChatMessage] = []
-    conversation: list[dict[str, Any]] = []
-    for index, message in enumerate(raw_messages[:latest_user_index]):
-        role = _message_role(message)
-        if role not in {ChatRole.USER.value, ChatRole.ASSISTANT.value}:
-            continue
-        history_messages.append(message)
-        conversation.append(_structural_entry(message, index=index))
-        if len(history_messages) >= history_message_limit:
-            break
+    # History is everything before the latest user message. The resolver only
+    # feeds USER/ASSISTANT exchanges into the conversation builder, matching
+    # the historical resolver contract. Token-budget-driven trimming (newest
+    # first, oldest discarded) is delegated to the single authoritative
+    # ConversationContextBuilder.
+    history_messages: list[dict[str, Any] | ChatMessage] = [
+        message
+        for index, message in enumerate(raw_messages[:latest_user_index])
+        if _message_role(message) in {ChatRole.USER.value, ChatRole.ASSISTANT.value}
+    ]
 
-    history_chat_messages = [ChatMessage.model_validate(message) for message in history_messages]
+    # Record the original index of each candidate so structural entries keep
+    # their original position metadata.
+    original_indices: dict[int, int] = {
+        id(message): index
+        for index, message in enumerate(raw_messages[:latest_user_index])
+    }
+
+    builder = ConversationContextBuilder(token_budget=token_budget)
+    history_chat_messages, builder_info = builder.build(history_messages)
+
+    # The builder trims oldest-first and returns the newest set in
+    # chronological order. Therefore the kept raw messages are the trailing
+    # ``len(history_chat_messages)`` entries of ``history_messages``.
+    kept_raw = (
+        history_messages[-len(history_chat_messages):]
+        if history_chat_messages
+        else []
+    )
+
+    conversation: list[dict[str, Any]] = []
+    for message in kept_raw:
+        original_index = original_indices.get(id(message))
+        if original_index is None:
+            continue
+        conversation.append(_structural_entry(message, index=original_index))
+
     total_context_messages = sum(
         1
         for message in raw_messages[:latest_user_index]
@@ -196,8 +226,9 @@ def build_resolver_context(
         "history_message_count": len(history_chat_messages),
         "latest_user_index": latest_user_index,
         "latest_user_length": len(latest_user_message),
-        "roles": [_message_role(message) for message in history_messages],
-        "truncated": total_context_messages > len(history_chat_messages),
+        "roles": [_message_role(message) for message in history_chat_messages],
+        "truncated": bool(builder_info.truncated)
+        or total_context_messages > len(history_chat_messages),
     }
 
     logger.debug(

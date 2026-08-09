@@ -31,7 +31,6 @@ class Settings(BaseSettings):
 
     # Llama CPP default base URL (fallback when no per-model endpoint is set).
     llama_cpp_base_url: str = "http://llama-expert:8080"
-    llama_controller_model: str = "controller"
     llama_cpp_api_key: str | None = None
 
     # Structured per-role model configuration. The reasoning and coder logical
@@ -117,12 +116,9 @@ class Settings(BaseSettings):
     checkpoint_sqlite_path: str = "/data/checkpoints.sqlite3"
 
     # Runtime limits
-    max_context_messages: int = 24
-    max_controller_cycles: int = 6
-    max_specialist_executions: int = 12
-    max_specialist_retries: int = 1
-    workflow_stall_limit: int = 2
-    max_tool_rounds: int = 4
+    # Conversation-history token budget (NOT the total model context budget).
+    # Conversation history is trimmed oldest-first until it fits this budget.
+    max_context_history_tokens: int = 12000
     request_timeout_s: float = 300.0
 
     # OpenAI-compatible surface
@@ -130,37 +126,20 @@ class Settings(BaseSettings):
     openai_organization: str | None = None
 
     # Feature flags
-    enable_streaming: bool = True
     enable_rag: bool = True
     enable_vision: bool = True
 
-    @property
-    def general_model(self) -> str:
-        return self.controller_model
-
-    @property
-    def controller_temperature(self) -> float:
-        return self.controller_plan_temperature
-
-    @property
-    def controller_max_tokens(self) -> int:
-        return self.controller_plan_max_tokens
-
-    @property
-    def controller_final_max_tokens(self) -> int:
-        return self.controller_finalize_max_tokens
-
-    @property
-    def controller_think(self) -> bool:
-        return self.controller_model_think
+    # Persistent conversation evidence (Feature 3)
+    # Bounds for reusable specialist evidence stored in the LangGraph
+    # checkpoint. These are operational limits; the state model itself stays a
+    # simple container.
+    conversation_evidence_max_items: int = 12
+    conversation_evidence_max_content_length: int = 4000
+    conversation_evidence_max_total_chars: int = 24000
 
     @property
     def reasoning_think(self) -> bool:
         return self.reasoning_model_think
-
-    @property
-    def router_model(self) -> str | None:
-        return None
 
 
 @lru_cache(maxsize=1)

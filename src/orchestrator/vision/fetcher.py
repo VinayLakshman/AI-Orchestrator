@@ -8,60 +8,12 @@ from typing import Any
 
 import httpx
 
-from ..common.enums import ChatRole
 from ..logging import get_logger
 from ..settings import Settings
 from ..models.vision import ResolvedImage
 
 
 logger = get_logger(__name__)
-
-
-def collect_latest_message_images(messages: list[dict[str, Any]] | None, max_images: int) -> list[str]:
-    if not messages:
-        return []
-
-    for message in reversed(messages):
-        if message.get("role") != ChatRole.USER.value:
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        refs: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "image_url":
-                image_url = part.get("image_url")
-                if isinstance(image_url, dict):
-                    url = image_url.get("url")
-                else:
-                    url = image_url
-                if isinstance(url, str) and url.strip():
-                    refs.append(url.strip())
-            elif isinstance(part, dict) and part.get("type") == "image":
-                url = part.get("url")
-                if isinstance(url, str) and url.strip():
-                    refs.append(url.strip())
-        return refs[:max_images]
-    return []
-
-
-def extract_latest_user_text(messages: list[dict[str, Any]] | None) -> str:
-    if not messages:
-        return ""
-
-    for message in reversed(messages):
-        if message.get("role") != ChatRole.USER.value:
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
-                    parts.append(str(part["text"]).strip())
-            return "\n".join(parts).strip()
-    return ""
 
 
 def strip_images_from_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
