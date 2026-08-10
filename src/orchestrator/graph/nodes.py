@@ -249,7 +249,7 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
     return controller_plan_node
 
 
-def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_lifecycle: Any):
+def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
 
 
     async def vision_node(state: OrchestratorState) -> OrchestratorState:
@@ -294,14 +294,10 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
         stream = get_current_stream()
         image_refs = state.request.images[: settings.vision_max_images]
 
-        await model_lifecycle.ensure_warm("vision")
-
         if stream and image_refs:
             await stream.vision_started(image_count=len(image_refs))
 
-        async with model_lifecycle.active_inference("vision"):
-            result = await vision_pipeline.process(state)
-
+        result = await vision_pipeline.process(state)
 
         if result is None:
             evidence.vision = VisionEvidence(
@@ -338,7 +334,7 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
             detected_objects=[],
             metadata={
                 "cache_hit": bool(result.cache_hit),
-                "source_model": str(getattr(analysis, "source_model", "") or settings.vision_model),
+                "source_model": str(getattr(analysis, "source_model", "") or settings.vision_model_name),
                 "image_count": int(getattr(analysis, "image_count", 0) or 0),
                 "hashes": list(getattr(analysis, "hashes", []) or []),
             },
@@ -355,9 +351,6 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
             )
             await stream.vision_finished(summary=summary[:200] or "Vision analysis completed.")
 
-        model_lifecycle.touch("vision")
-        await model_lifecycle.keep_warm("vision")
-
         execution = _advance_runtime(execution, SpecialistType.VISION, success=True)
 
         state.execution = execution
@@ -371,7 +364,7 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings, model_
         if image_resource_ids:
             state = persist_vision_evidence(state, evidence, image_resource_ids, settings)
         _log_transition("specialist_complete", specialist=SpecialistType.VISION.value, **_state_snapshot(state))
-        _update_used_models(state, str(getattr(analysis, "source_model", "") or settings.vision_model))
+        _update_used_models(state, str(getattr(analysis, "source_model", "") or settings.vision_model_name))
         return state
 
     return vision_node
@@ -796,7 +789,7 @@ def _coder_history(state: OrchestratorState) -> list[ChatMessage]:
         return []
 
 
-def make_coder_node(controller: ControllerEngine, settings: Settings, model_lifecycle: Any):
+def make_coder_node(controller: ControllerEngine, settings: Settings):
 
 
     async def coder_node(state: OrchestratorState) -> OrchestratorState:
@@ -804,24 +797,19 @@ def make_coder_node(controller: ControllerEngine, settings: Settings, model_life
         evidence = state.evidence
         execution.runtime.current_specialist = SpecialistType.CODER
 
-        # Model lifecycle: warm/cached residency is handled here.
-        await model_lifecycle.ensure_warm("coder")
-
         stream = get_current_stream()
         if stream:
-            await stream.code_started(model=settings.coder_model)
+            await stream.code_started(model=settings.coder_model_name)
 
         messages = _build_coder_prompt(state)
 
-        async with model_lifecycle.active_inference("coder"):
-            response = await controller.models.client("coder").chat(
-                model=settings.coder_model,
-                messages=messages,
-                temperature=0.15,
-                max_tokens=settings.coder_max_tokens,
-                stream=False,
-                keep_alive=settings.controller_keep_alive,
-            )
+        response = await controller.models.client("coder").chat(
+            model=settings.coder_model_name,
+            messages=messages,
+            temperature=0.15,
+            max_tokens=settings.coder_max_tokens,
+            stream=False,
+        )
 
         text = extract_assistant_text(response.content) or extract_assistant_text(response.raw) or ""
         parsed = _extract_json_object(text)
@@ -846,12 +834,10 @@ def make_coder_node(controller: ControllerEngine, settings: Settings, model_life
             warnings=[str(item) for item in (parsed.get("warnings") or [])],
             confidence=float(parsed.get("confidence") or 0.0),
             metadata={
-                "model": settings.coder_model,
+                "model": settings.coder_model_name,
             },
         )
 
-        model_lifecycle.touch("coder")
-        model_lifecycle.keep_warm("coder")
         success = bool(code or explanation)
         execution = _advance_runtime(execution, SpecialistType.CODER, success=success)
 
@@ -859,7 +845,7 @@ def make_coder_node(controller: ControllerEngine, settings: Settings, model_life
         if success:
             state.conversation = record_specialist_success(state.conversation, SpecialistType.CODER)
         _log_transition("specialist_complete", specialist=SpecialistType.CODER.value, **_state_snapshot(state))
-        _update_used_models(state, settings.coder_model)
+        _update_used_models(state, settings.coder_model_name)
         return state
 
     return coder_node
@@ -965,28 +951,24 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
             **_state_snapshot(state),
         )
 
-        _update_used_models(state, settings.controller_model)
+        _update_used_models(state, controller.models.controller().name)
         return state
 
     return controller_validate_node
 
 
-def make_reasoning_node(controller: ControllerEngine, settings: Settings, model_lifecycle: Any):
+def make_reasoning_node(controller: ControllerEngine, settings: Settings):
 
 
     async def reasoning_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
 
-        # Model lifecycle: warm/cached residency is handled here.
-        await model_lifecycle.ensure_warm("reasoning")
-
         stream = get_current_stream()
         if stream:
-            await stream.reasoning_started(model=settings.reasoning_model)
+            await stream.reasoning_started(model=settings.reasoning_model_name)
 
-        async with model_lifecycle.active_inference("reasoning"):
-            generation = await controller.reason(state)
+        generation = await controller.reason(state)
 
 
         summary = str(generation.content or generation.raw or "").strip()
@@ -998,7 +980,7 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings, model_
             conclusions=_compact_lines(summary, max_items=8, max_chars=220),
             assumptions=[],
             metadata={
-                "model": settings.reasoning_model,
+                "model": settings.reasoning_model_name,
                 "source": "controller.reason",
             },
         )
@@ -1015,9 +997,6 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings, model_
             runtime.current_specialist = None
             execution = execution.model_copy(update={"runtime": runtime})
 
-        model_lifecycle.touch("reasoning")
-        await model_lifecycle.keep_warm("reasoning")
-
         state.execution = execution
         if stream:
             await stream.reasoning_finished()
@@ -1026,7 +1005,7 @@ def make_reasoning_node(controller: ControllerEngine, settings: Settings, model_
 
         _log_transition("specialist_complete", specialist=SpecialistType.REASONING.value, **_state_snapshot(state))
 
-        _update_used_models(state, settings.reasoning_model)
+        _update_used_models(state, settings.reasoning_model_name)
         return state
 
     return reasoning_node
@@ -1113,10 +1092,10 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
         existing_answer = str(response.final_response or "").strip()
         if existing_answer:
             answer = existing_answer
-            model = str(response.metadata.get("final_model") or settings.controller_model)
+            model = str(response.metadata.get("final_model") or settings.controller_model_name)
         else:
             generation = await controller.finalize(state, publisher=stream)
-            model = str(generation.model or settings.controller_model)
+            model = str(generation.model or settings.controller_model_name)
             answer = str(extract_assistant_text(generation.content) or extract_assistant_text(generation.raw) or "").strip()
 
         if not answer.strip():

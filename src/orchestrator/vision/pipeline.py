@@ -77,7 +77,7 @@ class VisionPipeline:
             observations=summary,
             answer_context=summary,
             image_count=0,
-            source_model=self.settings.vision_model,
+            source_model=self.settings.vision_model_name,
             raw_text=reason,
             hashes=[],
         )
@@ -109,7 +109,7 @@ class VisionPipeline:
             observations=summary,
             answer_context=summary,
             image_count=image_count,
-            source_model=self.settings.vision_model,
+            source_model=self.settings.vision_model_name,
             raw_text=raw_text,
             hashes=hashes,
         )
@@ -151,7 +151,7 @@ class VisionPipeline:
             "observations": str(parsed.get("observations") or "").strip(),
             "answer_context": str(parsed.get("answer_context") or "").strip(),
             "image_count": image_count,
-            "source_model": self.settings.vision_model,
+            "source_model": self.settings.vision_model_name,
             "raw_text": raw_text,
             "hashes": hashes,
         }
@@ -185,7 +185,7 @@ class VisionPipeline:
             logger.debug(
                 "VISION REQUEST request_id=%s model=%s request_state_image_count=%d request_state_image_source=%s prompt_length=%d",
                 request_id,
-                self.settings.vision_model,
+                self.settings.vision_model_name,
                 len(images),
                 request_image_sources,
                 len(state.request.user_message or ""),
@@ -213,7 +213,7 @@ class VisionPipeline:
                 logger.debug(
                     "VISION REQUEST SKIPPED request_id=%s model=%s vision_skipped=true reason=%s resolved_image_count=%d",
                     request_id,
-                    self.settings.vision_model,
+                    self.settings.vision_model_name,
                     "no_resolved_images",
                     0,
                 )
@@ -251,7 +251,7 @@ class VisionPipeline:
             logger.debug(
                 "VISION PAYLOAD CREATED request_id=%s model=%s payload_image_count=%d payload_image_source=%s payload_mime=%s payload_raw_size=%s payload_encoded_length=%s prompt_length=%d",
                 request_id,
-                self.settings.vision_model,
+                self.settings.vision_model_name,
                 len(resolved_images),
                 request_image_sources,
                 payload_mime_types,
@@ -279,7 +279,7 @@ class VisionPipeline:
         try:
             # Use the generic OpenAI-compatible llama.cpp client for inference.
             response = await self.model_client.chat(
-                model=self.settings.vision_model,
+                model=self.settings.vision_model_name,
                 messages=chat_messages,
                 temperature=0.15,
                 max_tokens=1200,

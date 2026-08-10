@@ -13,8 +13,7 @@ from ..clients.searxng import SearXNGClient
 from ..clients.registry import ClientRegistry
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
-from ..runtime.docker_runtime import DockerRuntime
-from ..runtime.model_lifecycle import ModelLifecycle
+from ..runtime.model_provider import ModelProvider
 
 from ..models.state import OrchestratorState
 from ..logging import get_logger
@@ -114,7 +113,6 @@ class TypedGraphFacade:
 class OrchestratorRuntime:
     settings: Settings
     model_manager: ModelManager
-    model_lifecycle: ModelLifecycle
 
     controller: ControllerEngine
     knowledge_client: KnowledgeClient
@@ -147,8 +145,7 @@ class OrchestratorRuntime:
 
     async def close(self) -> None:
         """Close runtime-owned transports exactly once."""
-        await self.model_lifecycle.close()
-        clients = [self.knowledge_client.client]
+        clients = [self.knowledge_client.client, *self.client_registry.clients()]
 
         if self.searxng_client is not None:
             clients.append(self.searxng_client.client)
@@ -187,7 +184,6 @@ def build_graph(
     knowledge_client: KnowledgeClient,
     client_registry: ClientRegistry,
     vision_pipeline: VisionPipeline,
-    model_lifecycle: ModelLifecycle,
     searxng_client: SearXNGClient | None = None,
 ) -> tuple[Any, Any]:
 
@@ -199,16 +195,16 @@ def build_graph(
 
     prepare_node = make_prepare_node(settings)
     plan_node = make_controller_plan_node(controller, settings)
-    vision_node = make_vision_node(vision_pipeline, settings, model_lifecycle)
+    vision_node = make_vision_node(vision_pipeline, settings)
 
 
     knowledge_node = make_knowledge_node(knowledge_client, settings)
     web_node = make_web_node(WebSpecialist(searxng_client), settings)
-    coder_node = make_coder_node(controller, settings, model_lifecycle)
+    coder_node = make_coder_node(controller, settings)
 
     tools_node = make_tools_node(settings)
     validate_node = make_controller_validate_node(controller, settings)
-    reasoning_node = make_reasoning_node(controller, settings, model_lifecycle)
+    reasoning_node = make_reasoning_node(controller, settings)
 
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
@@ -354,27 +350,35 @@ def build_graph(
 async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     logger.info("registering runtime dependencies")
 
+    provider = ModelProvider(settings)
+
+    router_health_timeout = max(1.0, min(5.0, float(settings.health_timeout_s)))
+    async with httpx.AsyncClient(
+        base_url=provider.router_origin_url,
+        timeout=httpx.Timeout(router_health_timeout),
+        follow_redirects=False,
+    ) as health_client:
+        try:
+            response = await health_client.get("/health")
+            response.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Router health check failed at {provider.router_origin_url}/health"
+            ) from exc
+
     knowledge_http = httpx.AsyncClient(
         base_url=settings.knowledge_service_url,
         timeout=settings.request_timeout_s,
     )
 
-    # Build one llama.cpp client per physical backend container. The reasoning
-    # and coder logical roles resolve to the same llama-expert backend, so they
-    # reuse a single shared client instance.
     client_registry = ClientRegistry()
 
-    def _register_client(roles: tuple[str, ...], *, endpoint: str) -> None:
-        client = LlamaCppClient(
-            settings=settings,
-            base_url=endpoint,
-        )
-        for role in roles:
-            client_registry.register(role, client)
-
-    _register_client(("controller",), endpoint=settings.models["controller"].endpoint)
-    _register_client(("reasoning", "coder"), endpoint=settings.models["reasoning"].endpoint)
-    _register_client(("vision",), endpoint=settings.models["vision"].endpoint)
+    router_client = LlamaCppClient(
+        settings=settings,
+        base_url=provider.router_base_url,
+    )
+    for role in ("controller", "reasoning", "coder", "vision"):
+        client_registry.register(role, router_client)
 
     knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
 
@@ -386,21 +390,11 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         )
         searxng_client = SearXNGClient(settings=settings, client=web_http)
 
-    model_manager = ModelManager(settings=settings, client_registry=client_registry)
-
-    # Build lifecycle first so the controller engine can re-warm the (transient)
-    # controller before each direct controller-client call.
-    docker = DockerRuntime()
-    model_lifecycle = ModelLifecycle(
-        settings=settings,
-        models=model_manager,
-        docker=docker,
-    )
+    model_manager = ModelManager(settings=settings, client_registry=client_registry, provider=provider)
 
     controller = ControllerEngine(
         settings=settings,
         models=model_manager,
-        lifecycle=model_lifecycle,
     )
 
     vision_fetch_http = httpx.AsyncClient(
@@ -414,22 +408,18 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     )
     stream_hub = StreamHub()
 
-    model_lifecycle.start_background_cleanup()
-
     graph, checkpointer = build_graph(
         settings=settings,
         controller=controller,
         knowledge_client=knowledge_client,
         client_registry=client_registry,
         vision_pipeline=vision_pipeline,
-        model_lifecycle=model_lifecycle,
         searxng_client=searxng_client,
     )
 
     runtime = OrchestratorRuntime(
         settings=settings,
         model_manager=model_manager,
-        model_lifecycle=model_lifecycle,
         controller=controller,
         knowledge_client=knowledge_client,
         client_registry=client_registry,

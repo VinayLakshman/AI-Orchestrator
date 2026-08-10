@@ -29,42 +29,22 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8001
 
-    # Llama CPP default base URL (fallback when no per-model endpoint is set).
-    llama_cpp_base_url: str = "http://llama-expert:8080"
+    # Router API base URL. The llama.cpp router owns model loading/unloading;
+    # the orchestrator only selects the logical model identifier.
+    model_router_url: str = "http://llama-router:8080/v1"
     llama_cpp_api_key: str | None = None
 
-    # Structured per-role model configuration. The reasoning and coder logical
-    # roles share the same physical llama-expert backend container exposing an
-    # OpenAI-compatible API. The vision role runs its own container.
-    models: dict[str, LlamaCppModelConfig] = {
-        "controller": LlamaCppModelConfig(
-            endpoint="http://llama-controller:8080",
-            container_name="llama-controller",
-        ),
-        "reasoning": LlamaCppModelConfig(
-            endpoint="http://llama-expert:8080",
-            container_name="llama-expert",
-        ),
-        "coder": LlamaCppModelConfig(
-            endpoint="http://llama-expert:8080",
-            container_name="llama-expert",
-        ),
-        "vision": LlamaCppModelConfig(
-            endpoint="http://llama-vision:8080",
-            container_name="llama-vision",
-        ),
-    }
+    # Logical model-role mapping to router model identifiers.
+    controller_model_name: str = "controller"
+    reasoning_model_name: str = "expert"
+    coder_model_name: str = "expert"
+    vision_model_name: str = "vision"
+    embedding_model: str = "nomic-embed-text"
 
-    # Container lifecycle / health tuning.
+    # Legacy lifecycle tuning kept only for operational rollback compatibility.
     container_start_timeout_s: float = 120.0
     health_poll_interval_s: float = 2.0
     health_timeout_s: float = 120.0
-
-    controller_model: str = "controller"
-    reasoning_model: str = "reasoning"
-    coder_model: str = "coder"
-    vision_model: str = "vision"
-    embedding_model: str = "nomic-embed-text"
 
     controller_keep_alive: str = "30m"
     reasoning_keep_alive: str = "15m"
