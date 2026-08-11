@@ -32,7 +32,7 @@ class LlamaCppClient:
     ) -> None:
         self.settings = settings
         self.client = client
-        self.base_url = base_url or getattr(settings, "llama_cpp_base_url", None)
+        self.base_url = base_url or getattr(settings, "model_router_url", None)
         self.api_key = getattr(settings, "llama_cpp_api_key", None)
 
     def _build_timeout(self, *, streaming: bool = False) -> httpx.Timeout:
@@ -223,7 +223,7 @@ class LlamaCppClient:
 
         client, close_client = await self._get_client()
         try:
-            resp = await client.post("/v1/chat/completions", json=payload)
+            resp = await client.post("chat/completions", json=payload)
             resp.raise_for_status()
             data = resp.json()
             content = self._extract_message_content(data).strip()
@@ -271,7 +271,7 @@ class LlamaCppClient:
 
         client, close_client = await self._get_client(streaming=True)
         try:
-            async with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+            async with client.stream("POST", "chat/completions", json=payload) as resp:
                 resp.raise_for_status()
 
                 async for line in resp.aiter_lines():

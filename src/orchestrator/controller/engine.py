@@ -395,20 +395,8 @@ def _normalized_validation_payload(parsed: dict[str, Any]) -> dict[str, Any]:
 class ControllerEngine:
     settings: Settings
     models: ModelManager
-    lifecycle: Any = None
-
-    async def _ensure_controller_warm(self) -> None:
-        """Ensure the controller container owns the GPU before any controller call.
-
-        With transient (single-GPU-owner) containers, the controller may have been
-        unloaded in favor of another model. Re-warm it here so plan/validate/finalize
-        always have a resident controller.
-        """
-        if self.lifecycle is not None:
-            await self.lifecycle.ensure_warm("controller")
 
     async def plan(self, state: OrchestratorState) -> ExecutionPlan:
-        await self._ensure_controller_warm()
         profile = {
             "has_images": bool(state.request.images),
             "has_files": bool(state.request.metadata.get("attachments")),
@@ -449,7 +437,6 @@ class ControllerEngine:
             max_tokens=self.settings.controller_plan_max_tokens,
             stream=False,
             response_format="json",
-            keep_alive=self.settings.controller_keep_alive,
         )
 
         raw_content = _response_text(response)
@@ -523,8 +510,6 @@ class ControllerEngine:
 
         step_text = last_step.value if last_step else "unknown"
 
-        await self._ensure_controller_warm()
-
         validation_messages = build_controller_messages(
             system_prompt=build_controller_validation_prompt(),
             messages=_request_messages(state),
@@ -539,7 +524,6 @@ class ControllerEngine:
             max_tokens=self.settings.controller_validate_max_tokens,
             stream=False,
             response_format="json",
-            keep_alive=self.settings.controller_keep_alive,
         )
 
         raw_content = response.content or response.raw or "{}"
@@ -581,8 +565,6 @@ class ControllerEngine:
         state: OrchestratorState,
         publisher: StreamPublisher | None = None,
     ) -> ModelGenerationResponse:
-        await self._ensure_controller_warm()
-
         finalizer_context = build_finalize_context(state)
 
         context_json = json.dumps(
@@ -627,7 +609,6 @@ class ControllerEngine:
                     messages=messages,
                     temperature=self.settings.controller_finalize_temperature,
                     max_tokens=self.settings.controller_finalize_max_tokens,
-                    keep_alive=self.settings.controller_keep_alive,
                 ):
                     if chunk.content:
                         parts.append(chunk.content)
@@ -650,7 +631,6 @@ class ControllerEngine:
                 temperature=self.settings.controller_finalize_temperature,
                 max_tokens=self.settings.controller_finalize_max_tokens,
                 stream=False,
-                keep_alive=self.settings.controller_keep_alive,
             )
 
             return ModelGenerationResponse(
@@ -699,7 +679,6 @@ class ControllerEngine:
             temperature=self.settings.reasoning_temperature,
             max_tokens=self.settings.reasoning_max_tokens,
             stream=False,
-            keep_alive=self.settings.reasoning_keep_alive,
             think=self.settings.reasoning_think,
         )
 

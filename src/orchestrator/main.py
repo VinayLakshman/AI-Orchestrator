@@ -69,10 +69,6 @@ async def lifespan(app: FastAPI):
     )
     app.state.runtime = runtime
 
-    # Keep the resident controller loaded before serving traffic.
-    with suppress(Exception):
-        await runtime.model_lifecycle.ensure_warm("controller")
-
     cleanup_task = asyncio.create_task(_cleanup_streams(runtime))
 
     try:

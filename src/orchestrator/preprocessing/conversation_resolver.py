@@ -581,7 +581,6 @@ async def resolve_conversation_context(
     settings: Settings,
     model_manager: ModelManager,
     client_registry: Any,
-    model_lifecycle: Any = None,
 ) -> ResolverResult:
     original_query = str(request.original_query or request.user_message or "").strip()
     resolution = ConversationResolution(
@@ -643,9 +642,6 @@ async def resolve_conversation_context(
     )
 
     try:
-        if model_lifecycle is not None:
-            await model_lifecycle.ensure_warm("controller")
-
         response = await client_registry.get("controller").chat(
             model=model_manager.controller().name,
             messages=messages,
@@ -653,7 +649,6 @@ async def resolve_conversation_context(
             max_tokens=256,
             stream=False,
             response_format="json",
-            keep_alive=settings.controller_keep_alive,
         )
         raw_content = str(response.content or response.raw or "").strip()
         parsed = _extract_json_object(raw_content)

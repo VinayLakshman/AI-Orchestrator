@@ -247,15 +247,14 @@ async def readyz(runtime: OrchestratorRuntime = Depends(get_runtime)) -> dict[st
 
 @router.get("/v1/models", response_model=OpenAIModelListResponse)
 async def list_models(runtime: OrchestratorRuntime = Depends(get_runtime)) -> OpenAIModelListResponse:
-    settings = runtime.settings
     return OpenAIModelListResponse(
         data=[
             OpenAIModelCard(id="orchestrator", owned_by="local"),
-            OpenAIModelCard(id=settings.controller_model, owned_by="local"),
-            OpenAIModelCard(id=settings.reasoning_model, owned_by="local"),
-            OpenAIModelCard(id=settings.coder_model, owned_by="local"),
-            OpenAIModelCard(id=settings.vision_model, owned_by="local"),
-            OpenAIModelCard(id=settings.embedding_model, owned_by="local"),
+            OpenAIModelCard(id="controller", owned_by="local"),
+            OpenAIModelCard(id="reasoning", owned_by="local"),
+            OpenAIModelCard(id="coder", owned_by="local"),
+            OpenAIModelCard(id="vision", owned_by="local"),
+            OpenAIModelCard(id=runtime.settings.embedding_model, owned_by="local"),
         ]
     )
 
@@ -299,7 +298,6 @@ async def _input_state_from_request(
         settings=runtime.settings,
         model_manager=runtime.model_manager,
         client_registry=runtime.client_registry,
-        model_lifecycle=runtime.model_lifecycle,
     )
     return _input_state_from_request_state(
         resolved.request,
@@ -353,7 +351,6 @@ async def openai_chat_completions(
         settings=runtime.settings,
         model_manager=runtime.model_manager,
         client_registry=runtime.client_registry,
-        model_lifecycle=runtime.model_lifecycle,
     )
     thread_id = str(uuid4())
     started_at = perf_counter()
@@ -534,4 +531,3 @@ async def openai_chat_completions(
 
     await stream.close()
     return completion
-
