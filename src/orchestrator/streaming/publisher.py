@@ -207,6 +207,17 @@ class StreamPublisher:
             data={"action": action, "issues": issues},
         )
 
+    async def validation_started(
+        self,
+        *,
+        message: str | None = None,
+    ) -> StreamEvent:
+        return await self.specialist_started(
+            specialist="validation",
+            message=message or "Validating the result...",
+            data={},
+        )
+
     async def knowledge_started(self, *, query: str | None = None) -> StreamEvent:
         return await self.specialist_started(
             specialist="knowledge",

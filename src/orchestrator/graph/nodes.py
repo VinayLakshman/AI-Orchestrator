@@ -936,6 +936,11 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
             except Exception:
                 last_step = None
 
+        # Emit validation start before running validation logic
+        stream = get_current_stream()
+        if stream:
+            await stream.validation_started()
+
         validation = await controller.validate(state, last_step=last_step)
 
         if validation.retry:
@@ -950,7 +955,7 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         state.debug.validator_prompt = build_controller_validation_prompt()
         state.debug.validator_response = validation.model_dump(exclude_none=True)
 
-        stream = get_current_stream()
+        # Emit validation complete
         if stream:
             await stream.controller_validated(
                 action=validation.action.value if hasattr(validation.action, "value") else str(validation.action),
