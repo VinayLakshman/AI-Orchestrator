@@ -35,7 +35,8 @@ logger = get_logger(__name__)
 
 # Default history budget. Treat strictly as the conversation-history budget,
 # NOT the total model context budget. Overridable per call and via settings.
-DEFAULT_HISTORY_TOKEN_BUDGET = 12000
+# Increased from 12000 to 32000 to support larger document processing
+DEFAULT_HISTORY_TOKEN_BUDGET = 32000
 
 
 def estimate_text_tokens(text: str | None) -> int:

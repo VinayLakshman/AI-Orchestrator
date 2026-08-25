@@ -6,10 +6,20 @@ from pydantic import BaseModel, Field
 
 
 class NormalizedAttachment(BaseModel):
+    """Normalized attachment metadata without raw content.
+
+    Stores only lightweight metadata (type, filename, size, reference)
+    to avoid bloating the orchestration state with large file contents.
+    The raw file content should only exist temporarily during preprocessing
+    and must NOT be propagated through OrchestratorState or checkpoints.
+    """
     attachment_type: str
     placeholder: str
     reference: str = ""
-    raw: dict[str, Any] = Field(default_factory=dict)
+    filename: str = ""
+    size_bytes: int = 0
+    # NOTE: 'raw' field removed intentionally to prevent large file contents
+    # from being stored in the orchestration state and LangGraph checkpoints.
 
 
 class OpenAIMessage(BaseModel):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import math
 import re
 from typing import Any
@@ -124,6 +123,13 @@ def _placeholder_for_type(part: dict[str, Any], attachment_type: str) -> str:
 
 
 def _content_to_text(content: Any, *, attachments: list[NormalizedAttachment]) -> str:
+    """Convert message content to text, extracting attachment metadata only.
+
+    IMPORTANT: This function intentionally does NOT store raw file content
+    (base64, data URLs, etc.) in attachments. The raw content is only used
+    temporarily to extract the reference/URL, then discarded to prevent
+    bloating the orchestration state with large file payloads.
+    """
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
@@ -139,12 +145,34 @@ def _content_to_text(content: Any, *, attachments: list[NormalizedAttachment]) -
                 continue
             if _is_image_part(item) or _is_file_part(item):
                 attachment_type = _attachment_type(item)
+                # Extract filename for metadata (without storing raw content)
+                filename = str(
+                    item.get("filename")
+                    or item.get("name")
+                    or item.get("path")
+                    or item.get("file_id")
+                    or ""
+                ).strip()
+                # Extract size if available (for file uploads)
+                size_bytes = item.get("size") or item.get("file_size") or 0
+                if isinstance(size_bytes, int):
+                    pass  # Keep as int
+                elif isinstance(size_bytes, str):
+                    try:
+                        size_bytes = int(size_bytes)
+                    except ValueError:
+                        size_bytes = 0
+                else:
+                    size_bytes = 0
+
                 attachments.append(
                     NormalizedAttachment(
                         attachment_type=attachment_type,
                         placeholder=_placeholder_for_type(item, attachment_type),
                         reference=_attachment_reference(item),
-                        raw=copy.deepcopy(item),
+                        filename=filename,
+                        size_bytes=size_bytes,
+                        # Intentionally NOT storing raw data to prevent OOM
                     )
                 )
                 parts.append(_placeholder_for_type(item, attachment_type))
@@ -210,9 +238,50 @@ def normalize_openai_request(
     *,
     request_id: str = "",
     thread_id: str = "",
+    max_file_size: int = 10 * 1024 * 1024,  # 10 MB default
+    max_files_per_request: int = 10,
 ) -> RequestState:
+    """Normalize OpenAI request with file size validation.
+
+    Validates attachment sizes before processing to prevent OOM errors
+    with large files. Returns early with a metadata flag if validation fails.
+    """
     original_messages = [message.model_dump(exclude_none=True) for message in payload.messages]
     controller_messages, attachments, user_query = _extract_controller_messages(payload.messages)
+
+    # Validate file sizes and count
+    oversized_files = []
+    total_file_size = 0
+    for attachment in attachments:
+        if attachment.attachment_type != "image":
+            file_size = attachment.size_bytes
+            if file_size > max_file_size:
+                oversized_files.append(attachment.filename or "unknown")
+            total_file_size += file_size
+
+    # Create metadata with validation results
+    validation_metadata = {
+        "has_images": any(item.attachment_type == "image" for item in attachments),
+        "has_files": any(item.attachment_type != "image" for item in attachments),
+        "attachment_types": list(dict.fromkeys(item.attachment_type for item in attachments)),
+        "file_count": sum(1 for item in attachments if item.attachment_type != "image"),
+        "total_file_size_bytes": total_file_size,
+        "max_file_size_bytes": max_file_size,
+        "max_files_per_request": max_files_per_request,
+        "files_exceed_size_limit": len(oversized_files) > 0,
+        "oversized_files": oversized_files,
+        "files_exceed_count_limit": len(attachments) > max_files_per_request,
+    }
+
+    logger.debug(
+        "NORMALIZE: request_id=%s thread_id=%s file_count=%d total_size=%d "
+        "oversized=%s",
+        request_id,
+        thread_id,
+        validation_metadata["file_count"],
+        total_file_size,
+        oversized_files,
+    )
     controller_text = _scan_text(controller_messages)
 
     logger.debug(

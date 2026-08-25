@@ -14,6 +14,7 @@ from ..models.chat import ChatMessage
 logger = get_logger(__name__)
 
 # Resolver history is token-budget driven (not a fixed message count).
+# Default is 32000 tokens (increased from 12000) to support larger document processing
 RESOLVER_HISTORY_TOKEN_BUDGET = DEFAULT_HISTORY_TOKEN_BUDGET
 
 

@@ -98,7 +98,18 @@ class Settings(BaseSettings):
     # Runtime limits
     # Conversation-history token budget (NOT the total model context budget).
     # Conversation history is trimmed oldest-first until it fits this budget.
-    max_context_history_tokens: int = 12000
+    # Increased from 12000 to 32000 to support larger document processing
+    max_context_history_tokens: int = 32000
+
+    # Document-specific token budget for file attachments.
+    # When processing large PDFs/documents, the knowledge service may generate
+    # substantial context. This budget determines how much document context
+    # is retained alongside conversation history.
+    max_document_context_tokens: int = 16000
+
+    # File size limits (in bytes)
+    max_file_size_bytes: int = 10 * 1024 * 1024  # 10 MB default
+    max_files_per_request: int = 10
     request_timeout_s: float = 300.0
 
     # OpenAI-compatible surface
