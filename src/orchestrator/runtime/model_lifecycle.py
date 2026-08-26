@@ -43,19 +43,24 @@ class LifecycleState(StrEnum):
 #                                   the GPU and is preparing it (draining LLM
 #                                   inference / unloading the resident model).
 #   "TRANSITIONING_TO_LLM"       -> GPU is being handed back to the LLM pool.
-#   None                         -> GPU is free.
+#   "releasing_comfyui"          -> image generation FINISHED and the release
+#                                   barrier is verifying actual GPU/VRAM
+#                                   release before the GPU becomes available.
+#   None                         -> GPU is free (release verified).
 #
 # Any other non-None value is a physical llama.cpp container name that MAY be
 # passed to Docker lifecycle operations.
 GPU_OWNER_COMFYUI = "comfyui"
 GPU_OWNER_TRANSITIONING_TO_COMFYUI = "transitioning_to_comfyui"
 GPU_OWNER_TRANSITIONING_TO_LLM = LifecycleState.TRANSITIONING_TO_LLM.value
+GPU_OWNER_RELEASING_COMFYUI = "releasing_comfyui"
 
 _IMAGE_GPU_SENTINELS = frozenset(
     {
         GPU_OWNER_COMFYUI,
         GPU_OWNER_TRANSITIONING_TO_COMFYUI,
         GPU_OWNER_TRANSITIONING_TO_LLM,
+        GPU_OWNER_RELEASING_COMFYUI,
     }
 )
 
@@ -211,6 +216,11 @@ class ModelLifecycle:
         # sharing a container (e.g. reasoning/coder -> llama-expert) share the same
         # owner and never trigger mutual stop/start.
         self._gpu_owner: str | None = None
+        # Free-VRAM baseline (MB) captured after the LLM unload during
+        # acquire_comfyui_gpu(). Used by the release barrier to verify that
+        # ComfyUI actually returned its VRAM. None when GPU telemetry is
+        # unavailable on this host.
+        self._comfyui_vram_free_baseline_mb: float | None = None
 
         # Serializes all GPU residency transitions (stop current owner -> start new
         # owner). Only one ownership transition may execute at a time; this prevents
@@ -989,7 +999,11 @@ class ModelLifecycle:
             occupied: str | None = None
             async with self._ownership_lock:
                 owner = self._gpu_owner
-                if owner in {GPU_OWNER_COMFYUI, GPU_OWNER_TRANSITIONING_TO_COMFYUI}:
+                if owner in {
+                    GPU_OWNER_COMFYUI,
+                    GPU_OWNER_TRANSITIONING_TO_COMFYUI,
+                    GPU_OWNER_RELEASING_COMFYUI,
+                }:
                     # Another image generation owns/reserved the GPU: wait for
                     # it to be fully released rather than sharing ownership.
                     occupied = owner
@@ -1078,6 +1092,24 @@ class ModelLifecycle:
                     logger.error("llama_router_api_error error=%r", e)
                     raise LifecycleError(f"llama-router API error: {e}")
 
+            # Step 5.5: Capture the free-VRAM baseline for the release barrier.
+            # This is taken AFTER the LLM unload has been confirmed, so it
+            # reflects the memory available with no llama.cpp model resident.
+            # After image generation, ComfyUI must return free VRAM to (at
+            # least) this level before llama-router may load again.
+            self._comfyui_vram_free_baseline_mb = await self._query_gpu_free_mem_mb()
+            if self._comfyui_vram_free_baseline_mb is not None:
+                logger.info(
+                    "comfyui_gpu_release_baseline_captured free_mb=%.0f",
+                    self._comfyui_vram_free_baseline_mb,
+                )
+            else:
+                logger.info(
+                    "comfyui_gpu_release_baseline_unavailable "
+                    "(no GPU telemetry on this host; release barrier will "
+                    "fall back to llama-router resident-model verification)"
+                )
+
             # Step 6: Revalidate and atomically finalize COMFYUI_ACTIVE.
             async with self._ownership_lock:
                 if self._gpu_owner != GPU_OWNER_TRANSITIONING_TO_COMFYUI:
@@ -1103,30 +1135,193 @@ class ModelLifecycle:
                         )
             raise
 
+    async def _query_gpu_free_mem_mb(self) -> float | None:
+        """Query free GPU memory (MB) via nvidia-smi telemetry.
+
+        Returns None when nvidia-smi is unavailable or fails (e.g. the
+        orchestrator runs in a container without GPU tooling). This is a
+        best-effort observable, never a hard dependency.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            # Multi-GPU hosts: the minimum free memory across GPUs is the
+            # conservative signal.
+            values = [
+                float(line.strip())
+                for line in stdout.decode().splitlines()
+                if line.strip()
+            ]
+            return min(values) if values else None
+        except ValueError:
+            return None
+
+    async def _router_has_no_resident_model(self) -> bool | None:
+        """Return True when llama-router reports NO loaded/loading model.
+
+        Returns None on transport/HTTP errors so callers can distinguish
+        "verified clear" from "could not observe".
+        """
+        try:
+            async with await self._get_llm_client() as client:
+                resp = await client.get("/v1/models")
+                resp.raise_for_status()
+                models_data = resp.json()
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("comfyui_gpu_release_router_probe_failed error=%r", e)
+            return None
+        for model in models_data.get("data", []):
+            status = model.get("status", {})
+            if status.get("value") in ("loaded", "loading", "sleeping"):
+                return False
+        return True
+
     async def release_comfyui_gpu(self) -> None:
         """Release GPU ownership after confirmed image-generation completion.
 
-        The orchestrator no longer owns any direct ComfyUI workload: image
-        generation is delegated to Open WebUI, whose synchronous API returns
-        only after its generation has completed. Therefore no ComfyUI /free
-        call is performed here — ComfyUI memory management belongs to Open
-        WebUI. This method only transitions GPU ownership back to free.
+        This is a BLOCKING RELEASE BARRIER. It does NOT simply clear the
+        ownership state: llama-router must never begin loading an LLM while
+        ComfyUI still holds VRAM.
+
+        State machine (all transitions under ``_ownership_lock``):
+
+            COMFYUI ("comfyui")
+                --atomic--> RELEASING_COMFYUI ("releasing_comfyui")
+                [outside lock] poll real observables until verified
+                --atomic--> FREE (None)
+
+        While the owner is ``releasing_comfyui``:
+
+        - LLM requests block in ``_wait_for_llm_gpu_availability`` (owner is
+          non-None and is not their container).
+        - Concurrent image requests serialize behind it in
+          ``acquire_comfyui_gpu``.
+        - The sentinel NEVER reaches Docker lifecycle operations (it is in
+          ``_IMAGE_GPU_SENTINELS``).
+
+        Observable verification (bounded by ``comfyui_release_timeout_s``):
+
+        - PRIMARY: GPU free-memory telemetry (nvidia-smi), compared against
+          the baseline captured at acquisition time after the LLM unload.
+          Verified when free VRAM returned to within
+          ``comfyui_release_memory_tolerance_mb`` of that baseline — a
+          host-relative check with no hard-coded absolute VRAM numbers.
+        - FALLBACK (telemetry unavailable): llama-router's /v1/models reports
+          no resident model, combined with Open WebUI's synchronous
+          image-generation API only returning after its downstream ComfyUI
+          workflow execution completed.
+
+        On timeout: the owner REMAINS ``releasing_comfyui`` (safe blocked
+        state — nothing may claim the GPU), and LifecycleError is raised.
+        A false-positive release is never traded for availability.
 
         Callers must ONLY invoke this after confirmed completion/failure of
-        the Open WebUI request. Unknown workload state must retain ownership.
-        Does NOT use Docker for container lifecycle management.
-
-        Verify-and-transition happen ATOMICALLY under ``_ownership_lock`` so a
-        concurrent second image request can never observe a half-released
-        state.
+        the Open WebUI request. Unknown workload state retains ownership
+        (callers never invoke this method in that case; there is NO
+        unconditional ``finally`` release).
         """
         async with self._ownership_lock:
             if self._gpu_owner != GPU_OWNER_COMFYUI:
-                logger.warning("comfyui_gpu_release_invalid owner=%s", self._gpu_owner)
+                logger.warning(
+                    "comfyui_gpu_release_invalid owner=%s", self._gpu_owner
+                )
+                return
+            self._gpu_owner = GPU_OWNER_RELEASING_COMFYUI
+
+        logger.info("comfyui_gpu_release_started")
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timeout_s = max(
+            1.0, float(getattr(self.settings, "comfyui_release_timeout_s", 120.0))
+        )
+        poll_interval_s = max(
+            0.05,
+            float(getattr(self.settings, "comfyui_release_poll_interval_s", 1.0)),
+        )
+        tolerance_mb = max(
+            0.0,
+            float(
+                getattr(self.settings, "comfyui_release_memory_tolerance_mb", 512.0)
+            ),
+        )
+        deadline = started + timeout_s
+        baseline_mb = self._comfyui_vram_free_baseline_mb
+
+        while True:
+            free_mb = await self._query_gpu_free_mem_mb()
+            router_clear = await self._router_has_no_resident_model()
+
+            if baseline_mb is not None and free_mb is not None:
+                observed = (
+                    f"free_mb={free_mb:.0f} baseline_mb={baseline_mb:.0f} "
+                    f"tolerance_mb={tolerance_mb:.0f}"
+                )
+                verified = free_mb >= (baseline_mb - tolerance_mb)
+                reason = "gpu_telemetry"
+            else:
+                # Telemetry unavailable: fall back to llama-router reporting
+                # zero resident models (plus Open WebUI's synchronous
+                # completion guarantee for the ComfyUI side).
+                observed = (
+                    f"router_clear={router_clear} "
+                    f"telemetry={'unavailable' if free_mb is None else 'no-baseline'}"
+                )
+                verified = router_clear is True
+                reason = "llama_router_status"
+
+            elapsed = loop.time() - started
+            if verified:
+                async with self._ownership_lock:
+                    if self._gpu_owner != GPU_OWNER_RELEASING_COMFYUI:
+                        raise LifecycleError(
+                            "comfyui_release_state_corrupted "
+                            f"(owner={self._gpu_owner!r})"
+                        )
+                    self._gpu_owner = None
+                logger.info(
+                    "comfyui_gpu_release_verified reason=%s elapsed_s=%.2f %s",
+                    reason,
+                    elapsed,
+                    observed,
+                )
+                logger.info("comfyui_gpu_available_for_llm")
                 return
 
-            self._gpu_owner = None
-            logger.info("comfyui_gpu_released")
+            if loop.time() >= deadline:
+                # SAFETY: leave the owner as releasing_comfyui — LLM
+                # acquisition stays blocked rather than risking a CUDA OOM.
+                logger.error(
+                    "comfyui_gpu_release_timeout elapsed_s=%.2f owner=%r %s; "
+                    "GPU NOT marked available for llama-router",
+                    loop.time() - started,
+                    GPU_OWNER_RELEASING_COMFYUI,
+                    observed,
+                )
+                raise LifecycleError(
+                    f"ComfyUI GPU release not verified within {timeout_s:.0f}s "
+                    f"({observed}); llama-router loading remains blocked"
+                )
+
+            logger.info(
+                "comfyui_gpu_release_waiting elapsed_s=%.2f timeout_s=%.0f %s",
+                elapsed,
+                timeout_s,
+                observed,
+            )
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(poll_interval_s, max(remaining, 0.05)))
 
     async def _get_llm_client(self) -> httpx.AsyncClient:
         """Create a short-lived HTTP client for llama-router API calls.

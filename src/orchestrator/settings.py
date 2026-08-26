@@ -125,6 +125,16 @@ class Settings(BaseSettings):
     # has reserved it (sentinel owners "comfyui" / "transitioning_to_comfyui").
     gpu_ownership_wait_timeout_s: float = 1800.0
 
+    # ComfyUI GPU-release barrier: after an Open WebUI generation completes,
+    # llama-router must NOT load a model until ComfyUI's VRAM is verifiably
+    # released. The barrier polls real observables with a bounded timeout.
+    comfyui_release_timeout_s: float = 120.0
+    comfyui_release_poll_interval_s: float = 1.0
+    # Tolerance below the pre-generation free-VRAM baseline (MB). The baseline
+    # is captured AFTER the LLM unload at acquisition time, so this compares a
+    # host against itself — there are no hard-coded absolute VRAM numbers.
+    comfyui_release_memory_tolerance_mb: float = 512.0
+
     # Persistent conversation evidence (Feature 3)
     # Bounds for reusable specialist evidence stored in the LangGraph
     # checkpoint. These are operational limits; the state model itself stays a

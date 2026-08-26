@@ -67,9 +67,26 @@ def make_image_generation_node(
 
         lifecycle = model_lifecycle
 
+        # Publish the started event BEFORE any potentially long-running work
+        # (GPU acquisition can wait for LLM inference to drain and unload the
+        # resident model). Without this the client-visible stream stays stuck
+        # on the controller's planning state for the entire image-generation
+        # duration. Publishing is lightweight/non-blocking by design
+        # (RequestEventStream.publish appends to an in-memory list).
+        if stream:
+            await stream.image_generation_started(
+                message="Image generation started.",
+            )
+
         # Acquire GPU ownership (waits for LLM inference, evicts resident
         # models through the existing llama-router unload flow).
         logger.info("acquiring_gpu_for_image_generation")
+        if stream:
+            await stream.specialist_progress(
+                specialist="image_generation",
+                message="Acquiring GPU for image generation.",
+                data={"stage": "acquiring_gpu"},
+            )
         await lifecycle.acquire_comfyui_gpu()
 
         # Workload tracking for GPU-ownership safety:
@@ -100,7 +117,11 @@ def make_image_generation_node(
                 )
 
             if stream:
-                await stream.image_generation_started(message="Generating image.")
+                await stream.specialist_progress(
+                    specialist="image_generation",
+                    message="Generating image.",
+                    data={"stage": "generating_image"},
+                )
 
             # Delegate entirely to Open WebUI. It reads its own current
             # persisted configuration on every request; no workflow or
@@ -130,8 +151,17 @@ def make_image_generation_node(
                 )
 
             # The synchronous endpoint returned successfully: the workload is
-            # confirmed complete, safe to release GPU ownership.
+            # confirmed complete, safe to release GPU ownership. The overall
+            # request is NOT complete yet: graph_finished/completed is only
+            # emitted by the API layer after this node returns, i.e. after
+            # GPU release has succeeded.
             logger.info("releasing_gpu_after_image_generation")
+            if stream:
+                await stream.specialist_progress(
+                    specialist="image_generation",
+                    message="Releasing GPU after image generation.",
+                    data={"stage": "releasing_gpu"},
+                )
             await lifecycle.release_comfyui_gpu()
             return state
 
