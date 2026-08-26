@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from ..clients.openwebui import (
     OpenWebUIAuthError,
@@ -18,7 +19,12 @@ from ..streaming.context import get_current_stream
 logger = get_logger(__name__)
 
 
-async def make_image_generation_node(settings: Settings):
+def make_image_generation_node(
+    settings: Settings,
+    *,
+    model_lifecycle: Any,
+    client_registry: Any,
+):
     """Create an image-generation node that delegates to Open WebUI.
 
     Open WebUI is the single source of truth for all image-generation
@@ -33,23 +39,33 @@ async def make_image_generation_node(settings: Settings):
     The endpoint is synchronous: a successful HTTP response means Open WebUI
     has fully completed the generation. A timeout/connection error leaves the
     workload state unknown, so GPU ownership is conservatively retained.
+
+    ``model_lifecycle`` and ``client_registry`` are injected at construction
+    time from the runtime (they are NOT reachable via ``execution.runtime``,
+    which is per-request execution state).
     """
 
+    if model_lifecycle is None:
+        raise ValueError("ModelLifecycle is required for the image-generation node")
+
     async def image_generation_node(state: OrchestratorState) -> OrchestratorState:
-        execution = state.execution
         request = state.request
         response = state.response
         evidence: EvidenceLedger = state.evidence
 
         stream = get_current_stream()
 
-        runtime = execution.runtime
-        lifecycle = runtime.lifecycle
-        client_registry = runtime.client_registry
-
-        openwebui_client = client_registry.get("openwebui")
+        try:
+            openwebui_client = client_registry.get("openwebui")
+        except KeyError as exc:
+            raise ValueError(
+                "Open WebUI client is not registered in the client registry "
+                "(required for image generation)"
+            ) from exc
         if not openwebui_client or not isinstance(openwebui_client, OpenWebUIClient):
             raise ValueError("Open WebUI client not available in registry")
+
+        lifecycle = model_lifecycle
 
         # Acquire GPU ownership (waits for LLM inference, evicts resident
         # models through the existing llama-router unload flow).

@@ -186,6 +186,7 @@ def build_graph(
     controller: ControllerEngine,
     knowledge_client: KnowledgeClient,
     client_registry: ClientRegistry,
+    model_lifecycle: Any,
     vision_pipeline: VisionPipeline,
     searxng_client: SearXNGClient | None = None,
 ) -> tuple[Any, Any]:
@@ -208,7 +209,11 @@ def build_graph(
     tools_node = make_tools_node(settings)
     validate_node = make_controller_validate_node(controller, settings)
     reasoning_node = make_reasoning_node(controller, settings)
-    image_generation_node = make_image_generation_node(settings)
+    image_generation_node = make_image_generation_node(
+        settings,
+        model_lifecycle=model_lifecycle,
+        client_registry=client_registry,
+    )
 
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
@@ -362,18 +367,12 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
 
     from ..runtime.model_lifecycle import ModelLifecycle
     from ..runtime.docker_runtime import DockerRuntime
-    
-    # Create Docker runtime for container management
+
+    # Create Docker runtime for EXISTING LLM container management only.
+    # Docker is never used for Open WebUI / ComfyUI GPU arbitration.
     docker = DockerRuntime()
-    
+
     provider = ModelProvider(settings)
-    
-    # Create ModelLifecycle for GPU coordination
-    model_lifecycle = ModelLifecycle(
-        settings=settings,
-        models=model_manager,
-        docker=docker,
-    )
 
     router_health_timeout = max(1.0, min(5.0, float(settings.health_timeout_s)))
     async with httpx.AsyncClient(
@@ -444,11 +443,22 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     )
     stream_hub = StreamHub()
 
+    # ModelLifecycle depends on the fully constructed ModelManager, so it is
+    # created here — AFTER model_manager and BEFORE the graph/runtime that
+    # consume it (initialization order: settings -> DockerRuntime ->
+    # ModelManager -> ModelLifecycle -> graph -> OrchestratorRuntime).
+    model_lifecycle = ModelLifecycle(
+        settings=settings,
+        models=model_manager,
+        docker=docker,
+    )
+
     graph, checkpointer = build_graph(
         settings=settings,
         controller=controller,
         knowledge_client=knowledge_client,
         client_registry=client_registry,
+        model_lifecycle=model_lifecycle,
         vision_pipeline=vision_pipeline,
         searxng_client=searxng_client,
     )
