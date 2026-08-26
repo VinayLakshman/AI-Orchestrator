@@ -66,7 +66,7 @@ Nodes are internally gated by classification flags:
 
 | Node | What it does |
 | --- | --- |
-| `classify` | Sets `needs_retrieval`, `needs_vision`, `needs_coder`, and `needs_tools` using keyword rules and image presence. |
+| `classify` | Sets `needs_retrieval`, `needs_vision`, `needs_coder`, and `needs_tools`. Routing is decided by the Controller LLM, which produces an `ExecutionPlan` / execution queue; the normalizer only performs structural normalization (attachments, URLs, code blocks) — it never routes on keywords. |
 | `retrieve` | Calls the Knowledge Service when `needs_retrieval=true`; formats returned chunks into `retrieved_context`. |
 | `vision` | Calls the configured Ollama vision model when images are present or vision is requested. |
 | `tools` | Calls the MCP Gateway stub with tool name `inspect` when tool use is requested. |
@@ -74,14 +74,8 @@ Nodes are internally gated by classification flags:
 | `synthesize` | Calls the configured main Ollama model to produce the final answer from the user request plus any intermediate context. |
 | `finish` | Ensures `final_answer` exists, falling back to intermediate outputs or `No answer generated.` |
 
-Classification keywords are currently simple string matches:
-
-| Flag | Trigger examples |
-| --- | --- |
-| `needs_retrieval` | `what does`, `how is`, `docs`, `knowledge`, `homelab`, `where is`, `why is`, `explain` |
-| `needs_vision` | image input, `image`, `screenshot`, `photo`, `diagram`, `visual`, `see this` |
-| `needs_coder` | `fix`, `patch`, `update`, `edit`, `generate code`, `compose`, `dockerfile`, `python`, `code` |
-| `needs_tools` | `run`, `restart`, `check logs`, `logs`, `status`, `shell`, `docker`, `git`, `home assistant` |
+Classification flags are decided by the Controller LLM when producing the
+`ExecutionPlan`; there is no deterministic keyword table.
 
 ## Runtime Dependencies
 
@@ -316,7 +310,7 @@ app/
     middleware/           Request ID middleware.
   adapters/               OpenAI response builder and Open WebUI content parser.
   clients/                HTTP clients for Ollama, Knowledge Service, and MCP Gateway.
-  graph/                  LangGraph builder, state type, and keyword classifier.
+  graph/                  LangGraph builder, state type, and specialist nodes.
   nodes/                  Graph node implementations.
   models/                 Pydantic request/response models.
   tools/                  Placeholder module boundary for future MCP-backed helpers.
@@ -329,7 +323,7 @@ tests/                    Unit and integration tests.
 
 ## Known Limitations
 
-- Routing is keyword-based and deterministic, not LLM-planned.
+- Routing is planned by the Controller LLM (semantic), not deterministic.
 - The graph executes every node in fixed order; nodes no-op when their classification flag is false.
 - Streaming is response-shape compatible but not token incremental.
 - Token usage values in responses are currently zero.

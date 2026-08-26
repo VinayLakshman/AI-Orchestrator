@@ -28,6 +28,7 @@ class SpecialistType(StrEnum):
     TOOLS = "tools"
     REASONING = "reasoning"
     CLARIFY = "clarify"
+    IMAGE_GENERATION = "image_generation"
 
 
 class ControllerAction(StrEnum):

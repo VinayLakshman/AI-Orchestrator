@@ -397,3 +397,61 @@ class StreamPublisher:
             stage="reasoning",
             message="Reasoning completed.",
         )
+
+    async def image_generation_started(
+        self,
+        *,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> StreamEvent:
+        return await self._emit(
+            StreamKind.IMAGE_GENERATION_STARTED,
+            **_clean_payload(
+                specialist="image_generation",
+                message=message or "Image generation started.",
+                data=data or {},
+            ),
+        )
+
+    async def image_generation_progress(
+        self,
+        *,
+        progress: float,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> StreamEvent:
+        return await self._emit(
+            StreamKind.IMAGE_GENERATION_PROGRESS,
+            **_clean_payload(
+                specialist="image_generation",
+                progress=progress,
+                message=message or f"Image generation in progress: {progress}%",
+                data=data or {},
+            ),
+        )
+
+    async def image_generation_finished(
+        self,
+        *,
+        success: bool = True,
+        image_url: str | None = None,
+        error: str | None = None,
+        message: str | None = None,
+    ) -> StreamEvent:
+        data: dict[str, Any] = {}
+        if image_url is not None:
+            data["image_url"] = image_url
+        if error is not None:
+            data["error"] = error
+        
+        return await self._emit(
+            StreamKind.IMAGE_GENERATION_FINISHED,
+            **_clean_payload(
+                specialist="image_generation",
+                status="success" if success else "failed",
+                message=message or (
+                    "Image generation completed." if success else "Image generation failed."
+                ),
+                data=data or {},
+            ),
+        )

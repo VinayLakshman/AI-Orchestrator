@@ -109,6 +109,22 @@ class Settings(BaseSettings):
     enable_rag: bool = True
     enable_vision: bool = True
 
+    # Image generation (delegated to Open WebUI)
+    # Open WebUI is the single source of truth for all image-generation
+    # configuration (engine, ComfyUI workflow, node mappings, model, size,
+    # steps). The orchestrator only needs the API boundary and a credential.
+    openwebui_base_url: str = "http://open-webui:8080"
+    # Externally reachable Open WebUI base URL used to make relative image
+    # file URLs absolute for the end client/browser. Falls back to
+    # openwebui_base_url when unset.
+    openwebui_public_base_url: str | None = None
+    openwebui_api_key: str | None = None
+    image_generation_timeout: float = 300.0  # 5 minutes
+
+    # Max time any requester waits for the GPU while image generation owns or
+    # has reserved it (sentinel owners "comfyui" / "transitioning_to_comfyui").
+    gpu_ownership_wait_timeout_s: float = 1800.0
+
     # Persistent conversation evidence (Feature 3)
     # Bounds for reusable specialist evidence stored in the LangGraph
     # checkpoint. These are operational limits; the state model itself stays a

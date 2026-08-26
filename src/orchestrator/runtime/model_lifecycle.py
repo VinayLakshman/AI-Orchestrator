@@ -28,6 +28,46 @@ class LifecycleState(StrEnum):
     WARM = "WARM"
     IDLE = "IDLE"
     STOPPING = "STOPPING"
+    # GPU ownership transition states
+    TRANSITIONING_TO_COMFYUI = "TRANSITIONING_TO_COMFYUI"
+    TRANSITIONING_TO_LLM = "TRANSITIONING_TO_LLM"
+
+
+# Logical GPU-ownership sentinel values stored in ModelLifecycle._gpu_owner.
+#
+# These strings are NOT Docker container names and must NEVER be passed to
+# any DockerRuntime / docker lifecycle operation:
+#
+#   "comfyui"                    -> image generation currently owns the GPU.
+#   "transitioning_to_comfyui"   -> image generation has atomically RESERVED
+#                                   the GPU and is preparing it (draining LLM
+#                                   inference / unloading the resident model).
+#   "TRANSITIONING_TO_LLM"       -> GPU is being handed back to the LLM pool.
+#   None                         -> GPU is free.
+#
+# Any other non-None value is a physical llama.cpp container name that MAY be
+# passed to Docker lifecycle operations.
+GPU_OWNER_COMFYUI = "comfyui"
+GPU_OWNER_TRANSITIONING_TO_COMFYUI = "transitioning_to_comfyui"
+GPU_OWNER_TRANSITIONING_TO_LLM = LifecycleState.TRANSITIONING_TO_LLM.value
+
+_IMAGE_GPU_SENTINELS = frozenset(
+    {
+        GPU_OWNER_COMFYUI,
+        GPU_OWNER_TRANSITIONING_TO_COMFYUI,
+        GPU_OWNER_TRANSITIONING_TO_LLM,
+    }
+)
+
+
+def is_llm_container_owner(value: str | None) -> bool:
+    """Return True only when ``value`` is a real llama.cpp container name.
+
+    Sentinel values ("comfyui", "transitioning_to_comfyui",
+    "TRANSITIONING_TO_LLM") and None are NOT containers and must never reach
+    Docker lifecycle functions.
+    """
+    return value is not None and value not in _IMAGE_GPU_SENTINELS
 
 
 @dataclass(slots=True)
@@ -114,7 +154,7 @@ class ModelLifecycle:
         *,
         settings: Settings,
         models: ModelManager,
-        docker: DockerRuntime,
+        docker: DockerRuntime | None = None,
         catalog_overrides: dict[str, ModelPolicy] | None = None,
         poll_interval_s: float = 60.0,
     ) -> None:
@@ -479,6 +519,41 @@ class ModelLifecycle:
                     return True
         return False
 
+    async def _wait_for_llm_gpu_availability(self, container_name: str) -> None:
+        """Block until the GPU is free or already owned by ``container_name``.
+
+        Image generation may own or have reserved the GPU (sentinel values
+        "comfyui" / "transitioning_to_comfyui"). LLM requests must WAIT in
+        that case — they must never evict ComfyUI, stop a sentinel-named
+        "container", or clear ownership. Raises LifecycleError if the wait
+        exceeds ``gpu_ownership_wait_timeout_s``.
+        """
+        timeout_s = float(getattr(self.settings, "gpu_ownership_wait_timeout_s", 1800.0))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+
+        while True:
+            async with self._ownership_lock:
+                owner = self._gpu_owner
+
+            if owner is None or owner == container_name:
+                return
+
+            if self._closing:
+                raise LifecycleError(
+                    "Lifecycle shutting down while waiting for GPU availability"
+                )
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise LifecycleError(
+                    f"Timed out waiting for GPU availability (owner={owner!r}); "
+                    "image generation owns/reserves the GPU"
+                )
+
+            logger.info("llm_gpu_wait_for_availability owner=%s", owner)
+            await asyncio.sleep(2)
+
     async def ensure_warm(self, role: str) -> None:
         """Make sure the model is warm before use."""
         role = role.lower().strip()
@@ -531,6 +606,13 @@ class ModelLifecycle:
         # GPU residency is exclusive: exactly one llama.cpp container may own the
         # GPU at a time. Serialize all ownership transitions so two threads can
         # never race stop/start across different containers (invariant preserved).
+        #
+        # Invariant: an LLM request can NEVER acquire the GPU while image
+        # generation owns it ("comfyui") or has reserved it
+        # ("transitioning_to_comfyui"). Wait outside the ownership lock until
+        # the GPU is free instead of evicting a logical ownership sentinel.
+        await self._wait_for_llm_gpu_availability(container_name)
+
         async with self._ownership_lock:
             try:
                 # If a sibling logical role already brought this same physical
@@ -554,7 +636,17 @@ class ModelLifecycle:
 
                 # Stop whatever currently owns the GPU so the target container can
                 # take exclusive residency. Only one owner may exist at a time.
-                if self._gpu_owner is not None and self._gpu_owner != container_name:
+                #
+                # SAFETY: the previous owner is only ever stopped when it is a
+                # REAL llama.cpp container name. Logical sentinels ("comfyui",
+                # "transitioning_to_comfyui", "TRANSITIONING_TO_LLM") are never
+                # passed to Docker. (The pre-lock wait above already blocks
+                # while image generation owns/reserves the GPU; this guard is
+                # defense in depth.)
+                if (
+                    is_llm_container_owner(self._gpu_owner)
+                    and self._gpu_owner != container_name
+                ):
                     previous_owner = self._gpu_owner
                     logger.info(
                         "gpu_ownership_transfer from=%s to=%s via_role=%s",
@@ -869,3 +961,182 @@ class ModelLifecycle:
                 raise
             except Exception:
                 logger.exception("model_lifecycle_cleanup_loop_error")
+                
+    async def acquire_comfyui_gpu(self) -> None:
+        """Acquire exclusive GPU ownership for image generation.
+
+        Ownership state machine (all transitions under ``_ownership_lock``):
+
+            FREE (None) or LLM_OWNED (<container>)
+                --atomic reservation--> TRANSITIONING_TO_COMFYUI
+            [outside lock] wait for active LLM inference == 0
+            [HTTP] unload resident llama-router model (POST /models/unload,
+                   NOT /sleep) and verify via GET /v1/models
+            TRANSITIONING_TO_COMFYUI --atomic finalize--> COMFYUI ("comfyui")
+
+        Guarantees:
+        - Concurrent image requests SERIALIZE: while another request holds
+          "comfyui" or "transitioning_to_comfyui", this request WAITS for the
+          owner to be released instead of borrowing its ownership token.
+        - Once reserved, no LLM request may acquire or reclaim the GPU.
+        - No Docker operations are used anywhere in this transition.
+        - On any failure the reservation rolls back to its previous value so
+          the GPU never wedges permanently in the transitioning state.
+        """
+        # Step 1: Atomically reserve the transition (from ANY prior state).
+        previous_owner: str | None = None
+        while True:
+            occupied: str | None = None
+            async with self._ownership_lock:
+                owner = self._gpu_owner
+                if owner in {GPU_OWNER_COMFYUI, GPU_OWNER_TRANSITIONING_TO_COMFYUI}:
+                    # Another image generation owns/reserved the GPU: wait for
+                    # it to be fully released rather than sharing ownership.
+                    occupied = owner
+                else:
+                    previous_owner = owner
+                    self._gpu_owner = GPU_OWNER_TRANSITIONING_TO_COMFYUI
+                    logger.info(
+                        "acquiring_comfyui_gpu: transition reserved previous_owner=%s",
+                        previous_owner,
+                    )
+            if occupied is None:
+                break
+            logger.info("comfyui_gpu_wait_for_existing_generation owner=%s", occupied)
+            await asyncio.sleep(2)
+
+        reservation_held = True
+
+        try:
+            # Step 2: Wait for active LLM inference to drain (outside lock).
+            roles_to_check = ["controller", "reasoning", "coder", "vision"]
+            for role in roles_to_check:
+                while True:
+                    async with self._state_lock:
+                        state = self._runtime.get(role)
+
+                    if state is None or state.active_inference_count == 0:
+                        break
+
+                    logger.info(
+                        "comfyui_gpu_wait_for_inference role=%s count=%d",
+                        role,
+                        state.active_inference_count,
+                    )
+                    await asyncio.sleep(2)
+
+            # Step 3: Get actual resident model from llama-router.
+            # This HTTP client is owned by this call (NOT the shared registry
+            # client) and is closed when the context exits.
+            async with await self._get_llm_client() as client:
+                try:
+                    resp = await client.get("/v1/models")
+                    resp.raise_for_status()
+                    models_data = resp.json()
+
+                    # Find the actually loaded model
+                    resident_model = None
+                    for model in models_data.get("data", []):
+                        status = model.get("status", {})
+                        if status.get("value") in ("loaded", "loading", "sleeping"):
+                            resident_model = model.get("id")
+                            break
+
+                    logger.info("comfyui_gpu: resident_model=%s", resident_model or "none")
+
+                    # Step 4: Unload the resident model if any
+                    if resident_model:
+                        logger.info("unload_llm_model_for_comfyui model=%s", resident_model)
+                        unload_resp = await client.post(
+                            "/models/unload",
+                            json={"model": resident_model}
+                        )
+                        unload_resp.raise_for_status()
+
+                        # Step 5: Poll until confirmed unloaded
+                        for _ in range(30):  # Wait up to 60 seconds
+                            await asyncio.sleep(2)
+                            check_resp = await client.get("/v1/models")
+                            check_resp.raise_for_status()
+                            models_data = check_resp.json()
+
+                            for model in models_data.get("data", []):
+                                if model.get("id") == resident_model:
+                                    status = model.get("status", {}).get("value")
+                                    if status == "unloaded":
+                                        logger.info("llm_model_confirmed_unloaded model=%s", resident_model)
+                                        resident_model = None
+                                        break
+
+                            if resident_model is None:
+                                break
+
+                    if resident_model is not None:
+                        raise LifecycleError(f"Failed to unload llama-router model: {resident_model}")
+
+                except httpx.HTTPError as e:
+                    logger.error("llama_router_api_error error=%r", e)
+                    raise LifecycleError(f"llama-router API error: {e}")
+
+            # Step 6: Revalidate and atomically finalize COMFYUI_ACTIVE.
+            async with self._ownership_lock:
+                if self._gpu_owner != GPU_OWNER_TRANSITIONING_TO_COMFYUI:
+                    raise LifecycleError(
+                        "comfyui_gpu_reservation_lost "
+                        f"(owner={self._gpu_owner!r}); acquisition aborted"
+                    )
+                self._gpu_owner = GPU_OWNER_COMFYUI
+                logger.info("comfyui_gpu_acquired")
+            reservation_held = False
+
+        except BaseException:
+            # Roll back the atomic reservation so the GPU never wedges in the
+            # transitioning state after a failed preparation (unload error,
+            # timeout, cancellation, ...). Only revert if we still hold it.
+            if reservation_held:
+                async with self._ownership_lock:
+                    if self._gpu_owner == GPU_OWNER_TRANSITIONING_TO_COMFYUI:
+                        self._gpu_owner = previous_owner
+                        logger.info(
+                            "comfyui_gpu_reservation_rolled_back restored_owner=%s",
+                            previous_owner,
+                        )
+            raise
+
+    async def release_comfyui_gpu(self) -> None:
+        """Release GPU ownership after confirmed image-generation completion.
+
+        The orchestrator no longer owns any direct ComfyUI workload: image
+        generation is delegated to Open WebUI, whose synchronous API returns
+        only after its generation has completed. Therefore no ComfyUI /free
+        call is performed here — ComfyUI memory management belongs to Open
+        WebUI. This method only transitions GPU ownership back to free.
+
+        Callers must ONLY invoke this after confirmed completion/failure of
+        the Open WebUI request. Unknown workload state must retain ownership.
+        Does NOT use Docker for container lifecycle management.
+
+        Verify-and-transition happen ATOMICALLY under ``_ownership_lock`` so a
+        concurrent second image request can never observe a half-released
+        state.
+        """
+        async with self._ownership_lock:
+            if self._gpu_owner != GPU_OWNER_COMFYUI:
+                logger.warning("comfyui_gpu_release_invalid owner=%s", self._gpu_owner)
+                return
+
+            self._gpu_owner = None
+            logger.info("comfyui_gpu_released")
+
+    async def _get_llm_client(self) -> httpx.AsyncClient:
+        """Create a short-lived HTTP client for llama-router API calls.
+
+        The returned client is owned by the caller and MUST be closed (use
+        ``async with``). It is intentionally NOT a shared registry client.
+        """
+        base_url = self.settings.model_router_url
+        if base_url.endswith("/v1"):
+            base_url = base_url[: -len("/v1")]
+        return httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=httpx.Timeout(30.0))
+
+            

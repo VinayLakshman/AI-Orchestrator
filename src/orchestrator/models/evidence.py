@@ -158,6 +158,8 @@ class EvidenceLedger(BaseModel):
 
     reasoning: ReasoningEvidence | None = None
 
+    comfyui: dict | None = None  # ComfyUI job results
+
     @property
     def has_repository(self) -> bool:
         return self.repository is not None
@@ -181,6 +183,10 @@ class EvidenceLedger(BaseModel):
     @property
     def has_reasoning(self) -> bool:
         return self.reasoning is not None
+
+    @property
+    def has_comfyui(self) -> bool:
+        return self.comfyui is not None
 
     def available_sources(self) -> list[str]:
         """

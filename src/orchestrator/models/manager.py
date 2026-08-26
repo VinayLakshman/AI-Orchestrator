@@ -53,6 +53,15 @@ class ModelManager:
     def model_for_role(self, role: str) -> str:
         return self.provider.model_for_role(role)
 
+    def container_for_role(self, role: str) -> str:
+        """Return the container name for a given model role.
+        
+        Used by ModelLifecycle for GPU ownership management.
+        """
+        model_name = self.provider.model_for_role(role)
+        # Default to container name being the same as model name for llama-router containers
+        return model_name
+
     def client(self, role: str) -> Any:
         """Return the inference client for a model role."""
         return self.client_registry.get(role)

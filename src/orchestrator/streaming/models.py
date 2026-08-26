@@ -19,6 +19,10 @@ class StreamKind(StrEnum):
     LLM_TOKEN = "llm_token"
     LLM_FINISHED = "llm_finished"
 
+    IMAGE_GENERATION_STARTED = "image_generation_started"
+    IMAGE_GENERATION_PROGRESS = "image_generation_progress"
+    IMAGE_GENERATION_FINISHED = "image_generation_finished"
+
     ERROR = "error"
 
 

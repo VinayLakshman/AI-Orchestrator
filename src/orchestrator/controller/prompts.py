@@ -325,6 +325,36 @@ A tool must materially contribute to completing the request.
 REASONING
 --------------------------------------------------
 
+IMAGE_GENERATION
+
+Use IMAGE_GENERATION when, based on the semantic meaning of the request, the
+user's requested output is an actual generated visual/image. This specialist
+delegates image generation to the image-generation service; it never analyzes
+existing images.
+
+Select IMAGE_GENERATION when:
+
+- The user's intent is to obtain a new generated visual/image as the output
+- The request describes what an image should depict
+- A visual artifact is the deliverable, not text or code
+
+Do NOT use IMAGE_GENERATION when:
+
+- The request is about analyzing or describing an existing image (use VISION)
+- The user merely mentions images, photos, pictures, or drawings while asking
+  for something else
+- A text description or explanation is sufficient
+
+Base the decision on meaning, never on the presence of specific words.
+VISION remains responsible for analyzing existing images;
+IMAGE_GENERATION is responsible only for producing new ones.
+
+IMAGE_GENERATION coordinates GPU resources with LLM containers.
+It waits for active LLM inference to complete and evicts resident models
+before starting generation.
+
+--------------------------------------------------
+
 REASONING is a synthesis capability, not an information source.
 
 Use it when the task benefits from combining, evaluating, or reconciling

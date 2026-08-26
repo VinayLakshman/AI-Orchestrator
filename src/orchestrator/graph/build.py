@@ -21,6 +21,7 @@ from ..settings import Settings
 from ..specialists.web import WebSpecialist
 from ..streaming.hub import StreamHub
 from ..vision.pipeline import VisionPipeline
+from .image_generation import make_image_generation_node
 from .nodes import (
     make_clarify_node,
     make_controller_plan_node,
@@ -116,6 +117,7 @@ class OrchestratorRuntime:
 
     controller: ControllerEngine
     knowledge_client: KnowledgeClient
+    model_lifecycle: Any
     client_registry: ClientRegistry
     vision_pipeline: VisionPipeline
     stream_hub: StreamHub
@@ -129,6 +131,7 @@ class OrchestratorRuntime:
             "model_manager": self.model_manager,
             "controller": self.controller,
             "knowledge_client": self.knowledge_client,
+            "model_lifecycle": self.model_lifecycle,
             "client_registry": self.client_registry,
             "vision_pipeline": self.vision_pipeline,
             "stream_hub": self.stream_hub,
@@ -205,6 +208,7 @@ def build_graph(
     tools_node = make_tools_node(settings)
     validate_node = make_controller_validate_node(controller, settings)
     reasoning_node = make_reasoning_node(controller, settings)
+    image_generation_node = make_image_generation_node(settings)
 
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
@@ -218,6 +222,7 @@ def build_graph(
     tools_node = timed_node("tools", tools_node, display_name="Tools")
     validate_node = timed_node("validation", validate_node, display_name="Validation")
     reasoning_node = timed_node("reasoning", reasoning_node, display_name="Reasoning")
+    image_generation_node = timed_node("image_generation", image_generation_node, display_name="Image Generation")
     clarify_node = timed_node("clarify", clarify_node, display_name="Clarification")
     finalize_node = timed_node("finalize", finalize_node, display_name="Finalizer")
 
@@ -230,6 +235,7 @@ def build_graph(
     builder.add_node("tools", tools_node)
     builder.add_node("validate", validate_node)
     builder.add_node("reasoning", reasoning_node)
+    builder.add_node("image_generation", image_generation_node)
     builder.add_node("clarify", clarify_node)
     builder.add_node("finalize", finalize_node)
 
@@ -311,6 +317,7 @@ def build_graph(
             "coder": "coder",
             "tools": "tools",
             "reasoning": "reasoning",
+            "image_generation": "image_generation",
             "finalize": "finalize",
             "clarify": "clarify",
         },
@@ -321,6 +328,7 @@ def build_graph(
     builder.add_edge("web", "validate")
     builder.add_edge("coder", "validate")
     builder.add_edge("tools", "validate")
+    builder.add_edge("image_generation", "validate")
 
     builder.add_conditional_edges(
         "validate",
@@ -332,12 +340,14 @@ def build_graph(
             "coder": "coder",
             "tools": "tools",
             "reasoning": "reasoning",
+            "image_generation": "image_generation",
             "finalize": "finalize",
             "clarify": "clarify",
         },
     )
 
     builder.add_edge("reasoning", "finalize")
+    builder.add_edge("image_generation", "finalize")
     builder.add_edge("clarify", END)
     builder.add_edge("finalize", END)
 
@@ -350,7 +360,20 @@ def build_graph(
 async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     logger.info("registering runtime dependencies")
 
+    from ..runtime.model_lifecycle import ModelLifecycle
+    from ..runtime.docker_runtime import DockerRuntime
+    
+    # Create Docker runtime for container management
+    docker = DockerRuntime()
+    
     provider = ModelProvider(settings)
+    
+    # Create ModelLifecycle for GPU coordination
+    model_lifecycle = ModelLifecycle(
+        settings=settings,
+        models=model_manager,
+        docker=docker,
+    )
 
     router_health_timeout = max(1.0, min(5.0, float(settings.health_timeout_s)))
     async with httpx.AsyncClient(
@@ -372,6 +395,19 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     )
 
     client_registry = ClientRegistry()
+
+    # Register Open WebUI client (image-generation delegation boundary).
+    # Open WebUI owns all image-generation configuration; the orchestrator
+    # only calls its authenticated image-generation API.
+    openwebui_client = None
+    if settings.openwebui_base_url:
+        from ..clients.openwebui import OpenWebUIClient
+        openwebui_http = httpx.AsyncClient(
+            base_url=settings.openwebui_base_url,
+            timeout=max(settings.image_generation_timeout, 60.0),
+        )
+        openwebui_client = OpenWebUIClient(settings=settings, client=openwebui_http)
+        client_registry.register("openwebui", openwebui_client)
 
     router_client = LlamaCppClient(
         settings=settings,
@@ -422,6 +458,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         model_manager=model_manager,
         controller=controller,
         knowledge_client=knowledge_client,
+        model_lifecycle=model_lifecycle,
         client_registry=client_registry,
         vision_pipeline=vision_pipeline,
         stream_hub=stream_hub,
