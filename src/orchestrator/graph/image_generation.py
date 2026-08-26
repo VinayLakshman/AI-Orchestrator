@@ -72,7 +72,6 @@ def make_image_generation_node(
         logger.info("acquiring_gpu_for_image_generation")
         await lifecycle.acquire_comfyui_gpu()
 
-        prompt = request.user_input or ""
         # Workload tracking for GPU-ownership safety:
         #   "not_started"  -> request not yet dispatched to Open WebUI
         #                     (release on failure is safe)
@@ -83,6 +82,23 @@ def make_image_generation_node(
         workload_state = "not_started"
 
         try:
+            # Canonical user prompt: RequestState.user_message is populated by
+            # normalize_openai_request() from the latest user message and is
+            # the same canonical representation every other specialist reads.
+            # Falls back to the original/resolved query for robustness only;
+            # no keyword routing or prompt reconstruction happens here.
+            prompt = (
+                request.user_message
+                or request.original_query
+                or request.resolved_query
+                or ""
+            ).strip()
+            if not prompt:
+                raise ValueError(
+                    "Image generation request has no user prompt "
+                    "(request.user_message/original_query/resolved_query are empty)"
+                )
+
             if stream:
                 await stream.image_generation_started(message="Generating image.")
 
