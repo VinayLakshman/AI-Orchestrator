@@ -67,15 +67,19 @@ _IMAGE_GPU_SENTINELS = frozenset(
 
 # llama-router model-status vocabulary (GET /v1/models, status.value).
 #
-# USABLE  : the router itself considers the model resident and serving
-#           ("model is already running" proves the router uses *more* active
-#           states than just "loaded" — e.g. "running"). Any of these must
-#           NEVER be followed by POST /models/load.
+# READY  : the router itself considers the model resident/usable
+#          ("model is already running" proves the router uses *more* active
+#          states than just "loaded" — e.g. "running"). "sleeping" is part of
+#          the router's own residency lifecycle (keep-alive expired but the
+#          server stays resident and wakes on demand), so it is treated as
+#          usable too — never a reason to POST /models/load.
 # TRANSITIONAL: an in-flight residency transition. Issuing a competing load
-#           here can race the transition already under way (HTTP 400 "model
-#           is already running"); we wait instead.
-_ROUTER_READY_STATUSES = frozenset({"loaded", "ready", "running"})
-_ROUTER_TRANSITIONAL_STATUSES = frozenset({"loading", "sleeping"})
+#          here can race the transition already under way (HTTP 400 "model
+#          is already running"); we wait instead.
+_ROUTER_READY_STATUSES = frozenset(
+    {"loaded", "ready", "running", "sleeping"}
+)
+_ROUTER_TRANSITIONAL_STATUSES = frozenset({"loading"})
 
 
 def is_llm_container_owner(value: str | None) -> bool:
@@ -1657,16 +1661,25 @@ class ModelLifecycle:
                 ) from exc
 
             status_value: str | None = None
+            status_failed: bool | None = None
+            status_exit_code: int | None = None
             found = False
             for model in models_data.get("data", []):
                 if model.get("id") == model_name:
                     found = True
                     status = model.get("status", {})
-                    status_value = (
-                        status.get("value")
-                        if isinstance(status, dict)
-                        else status
-                    )
+                    if isinstance(status, dict):
+                        status_value = status.get("value")
+                        # Full status metadata: a literal "unloaded" value can
+                        # carry failure/stale context ("failed": true,
+                        # "exit_code": 1) that must NOT be silently equated
+                        # with a clean, safe-to-load state.
+                        if isinstance(status.get("failed"), bool):
+                            status_failed = status["failed"]
+                        if isinstance(status.get("exit_code"), int):
+                            status_exit_code = status["exit_code"]
+                    else:
+                        status_value = status
                     break
 
             # Decision log: makes the next production run show exactly why
@@ -1698,8 +1711,19 @@ class ModelLifecycle:
                 return
             else:
                 # Genuinely not resident ("unloaded", or an unknown status we
-                # cannot prove usable) — request the load.
+                # cannot prove usable) — request the load. Include any
+                # failure metadata so operators can see whether the prior
+                # state was a clean unload or a stale/failed instance.
                 action = "load"
+                if status_failed is not None or status_exit_code is not None:
+                    logger.info(
+                        "llama_router_prior_state_metadata model=%s "
+                        "status=%s failed=%s exit_code=%s",
+                        model_name,
+                        status_value,
+                        status_failed,
+                        status_exit_code,
+                    )
 
             logger.info(
                 "llama_router_controller_state "
@@ -1734,45 +1758,30 @@ class ModelLifecycle:
                     body,
                 )
 
-                # Benign race recovery: if another path loaded the model
-                # between our state check and this POST, the router answers
-                # 400 "model is already running". Re-query the router state;
-                # if the model is genuinely usable, converge on readiness.
+                # The router is authoritative about lifecycle conflicts. An
+                # HTTP 400 "model is already running" response means a model
+                # instance/transition exists RIGHT NOW — even if the last
+                # /v1/models snapshot (which can be stale/inconsistent) said
+                # "unloaded". Treat it as a race/synchronization signal:
+                # wait for the existing router-side lifecycle to settle and
+                # become ready within the bounded timeout. A second
+                # POST /models/load MUST NOT be fired here.
                 if (
                     isinstance(status_code, int)
                     and status_code == 400
                     and "already running" in body.lower()
                 ):
-                    try:
-                        recheck = await client.get("/v1/models")
-                        recheck.raise_for_status()
-                        recheck_data = recheck.json()
-                    except (httpx.HTTPError, ValueError):
-                        recheck_data = None
-                    if recheck_data is not None:
-                        for model in recheck_data.get("data", []):
-                            if model.get("id") != model_name:
-                                continue
-                            recheck_status = self._router_model_status_value(
-                                model
-                            )
-                            if recheck_status in _ROUTER_READY_STATUSES:
-                                logger.warning(
-                                    "llama_router_load_race_resolved "
-                                    "model=%s status=%s (router rejected "
-                                    "the load with 'already running' but "
-                                    "reports the model usable; converged "
-                                    "on verified readiness)",
-                                    model_name,
-                                    recheck_status,
-                                )
-                                return
-                    raise LifecycleError(
-                        f"Failed to load controller model '{model_name}' in "
-                        f"llama-router (HTTP {status_code}): {body!r}. The "
-                        f"router said 'already running' but does NOT report "
-                        f"the model as usable; refusing to guess readiness."
-                    ) from exc
+                    logger.warning(
+                        "llama_router_load_conflict_already_running "
+                        "model=%s status=%s body=%r; treating as an active "
+                        "router-side transition, waiting for convergence "
+                        "(no competing load will be issued)",
+                        model_name,
+                        status_code,
+                        body,
+                    )
+                    await self._wait_router_model_settled(model_name)
+                    return
 
                 # Preserve the actual status/body so an operator can
                 # distinguish the real cause (e.g. invalid request vs.
@@ -1802,6 +1811,88 @@ class ModelLifecycle:
                     f"Transport error loading controller model "
                     f"'{model_name}' in llama-router: {exc}"
                 ) from exc
+
+    async def _wait_router_model_settled(self, model_name: str) -> None:
+        """Bounded wait for a router model to converge on readiness.
+
+        Used specifically as recovery for an HTTP 400 "model is already
+        running" response from POST /models/load: the router is authoritative
+        that an instance/transition exists even when the preceding
+        /v1/models snapshot was stale/inconsistent. This helper NEVER issues
+        another load request — it only re-queries /v1/models until the model
+        reports a ready status or ``controller_load_timeout_s`` expires.
+
+        Raises ``LifecycleError`` on timeout, preserving the last observed
+        status so operators can see exactly where the lifecycle stalled.
+        """
+        timeout_s = max(
+            1.0,
+            float(getattr(self.settings, "controller_load_timeout_s", 300.0)),
+        )
+        poll_interval_s = max(0.5, float(self.settings.health_poll_interval_s))
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        last_status: str | None = None
+
+        while loop.time() < deadline:
+            if self._closing:
+                raise LifecycleError(
+                    f"Lifecycle shutting down while waiting for "
+                    f"model '{model_name}' to settle"
+                )
+            try:
+                async with await self._get_llm_client() as client:
+                    resp = await client.get("/v1/models")
+                    resp.raise_for_status()
+                    models_data = resp.json()
+            except (httpx.HTTPError, ValueError):
+                # Transient probe failures during convergence are not fatal:
+                # keep polling until the bounded deadline expires.
+                await asyncio.sleep(poll_interval_s)
+                continue
+
+            found = False
+            for model in models_data.get("data", []):
+                if model.get("id") == model_name:
+                    found = True
+                    candidate_status = self._router_model_status_value(model)
+                    if candidate_status in _ROUTER_READY_STATUSES:
+                        logger.warning(
+                            "llama_router_already_running_resolved "
+                            "model=%s status=%s (load request was rejected "
+                            "with 'already running'; converged on verified "
+                            "readiness without issuing another load)",
+                            model_name,
+                            candidate_status,
+                        )
+                        return
+                    if candidate_status != last_status:
+                        logger.info(
+                            "llama_router_waiting_for_settle model=%s "
+                            "status=%s",
+                            model_name,
+                            candidate_status,
+                        )
+                        last_status = candidate_status
+                    break
+
+            if not found and last_status != "not_listed":
+                last_status = "not_listed"
+                logger.info(
+                    "llama_router_waiting_for_settle model=%s status=not_listed",
+                    model_name,
+                )
+
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(poll_interval_s, max(remaining, 0.05)))
+
+        raise LifecycleError(
+            f"llama-router reported 'model is already running' for "
+            f"'{model_name}' but the model did not reach a usable state "
+            f"within {timeout_s:.0f}s (last observed status: "
+            f"{last_status or 'unknown'}); controller loading remains blocked"
+        )
 
     async def _wait_model_ready(
         self, role: str, timeout_s: float | None = None
