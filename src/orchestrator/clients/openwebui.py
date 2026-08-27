@@ -79,9 +79,13 @@ class OpenWebUIClient:
         # short-lived client per request and closes that one.
         self.client = client
         self.base_url = settings.openwebui_base_url.rstrip("/")
-        self._public_base_url = (
-            settings.openwebui_public_base_url or settings.openwebui_base_url
-        ).rstrip("/")
+        # Service origins that may appear in Open WebUI-generated file URLs.
+        # These are STRIPPED back to relative paths for browser delivery —
+        # they are never used to prefix image results.
+        legacy_public = (settings.openwebui_public_base_url or "").rstrip("/")
+        self._service_origins: tuple[str, ...] = tuple(
+            origin for origin in (self.base_url, legacy_public) if origin
+        )
 
     def _create_owned_client(self) -> httpx.AsyncClient:
         """Create a NEW AsyncClient owned by the caller of generate_image."""
@@ -91,10 +95,31 @@ class OpenWebUIClient:
         )
         return httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
 
-    def _public_url(self, url: str) -> str:
-        """Convert a relative Open WebUI file URL into an absolute URL using
-        the externally reachable base URL (falls back to the internal base)."""
-        return self._absolute_url(self._public_base_url, url)
+    def _image_result_url(self, url: str) -> str:
+        """Return the BROWSER-FACING representation of an Open WebUI image URL.
+
+        Generated images are rendered by the user's browser through Open WebUI,
+        which resolves relative paths against its own public origin. The
+        Docker-internal service hostname is NOT resolvable by the browser, so:
+
+        - ``/api/v1/files/<id>/content`` is preserved EXACTLY as returned;
+        - an absolute URL pointing at one of our configured Open WebUI service
+          origins has that origin stripped back to its relative path
+          (``http://open-webui:8080/api/v1/files/<id>/content``
+          → ``/api/v1/files/<id>/content``);
+        - any other external URL is left untouched.
+
+        Query strings, fragments and percent-encoding are never modified.
+        """
+        cleaned = url.strip()
+        if not cleaned:
+            return ""
+        for origin in sorted(self._service_origins, key=len, reverse=True):
+            if cleaned.startswith(f"{origin}/"):
+                remainder = cleaned[len(origin):]
+                # Guarantee exactly one leading slash.
+                return "/" + remainder.lstrip("/") if remainder else "/"
+        return cleaned
 
     def _auth_headers(self) -> dict[str, str]:
         api_key = self.settings.openwebui_api_key
@@ -104,13 +129,6 @@ class OpenWebUIClient:
                 "against Open WebUI for image generation"
             )
         return {"Authorization": f"Bearer {api_key}"}
-
-    @staticmethod
-    def _absolute_url(base_url: str, url: str) -> str:
-        """Open WebUI may return relative file URLs (``/api/v1/files/...``)."""
-        if url.startswith(("http://", "https://")):
-            return url
-        return f"{base_url}{url if url.startswith('/') else '/' + url}"
 
     async def generate_image(
         self,
@@ -224,7 +242,7 @@ class OpenWebUIClient:
             url = item.get("url")
             if isinstance(url, str) and url.strip():
                 urls.append(
-                    GeneratedImage(url=self._public_url(url.strip()))
+                    GeneratedImage(url=self._image_result_url(url.strip()))
                 )
 
         if not urls:

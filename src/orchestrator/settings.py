@@ -120,9 +120,12 @@ class Settings(BaseSettings):
     # configuration (engine, ComfyUI workflow, node mappings, model, size,
     # steps). The orchestrator only needs the API boundary and a credential.
     openwebui_base_url: str = "http://open-webui:8080"
-    # Externally reachable Open WebUI base URL used to make relative image
-    # file URLs absolute for the end client/browser. Falls back to
-    # openwebui_base_url when unset.
+    # Legacy setting kept for configuration compatibility. Generated image
+    # URLs are now delivered as RELATIVE Open WebUI paths (the browser resolves
+    # them against the public origin), so this value is no longer used for
+    # browser-facing image URL normalization. It is retained only as a
+    # recognized service origin that may be stripped from absolute generated
+    # file URLs.
     openwebui_public_base_url: str | None = None
     openwebui_api_key: str | None = None
     image_generation_timeout: float = 300.0  # 5 minutes
