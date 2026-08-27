@@ -333,7 +333,33 @@ def build_graph(
     builder.add_edge("web", "validate")
     builder.add_edge("coder", "validate")
     builder.add_edge("tools", "validate")
-    builder.add_edge("image_generation", "validate")
+
+    # Image generation is a TERMINAL workload path. It must NOT fan out into
+    # normal controller validation or normal textual finalization:
+    #
+    #   - Both former edges ("image_generation" -> "validate" and
+    #     "image_generation" -> "finalize") scheduled two parallel sibling
+    #     nodes in the same Pregel superstep. Both nodes return the complete
+    #     OrchestratorState, so both wrote every channel — including the
+    #     reducer-less ``request`` LastValue channel — which raised
+    #     langgraph.errors.InvalidUpdateError
+    #     ("At key 'request': Can receive only one value per step").
+    #
+    #   - An image result never needs LLM validation/finalization; routing it
+    #     there made the controller stream a textual refusal after a
+    #     successful generation.
+    #
+    # The image-generation node itself owns the full lifecycle boundary and
+    # does not return until:
+    #
+    #   generate -> capture result -> image_generation_finished(success=True)
+    #            -> release_comfyui_gpu() (verified VRAM release) -> return
+    #
+    # It does NOT proactively reload the controller; the next request acquires
+    # whatever resource it needs through the normal lifecycle machinery.
+    # graph_finished is published by the API layer only after this node
+    # returns, so it cannot precede successful ComfyUI release.
+    builder.add_edge("image_generation", END)
 
     builder.add_conditional_edges(
         "validate",
@@ -345,14 +371,12 @@ def build_graph(
             "coder": "coder",
             "tools": "tools",
             "reasoning": "reasoning",
-            "image_generation": "image_generation",
             "finalize": "finalize",
             "clarify": "clarify",
         },
     )
 
     builder.add_edge("reasoning", "finalize")
-    builder.add_edge("image_generation", "finalize")
     builder.add_edge("clarify", END)
     builder.add_edge("finalize", END)
 

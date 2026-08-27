@@ -25,7 +25,7 @@ def make_image_generation_node(
     model_lifecycle: Any,
     client_registry: Any,
 ):
-    """Create an image-generation node that delegates to Open WebUI.
+    """Create a TERMINAL image-generation node that delegates to Open WebUI.
 
     Open WebUI is the single source of truth for all image-generation
     configuration (ComfyUI workflow, node mappings, model, size, steps).
@@ -35,6 +35,14 @@ def make_image_generation_node(
     2. Calls Open WebUI's authenticated image-generation API.
     3. Returns the image results produced by Open WebUI.
     4. Releases GPU ownership only after confirmed completion.
+
+    The node owns the full terminal lifecycle boundary of the image path.
+    On success it does NOT return until ``release_comfyui_gpu()`` has
+    completed (including VRAM verification); the graph ends directly after
+    this node returns (``image_generation`` -> END), so normal controller
+    validation and textual finalization never run for image workloads, and
+    the controller is never proactively reloaded here — the next request
+    acquires whatever resource it needs via the normal lifecycle machinery.
 
     The endpoint is synchronous: a successful HTTP response means Open WebUI
     has fully completed the generation. A timeout/connection error leaves the
