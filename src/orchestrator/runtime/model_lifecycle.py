@@ -1097,6 +1097,11 @@ class ModelLifecycle:
             # reflects the memory available with no llama.cpp model resident.
             # After image generation, ComfyUI must return free VRAM to (at
             # least) this level before llama-router may load again.
+            #
+            # PRIMARY source is host GPU telemetry; fallback is ComfyUI's own
+            # /system_stats VRAM accounting. Both are REAL memory observables;
+            # llama-router model state is NEVER used as a release-success
+            # signal (see release_comfyui_gpu).
             self._comfyui_vram_free_baseline_mb = await self._query_gpu_free_mem_mb()
             if self._comfyui_vram_free_baseline_mb is not None:
                 logger.info(
@@ -1104,10 +1109,20 @@ class ModelLifecycle:
                     self._comfyui_vram_free_baseline_mb,
                 )
             else:
+                self._comfyui_vram_free_baseline_mb = (
+                    await self._query_comfyui_free_mem_mb()
+                )
+            if self._comfyui_vram_free_baseline_mb is not None:
                 logger.info(
+                    "comfyui_gpu_release_baseline_captured free_mb=%.0f",
+                    self._comfyui_vram_free_baseline_mb,
+                )
+            else:
+                logger.warning(
                     "comfyui_gpu_release_baseline_unavailable "
-                    "(no GPU telemetry on this host; release barrier will "
-                    "fall back to llama-router resident-model verification)"
+                    "(no nvidia-smi telemetry AND no ComfyUI /system_stats "
+                    "observable on this host; the release barrier will fail "
+                    "closed until a real memory observable exists)"
                 )
 
             # Step 6: Revalidate and atomically finalize COMFYUI_ACTIVE.
@@ -1187,6 +1202,123 @@ class ModelLifecycle:
                 return False
         return True
 
+    async def _invoke_comfyui_free(self) -> None:
+        """Ask ComfyUI to unload all models and free VRAM (POST /free).
+
+        This is a REQUIRED step of ``release_comfyui_gpu``: ComfyUI only
+        returns its allocated VRAM when explicitly told to via:
+
+            POST /free
+            Content-Type: application/json
+            {"unload_models": true, "free_memory": true}
+
+        A failure here is FATAL for the release barrier: the ownership state
+        stays in ``releasing_comfyui`` (blocked/non-free) and
+        ``LifecycleError`` is raised. The GPU is NEVER marked available merely
+        because an unload attempt failed.
+        """
+        base_url = str(
+            getattr(self.settings, "comfyui_lifecycle_base_url", "") or ""
+        ).strip()
+        if not base_url:
+            logger.warning("comfyui_free_endpoint_unconfigured_skipping_call")
+            return
+
+        timeout_s = max(
+            1.0, float(getattr(self.settings, "comfyui_free_timeout_s", 30.0))
+        )
+        try:
+            async with httpx.AsyncClient(
+                base_url=base_url.rstrip("/"),
+                timeout=httpx.Timeout(timeout_s),
+            ) as client:
+                resp = await client.post(
+                    "/free",
+                    headers={"Content-Type": "application/json"},
+                    json={"unload_models": True, "free_memory": True},
+                )
+                if resp.status_code >= 400:
+                    body = ""
+                    try:
+                        body = resp.text[:500]
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    logger.error(
+                        "comfyui_free_http_failed status=%d body=%r",
+                        resp.status_code,
+                        body,
+                    )
+                    raise LifecycleError(
+                        f"ComfyUI /free request failed "
+                        f"(HTTP {resp.status_code}): {body!r}. "
+                        f"The GPU remains owned by 'releasing_comfyui'."
+                    )
+                logger.info(
+                    "comfyui_free_accepted status=%d", resp.status_code
+                )
+        except httpx.HTTPError as exc:
+            logger.error("comfyui_free_transport_failed error=%r", exc)
+            raise LifecycleError(
+                f"ComfyUI /free transport error: {exc}. "
+                f"The GPU remains owned by 'releasing_comfyui'."
+            ) from exc
+
+    async def _query_comfyui_free_mem_mb(self) -> float | None:
+        """Query free VRAM directly from ComfyUI's /system_stats endpoint.
+
+        Returns the minimum reported per-device ``vram_free`` in MB, or None
+        when the endpoint is unreachable/unparsable. This is a direct observe
+        of COMFYUI's own GPU memory accounting — NOT llama-router model state.
+        """
+        base_url = str(
+            getattr(self.settings, "comfyui_lifecycle_base_url", "") or ""
+        ).strip()
+        if not base_url:
+            return None
+        try:
+            async with httpx.AsyncClient(
+                base_url=base_url.rstrip("/"), timeout=httpx.Timeout(5.0)
+            ) as client:
+                resp = await client.get("/system_stats")
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        devices = data.get("devices") if isinstance(data, dict) else None
+        if not isinstance(devices, list):
+            return None
+        values_mb: list[float] = []
+        for device in devices:
+            vram_free = device.get("vram_free") if isinstance(device, dict) else None
+            # ComfyUI reports bytes.
+            if isinstance(vram_free, (int, float)):
+                values_mb.append(float(vram_free) / 1_000_000.0)
+        return min(values_mb) if values_mb else None
+
+    async def _router_has_no_resident_model(self) -> bool | None:
+        """Return True when llama-router reports NO loaded/loading model.
+
+        Returns None on transport/HTTP errors so callers can distinguish
+        "verified clear" from "could not observe".
+
+        NOTE: this observable describes LLAMA-ROUTER MODEL STATE ONLY. It can
+        NEVER establish that ComfyUI has released VRAM and is used purely for
+        diagnostics/logging by the release barrier.
+        """
+        try:
+            async with await self._get_llm_client() as client:
+                resp = await client.get("/v1/models")
+                resp.raise_for_status()
+                models_data = resp.json()
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("comfyui_gpu_release_router_probe_failed error=%r", e)
+            return None
+        for model in models_data.get("data", []):
+            status = model.get("status", {})
+            if status.get("value") in ("loaded", "loading", "sleeping"):
+                return False
+        return True
+
     async def release_comfyui_gpu(self) -> None:
         """Release GPU ownership after confirmed image-generation completion.
 
@@ -1212,15 +1344,19 @@ class ModelLifecycle:
 
         Observable verification (bounded by ``comfyui_release_timeout_s``):
 
-        - PRIMARY: GPU free-memory telemetry (nvidia-smi), compared against
-          the baseline captured at acquisition time after the LLM unload.
-          Verified when free VRAM returned to within
-          ``comfyui_release_memory_tolerance_mb`` of that baseline — a
-          host-relative check with no hard-coded absolute VRAM numbers.
-        - FALLBACK (telemetry unavailable): llama-router's /v1/models reports
-          no resident model, combined with Open WebUI's synchronous
-          image-generation API only returning after its downstream ComfyUI
-          workflow execution completed.
+        1. ComfyUI is explicitly told to release its models via
+           ``POST /free {"unload_models": true, "free_memory": true}``. A
+           failed /free request raises ``LifecycleError`` while the owner
+           REMAINS ``releasing_comfyui`` — a failed request can never move
+           ownership to None.
+        2. VRAM release is then verified from REAL GPU/ComfyUI memory
+           observables only (nvidia-smi free-memory telemetry and/or
+           ComfyUI's own /system_stats accounting), compared against the
+           baseline captured at acquisition time with a configurable
+           tolerance. The HTTP-200 response of /free alone is NOT treated as
+           proof of release, and llama-router model emptiness (GET /v1/models)
+           can NEVER establish that ComfyUI released VRAM: router model state
+           is fetched only for diagnostics/logging.
 
         On timeout: the owner REMAINS ``releasing_comfyui`` (safe blocked
         state — nothing may claim the GPU), and LifecycleError is raised.
@@ -1241,6 +1377,12 @@ class ModelLifecycle:
 
         logger.info("comfyui_gpu_release_started")
 
+        # REQUIRED step: explicitly ask ComfyUI to unload its models and free
+        # VRAM. This happens BEFORE any verification; on failure the owner is
+        # still 'releasing_comfyui' and LifecycleError propagates — the GPU
+        # can never transition to None because of a failed /free request.
+        await self._invoke_comfyui_free()
+
         loop = asyncio.get_running_loop()
         started = loop.time()
         timeout_s = max(
@@ -1260,26 +1402,52 @@ class ModelLifecycle:
         baseline_mb = self._comfyui_vram_free_baseline_mb
 
         while True:
-            free_mb = await self._query_gpu_free_mem_mb()
+            # Only REAL GPU/ComfyUI memory observables can establish release:
+            # - nvidia-smi free-memory telemetry (host-level VRAM)
+            # - ComfyUI's own /system_stats free-VRAM accounting
+            #
+            # llama-router model state (GET /v1/models) is fetched ONLY for
+            # diagnostics below — router emptiness says nothing about whether
+            # ComfyUI still holds VRAM and can NEVER be a release-success
+            # condition.
+            gpu_free_mb = await self._query_gpu_free_mem_mb()
+            comfyui_free_mb = await self._query_comfyui_free_mem_mb()
             router_clear = await self._router_has_no_resident_model()
 
-            if baseline_mb is not None and free_mb is not None:
+            memory_observables: dict[str, float] = {}
+            if gpu_free_mb is not None:
+                memory_observables["gpu_telemetry"] = gpu_free_mb
+            if comfyui_free_mb is not None:
+                memory_observables["comfyui_system_stats"] = comfyui_free_mb
+
+            verified = False
+            if baseline_mb is not None and memory_observables:
+                observed_parts = [
+                    f"{name}_free_mb={value:.0f}"
+                    for name, value in memory_observables.items()
+                ]
                 observed = (
-                    f"free_mb={free_mb:.0f} baseline_mb={baseline_mb:.0f} "
-                    f"tolerance_mb={tolerance_mb:.0f}"
+                    " ".join(observed_parts)
+                    + f" baseline_mb={baseline_mb:.0f} tolerance_mb={tolerance_mb:.0f}"
+                    + f" router_clear={router_clear} (diagnostic-only)"
                 )
-                verified = free_mb >= (baseline_mb - tolerance_mb)
-                reason = "gpu_telemetry"
+                verified = all(
+                    value >= (baseline_mb - tolerance_mb)
+                    for value in memory_observables.values()
+                )
             else:
-                # Telemetry unavailable: fall back to llama-router reporting
-                # zero resident models (plus Open WebUI's synchronous
-                # completion guarantee for the ComfyUI side).
                 observed = (
-                    f"router_clear={router_clear} "
-                    f"telemetry={'unavailable' if free_mb is None else 'no-baseline'}"
+                    f"memory_observables={list(memory_observables) or 'none'} "
+                    f"baseline={'captured' if baseline_mb is not None else 'unavailable'} "
+                    f"router_clear={router_clear} (diagnostic-only)"
                 )
-                verified = router_clear is True
-                reason = "llama_router_status"
+                # FAIL CLOSED: without a baseline AND at least one live
+                # memory observable, release cannot be established. Router
+                # emptiness must NOT be used as a success condition.
+                logger.warning(
+                    "comfyui_gpu_release_unverifiable_without_memory_state %s",
+                    observed,
+                )
 
             elapsed = loop.time() - started
             if verified:
@@ -1291,8 +1459,8 @@ class ModelLifecycle:
                         )
                     self._gpu_owner = None
                 logger.info(
-                    "comfyui_gpu_release_verified reason=%s elapsed_s=%.2f %s",
-                    reason,
+                    "comfyui_gpu_release_verified reason=memory_observables "
+                    "elapsed_s=%.2f %s",
                     elapsed,
                     observed,
                 )
@@ -1464,20 +1632,41 @@ class ModelLifecycle:
             logger.info("llama_router_load_model model=%s", model_name)
             try:
                 load_resp = await client.post(
-                    "/models/load", json={"model": model_name}
+                    "/models/load",
+                    headers={"Content-Type": "application/json"},
+                    json={"model": model_name},
                 )
                 load_resp.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status_code = getattr(exc.response, "status_code", "unknown")
+                body = ""
+                try:
+                    body = exc.response.text[:500]
+                except Exception:  # pragma: no cover - defensive
+                    pass
                 logger.error(
-                    "llama_router_model_load_failed model=%s status=%s",
+                    "llama_router_model_load_failed model=%s status=%s body=%r",
                     model_name,
                     status_code,
+                    body,
                 )
+                # Preserve the actual status/body so an operator can
+                # distinguish the real cause (e.g. invalid request vs.
+                # model-loading failure vs. CUDA OOM) instead of assuming a
+                # single hard-coded explanation for every HTTP 400/500.
+                if isinstance(status_code, int) and 400 <= status_code < 500:
+                    hint = (
+                        "llama-router rejected the load request "
+                        "(invalid request / refused by router)"
+                    )
+                else:
+                    hint = (
+                        "llama-router failed to load the model (possible "
+                        "model-loading or CUDA/OOM failure)"
+                    )
                 raise LifecycleError(
-                    f"Failed to load controller model '{model_name}' "
-                    f"in llama-router (HTTP {status_code}): "
-                    "GPU memory may not have been released by ComfyUI."
+                    f"Failed to load controller model '{model_name}' in "
+                    f"llama-router (HTTP {status_code}): {body!r}. {hint}."
                 ) from exc
             except httpx.HTTPError as exc:
                 logger.error(

@@ -141,6 +141,14 @@ class Settings(BaseSettings):
     # host against itself — there are no hard-coded absolute VRAM numbers.
     comfyui_release_memory_tolerance_mb: float = 512.0
 
+    # ComfyUI lifecycle endpoint (REQUIRED for the release barrier). This is
+    # used ONLY by the GPU-release barrier: POST /free (unload_models +
+    # free_memory) before verification and GET /system_stats as a direct
+    # ComfyUI/VRAM memory observable. It must NEVER be used to build or
+    # submit image-generation workflows directly.
+    comfyui_lifecycle_base_url: str = "http://comfyui:8188"
+    comfyui_free_timeout_s: float = 30.0
+
     # Persistent conversation evidence (Feature 3)
     # Bounds for reusable specialist evidence stored in the LangGraph
     # checkpoint. These are operational limits; the state model itself stays a
