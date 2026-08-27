@@ -133,9 +133,15 @@ class Settings(BaseSettings):
 
     # ComfyUI GPU-release barrier: after an Open WebUI generation completes,
     # llama-router must NOT load a model until ComfyUI's VRAM is verifiably
-    # released. The barrier polls real observables with a bounded timeout.
+    # released. The barrier ACTIVELY RETRIES POST /free: invoke /free, verify
+    # real memory observables against the captured baseline, wait
+    # comfyui_free_retry_interval_s if not yet released, and repeat until
+    # verified or the bounded timeout expires.
     comfyui_release_timeout_s: float = 120.0
-    comfyui_release_poll_interval_s: float = 1.0
+    # Interval between successive /free attempts when verification has NOT yet
+    # succeeded (NOT a telemetry-poll period). The first /free fires
+    # immediately; verification happens right after each attempt.
+    comfyui_free_retry_interval_s: float = 5.0
     # Tolerance below the pre-generation free-VRAM baseline (MB). The baseline
     # is captured AFTER the LLM unload at acquisition time, so this compares a
     # host against itself — there are no hard-coded absolute VRAM numbers.
