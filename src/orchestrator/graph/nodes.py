@@ -8,6 +8,7 @@ from orchestrator.controller.engine import ControllerEngine
 from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import normalize_query
 from ..common.enums import ControllerAction, SpecialistType
+from ..common.constants import FALLBACK_NO_ANSWER
 from ..common.utils import _extract_json_object
 from ..context.assembler import build_conversation
 from ..context.conversation_evidence import (
@@ -1118,7 +1119,7 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
             answer = str(extract_assistant_text(generation.content) or extract_assistant_text(generation.raw) or "").strip()
 
         if not answer.strip():
-            answer = "I could not generate a complete answer for that request. Please try again with a little more detail."
+            answer = FALLBACK_NO_ANSWER
 
         response.final_response = answer
         response.finish_reason = "stop"

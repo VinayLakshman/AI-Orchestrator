@@ -55,6 +55,18 @@ def _final_model(state: OrchestratorState) -> str:
     return model or "skipped"
 
 
+def _image_urls_from_metadata(state: OrchestratorState) -> list[str]:
+    """Valid generated image URLs from the terminal image-generation route."""
+    if state.response.metadata.get("route") != "image_generation":
+        return []
+    raw = state.response.metadata.get("image_urls")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [str(url).strip() for url in raw if isinstance(url, str) and str(url).strip()]
+
+
 def _request_status(state: OrchestratorState) -> str:
     if (
         state.response.finish_reason == "clarify"
@@ -66,6 +78,13 @@ def _request_status(state: OrchestratorState) -> str:
 
     if state.response.metadata.get("status") == "failed":
         return "FAILED"
+
+    # The image-generation route is intentionally terminal (no finalizer), so
+    # an empty ``final_response`` is EXPECTED there. Success is judged by the
+    # authoritative image result, not by arbitrary metadata presence.
+    generated_images = _image_urls_from_metadata(state)
+    if generated_images:
+        return "SUCCESS"
 
     if not str(state.response.final_response or "").strip():
         return "FAILED"
@@ -116,8 +135,20 @@ def _evidence_stats(state: OrchestratorState) -> dict[str, int]:
             image_count = int(metadata.get("image_count") or 0)
         except (TypeError, ValueError):
             image_count = 0
-    if not image_count:
-        image_count = len(state.request.images or [])
+
+    # Generated (ComfyUI/Open WebUI) images take precedence and are counted
+    # from the authoritative response metadata; the comfyui evidence ledger is
+    # a secondary source used only when the metadata is absent. Input images
+    # are only counted when nothing was generated, so no image is counted twice.
+    generated_images = _image_urls_from_metadata(state)
+    if generated_images:
+        image_count = len(generated_images)
+    else:
+        generated_count = evidence.comfyui_image_count
+        if generated_count:
+            image_count = generated_count
+        elif not image_count:
+            image_count = len(state.request.images or [])
 
     return {
         "repository_hits": len(evidence.repository.primary_hits) if evidence.repository else 0,

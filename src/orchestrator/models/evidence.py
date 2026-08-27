@@ -186,7 +186,18 @@ class EvidenceLedger(BaseModel):
 
     @property
     def has_comfyui(self) -> bool:
+        """True when ComfyUI image-generation results are present."""
         return self.comfyui is not None
+
+    @property
+    def comfyui_image_count(self) -> int:
+        """Number of generated images recorded in ``comfyui`` evidence."""
+        if self.comfyui is None:
+            return 0
+        images = (self.comfyui or {}).get("images")
+        if isinstance(images, list):
+            return sum(1 for item in images if isinstance(item, str) and item.strip())
+        return 0
 
     def available_sources(self) -> list[str]:
         """
