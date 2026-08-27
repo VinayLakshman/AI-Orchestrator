@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     health_poll_interval_s: float = 2.0
     health_timeout_s: float = 120.0
 
+    # Max time to wait for the controller model to become READY in
+    # llama-router after the GPU has been released by ComfyUI.  This is the
+    # post-image-generation handoff: the controller must be verifiably loaded
+    # before controller.validate() runs.
+    controller_load_timeout_s: float = 300.0
+
     controller_keep_alive: str = "30m"
     reasoning_keep_alive: str = "15m"
     coder_keep_alive: str = "30m"
@@ -61,16 +67,12 @@ class Settings(BaseSettings):
     controller_finalize_max_tokens: int = 1200
     reasoning_max_tokens: int = 4096
     coder_max_tokens: int = 1200
-    vision_max_tokens: int = 1200
 
     # Knowledge service
     knowledge_service_url: str = "http://knowledge-service:8000"
-    knowledge_collection: str = "homelab-knowledge"
     knowledge_top_k: int = 6
     knowledge_candidate_limit: int = 12
     knowledge_neighbor_window: int = 1
-    knowledge_min_score: float = 0.55
-    knowledge_min_hits: int = 1
 
     # Native web retrieval
     web_search_enabled: bool = True
@@ -90,7 +92,6 @@ class Settings(BaseSettings):
 
     # MCP / tools
     mcp_enabled: bool = True
-    mcp_servers_json: str = "[]"
 
     # Checkpoint / storage
     checkpoint_sqlite_path: str = "/data/checkpoints.sqlite3"
@@ -101,13 +102,52 @@ class Settings(BaseSettings):
     max_context_history_tokens: int = 12000
     request_timeout_s: float = 300.0
 
-    # OpenAI-compatible surface
-    openai_api_key: SecretStr | None = None
-    openai_organization: str | None = None
-
     # Feature flags
     enable_rag: bool = True
     enable_vision: bool = True
+
+    # Image generation (delegated to Open WebUI)
+    # Open WebUI is the single source of truth for all image-generation
+    # configuration (engine, ComfyUI workflow, node mappings, model, size,
+    # steps). The orchestrator only needs the API boundary and a credential.
+    openwebui_base_url: str = "http://open-webui:8080"
+    # Legacy setting kept for configuration compatibility. Generated image
+    # URLs are now delivered as RELATIVE Open WebUI paths (the browser resolves
+    # them against the public origin), so this value is no longer used for
+    # browser-facing image URL normalization. It is retained only as a
+    # recognized service origin that may be stripped from absolute generated
+    # file URLs.
+    openwebui_public_base_url: str | None = None
+    openwebui_api_key: str | None = None
+    image_generation_timeout: float = 300.0  # 5 minutes
+
+    # Max time any requester waits for the GPU while image generation owns or
+    # has reserved it (sentinel owners "comfyui" / "transitioning_to_comfyui").
+    gpu_ownership_wait_timeout_s: float = 1800.0
+
+    # ComfyUI GPU-release barrier: after an Open WebUI generation completes,
+    # llama-router must NOT load a model until ComfyUI's VRAM is verifiably
+    # released. The barrier ACTIVELY RETRIES POST /free: invoke /free, verify
+    # real memory observables against the captured baseline, wait
+    # comfyui_free_retry_interval_s if not yet released, and repeat until
+    # verified or the bounded timeout expires.
+    comfyui_release_timeout_s: float = 120.0
+    # Interval between successive /free attempts when verification has NOT yet
+    # succeeded (NOT a telemetry-poll period). The first /free fires
+    # immediately; verification happens right after each attempt.
+    comfyui_free_retry_interval_s: float = 5.0
+    # Tolerance below the pre-generation free-VRAM baseline (MB). The baseline
+    # is captured AFTER the LLM unload at acquisition time, so this compares a
+    # host against itself — there are no hard-coded absolute VRAM numbers.
+    comfyui_release_memory_tolerance_mb: float = 512.0
+
+    # ComfyUI lifecycle endpoint (REQUIRED for the release barrier). This is
+    # used ONLY by the GPU-release barrier: POST /free (unload_models +
+    # free_memory) before verification and GET /system_stats as a direct
+    # ComfyUI/VRAM memory observable. It must NEVER be used to build or
+    # submit image-generation workflows directly.
+    comfyui_lifecycle_base_url: str = "http://comfyui:8188"
+    comfyui_free_timeout_s: float = 30.0
 
     # Persistent conversation evidence (Feature 3)
     # Bounds for reusable specialist evidence stored in the LangGraph

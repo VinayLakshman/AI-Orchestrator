@@ -19,7 +19,8 @@ class StreamKind(StrEnum):
     LLM_TOKEN = "llm_token"
     LLM_FINISHED = "llm_finished"
 
-    ERROR = "error"
+    IMAGE_GENERATION_STARTED = "image_generation_started"
+    IMAGE_GENERATION_FINISHED = "image_generation_finished"
 
 
 class StreamEvent(BaseModel):

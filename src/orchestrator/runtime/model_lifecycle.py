@@ -28,6 +28,68 @@ class LifecycleState(StrEnum):
     WARM = "WARM"
     IDLE = "IDLE"
     STOPPING = "STOPPING"
+    # GPU ownership transition states
+    TRANSITIONING_TO_COMFYUI = "TRANSITIONING_TO_COMFYUI"
+    TRANSITIONING_TO_LLM = "TRANSITIONING_TO_LLM"
+
+
+# Logical GPU-ownership sentinel values stored in ModelLifecycle._gpu_owner.
+#
+# These strings are NOT Docker container names and must NEVER be passed to
+# any DockerRuntime / docker lifecycle operation:
+#
+#   "comfyui"                    -> image generation currently owns the GPU.
+#   "transitioning_to_comfyui"   -> image generation has atomically RESERVED
+#                                   the GPU and is preparing it (draining LLM
+#                                   inference / unloading the resident model).
+#   "TRANSITIONING_TO_LLM"       -> GPU is being handed back to the LLM pool.
+#   "releasing_comfyui"          -> image generation FINISHED and the release
+#                                   barrier is verifying actual GPU/VRAM
+#                                   release before the GPU becomes available.
+#   None                         -> GPU is free (release verified).
+#
+# Any other non-None value is a physical llama.cpp container name that MAY be
+# passed to Docker lifecycle operations.
+GPU_OWNER_COMFYUI = "comfyui"
+GPU_OWNER_TRANSITIONING_TO_COMFYUI = "transitioning_to_comfyui"
+GPU_OWNER_TRANSITIONING_TO_LLM = LifecycleState.TRANSITIONING_TO_LLM.value
+GPU_OWNER_RELEASING_COMFYUI = "releasing_comfyui"
+
+_IMAGE_GPU_SENTINELS = frozenset(
+    {
+        GPU_OWNER_COMFYUI,
+        GPU_OWNER_TRANSITIONING_TO_COMFYUI,
+        GPU_OWNER_TRANSITIONING_TO_LLM,
+        GPU_OWNER_RELEASING_COMFYUI,
+    }
+)
+
+
+# llama-router model-status vocabulary (GET /v1/models, status.value).
+#
+# READY  : the router itself considers the model resident/usable
+#          ("model is already running" proves the router uses *more* active
+#          states than just "loaded" — e.g. "running"). "sleeping" is part of
+#          the router's own residency lifecycle (keep-alive expired but the
+#          server stays resident and wakes on demand), so it is treated as
+#          usable too — never a reason to POST /models/load.
+# TRANSITIONAL: an in-flight residency transition. Issuing a competing load
+#          here can race the transition already under way (HTTP 400 "model
+#          is already running"); we wait instead.
+_ROUTER_READY_STATUSES = frozenset(
+    {"loaded", "ready", "running", "sleeping"}
+)
+_ROUTER_TRANSITIONAL_STATUSES = frozenset({"loading"})
+
+
+def is_llm_container_owner(value: str | None) -> bool:
+    """Return True only when ``value`` is a real llama.cpp container name.
+
+    Sentinel values ("comfyui", "transitioning_to_comfyui",
+    "TRANSITIONING_TO_LLM") and None are NOT containers and must never reach
+    Docker lifecycle functions.
+    """
+    return value is not None and value not in _IMAGE_GPU_SENTINELS
 
 
 @dataclass(slots=True)
@@ -114,7 +176,7 @@ class ModelLifecycle:
         *,
         settings: Settings,
         models: ModelManager,
-        docker: DockerRuntime,
+        docker: DockerRuntime | None = None,
         catalog_overrides: dict[str, ModelPolicy] | None = None,
         poll_interval_s: float = 60.0,
     ) -> None:
@@ -171,6 +233,11 @@ class ModelLifecycle:
         # sharing a container (e.g. reasoning/coder -> llama-expert) share the same
         # owner and never trigger mutual stop/start.
         self._gpu_owner: str | None = None
+        # Free-VRAM baseline (MB) captured after the LLM unload during
+        # acquire_comfyui_gpu(). Used by the release barrier to verify that
+        # ComfyUI actually returned its VRAM. None when GPU telemetry is
+        # unavailable on this host.
+        self._comfyui_vram_free_baseline_mb: float | None = None
 
         # Serializes all GPU residency transitions (stop current owner -> start new
         # owner). Only one ownership transition may execute at a time; this prevents
@@ -190,6 +257,15 @@ class ModelLifecycle:
         # roles mapping to the same physical container do not issue duplicate
         # start/stop/health/shutdown commands.
         self._container_locks: dict[str, asyncio.Lock] = {}
+
+        # Protects the per-model llama-router load-lock registry.
+        self._router_load_registry_lock = asyncio.Lock()
+
+        # Per-model locks serialize llama-router load/readiness transitions so
+        # concurrent readiness requests cannot issue competing POST /models/load
+        # calls for the same model (the router rejects a second concurrent load
+        # with HTTP 400 "model is already running").
+        self._router_load_locks: dict[str, asyncio.Lock] = {}
 
         # Runtime state for each model role.
         self._runtime: dict[str, ModelRuntimeState] = {}
@@ -213,6 +289,28 @@ class ModelLifecycle:
                 lock = asyncio.Lock()
                 self._container_locks[container_name] = lock
             return lock
+
+    async def _get_router_load_lock(self, model_name: str) -> asyncio.Lock:
+        """Return the per-model lock serializing llama-router load transitions.
+
+        At most one load transition per model may be active at a time; other
+        readiness requests wait on this lock instead of issuing a competing
+        POST /models/load.
+        """
+        async with self._router_load_registry_lock:
+            lock = self._router_load_locks.get(model_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._router_load_locks[model_name] = lock
+            return lock
+
+    @staticmethod
+    def _router_model_status_value(model: dict[str, Any]) -> str | None:
+        """Extract the llama-router status value from a /v1/models entry."""
+        status = model.get("status")
+        if isinstance(status, dict):
+            return status.get("value")
+        return str(status) if status is not None else None
 
     def start_background_cleanup(self) -> None:
         if self._cleanup_task is not None:
@@ -479,6 +577,41 @@ class ModelLifecycle:
                     return True
         return False
 
+    async def _wait_for_llm_gpu_availability(self, container_name: str) -> None:
+        """Block until the GPU is free or already owned by ``container_name``.
+
+        Image generation may own or have reserved the GPU (sentinel values
+        "comfyui" / "transitioning_to_comfyui"). LLM requests must WAIT in
+        that case — they must never evict ComfyUI, stop a sentinel-named
+        "container", or clear ownership. Raises LifecycleError if the wait
+        exceeds ``gpu_ownership_wait_timeout_s``.
+        """
+        timeout_s = float(getattr(self.settings, "gpu_ownership_wait_timeout_s", 1800.0))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+
+        while True:
+            async with self._ownership_lock:
+                owner = self._gpu_owner
+
+            if owner is None or owner == container_name:
+                return
+
+            if self._closing:
+                raise LifecycleError(
+                    "Lifecycle shutting down while waiting for GPU availability"
+                )
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise LifecycleError(
+                    f"Timed out waiting for GPU availability (owner={owner!r}); "
+                    "image generation owns/reserves the GPU"
+                )
+
+            logger.info("llm_gpu_wait_for_availability owner=%s", owner)
+            await asyncio.sleep(2)
+
     async def ensure_warm(self, role: str) -> None:
         """Make sure the model is warm before use."""
         role = role.lower().strip()
@@ -531,6 +664,13 @@ class ModelLifecycle:
         # GPU residency is exclusive: exactly one llama.cpp container may own the
         # GPU at a time. Serialize all ownership transitions so two threads can
         # never race stop/start across different containers (invariant preserved).
+        #
+        # Invariant: an LLM request can NEVER acquire the GPU while image
+        # generation owns it ("comfyui") or has reserved it
+        # ("transitioning_to_comfyui"). Wait outside the ownership lock until
+        # the GPU is free instead of evicting a logical ownership sentinel.
+        await self._wait_for_llm_gpu_availability(container_name)
+
         async with self._ownership_lock:
             try:
                 # If a sibling logical role already brought this same physical
@@ -554,7 +694,17 @@ class ModelLifecycle:
 
                 # Stop whatever currently owns the GPU so the target container can
                 # take exclusive residency. Only one owner may exist at a time.
-                if self._gpu_owner is not None and self._gpu_owner != container_name:
+                #
+                # SAFETY: the previous owner is only ever stopped when it is a
+                # REAL llama.cpp container name. Logical sentinels ("comfyui",
+                # "transitioning_to_comfyui", "TRANSITIONING_TO_LLM") are never
+                # passed to Docker. (The pre-lock wait above already blocks
+                # while image generation owns/reserves the GPU; this guard is
+                # defense in depth.)
+                if (
+                    is_llm_container_owner(self._gpu_owner)
+                    and self._gpu_owner != container_name
+                ):
                     previous_owner = self._gpu_owner
                     logger.info(
                         "gpu_ownership_transfer from=%s to=%s via_role=%s",
@@ -622,25 +772,6 @@ class ModelLifecycle:
                 logger.exception("model_start_failed role=%s model=%s", role, state.name)
                 raise LifecycleError(str(exc)) from exc
 
-    def touch(self, role: str) -> None:
-        """Extend keep-warm window based on last usage."""
-        role = role.lower().strip()
-        now = time.time()
-
-        async def _touch() -> None:
-            async with self._state_lock:
-                if role not in self._runtime:
-                    return
-                policy = self._policy(role)
-                state = self._runtime[role]
-                state.last_used_at = now
-                state.keep_warm_until = now + policy.keep_alive_seconds
-                state.status = LifecycleState.IDLE
-                state.touch_invocations += 1
-
-        if not self._closing:
-            asyncio.create_task(_touch())
-
     async def keep_warm(self, role: str) -> None:
         """Mark model as IDLE but not evictable until keep_alive expires."""
         role = role.lower().strip()
@@ -653,43 +784,6 @@ class ModelLifecycle:
             state.last_used_at = state.last_used_at or now
             state.keep_warm_until = now + policy.keep_alive_seconds
             state.status = LifecycleState.IDLE
-
-    def request_preload(self, role: str) -> None:
-        """Schedule a background warm without awaiting.
-
-        Preload now means: "if no other container currently owns GPU residency,
-        proactively start this model." It must never violate the single-owner
-        invariant, so if another container owns the GPU it is skipped.
-        """
-        role = role.lower().strip()
-        policy = self._policy(role)
-        if not policy.preload_enabled or self._closing:
-            return
-
-        container_name = self.models.container_for_role(role)
-
-        async def _preload() -> None:
-            try:
-                # Only preload when no other container owns the GPU. Holding the
-                # ownership lock here guarantees the invariant is not violated.
-                async with self._ownership_lock:
-                    if self._gpu_owner is not None and self._gpu_owner != container_name:
-                        logger.info(
-                            "model_preload_skipped_owner_conflict role=%s owner=%s",
-                            role,
-                            self._gpu_owner,
-                        )
-                        return
-                await self.ensure_warm(role)
-                async with self._state_lock:
-                    state = self._runtime.get(role)
-                    if state is not None:
-                        state.status = LifecycleState.IDLE
-                        logger.info("model_preload_finished role=%s model=%s", role, state.name)
-            except Exception:
-                logger.exception("model_preload_failed role=%s", role)
-
-        asyncio.create_task(_preload())
 
     async def _begin_inference(self, role: str) -> None:
         role = role.lower().strip()
@@ -728,17 +822,6 @@ class ModelLifecycle:
         from .model_inference_guard import _InferenceGuard
 
         return _InferenceGuard(lifecycle=self, role=role)
-
-    def is_loaded(self, role: str) -> bool:
-        role = role.lower().strip()
-        st = self._runtime.get(role)
-        if st is None:
-            return False
-        return st.status in {
-            LifecycleState.WARM,
-            LifecycleState.IDLE,
-            LifecycleState.STARTING,
-        }
 
     async def evict_if_needed(self) -> None:
         """Evict models whose keep-warm window has expired.
@@ -869,3 +952,967 @@ class ModelLifecycle:
                 raise
             except Exception:
                 logger.exception("model_lifecycle_cleanup_loop_error")
+                
+    async def acquire_comfyui_gpu(self) -> None:
+        """Acquire exclusive GPU ownership for image generation.
+
+        Ownership state machine (all transitions under ``_ownership_lock``):
+
+            FREE (None) or LLM_OWNED (<container>)
+                --atomic reservation--> TRANSITIONING_TO_COMFYUI
+            [outside lock] wait for active LLM inference == 0
+            [HTTP] unload resident llama-router model (POST /models/unload,
+                   NOT /sleep) and verify via GET /v1/models
+            TRANSITIONING_TO_COMFYUI --atomic finalize--> COMFYUI ("comfyui")
+
+        Guarantees:
+        - Concurrent image requests SERIALIZE: while another request holds
+          "comfyui" or "transitioning_to_comfyui", this request WAITS for the
+          owner to be released instead of borrowing its ownership token.
+        - Once reserved, no LLM request may acquire or reclaim the GPU.
+        - No Docker operations are used anywhere in this transition.
+        - On any failure the reservation rolls back to its previous value so
+          the GPU never wedges permanently in the transitioning state.
+        """
+        # Step 1: Atomically reserve the transition (from ANY prior state).
+        previous_owner: str | None = None
+        while True:
+            occupied: str | None = None
+            async with self._ownership_lock:
+                owner = self._gpu_owner
+                if owner in {
+                    GPU_OWNER_COMFYUI,
+                    GPU_OWNER_TRANSITIONING_TO_COMFYUI,
+                    GPU_OWNER_RELEASING_COMFYUI,
+                }:
+                    # Another image generation owns/reserved the GPU: wait for
+                    # it to be fully released rather than sharing ownership.
+                    occupied = owner
+                else:
+                    previous_owner = owner
+                    self._gpu_owner = GPU_OWNER_TRANSITIONING_TO_COMFYUI
+                    logger.info(
+                        "acquiring_comfyui_gpu: transition reserved previous_owner=%s",
+                        previous_owner,
+                    )
+            if occupied is None:
+                break
+            logger.info("comfyui_gpu_wait_for_existing_generation owner=%s", occupied)
+            await asyncio.sleep(2)
+
+        reservation_held = True
+
+        try:
+            # Step 2: Wait for active LLM inference to drain (outside lock).
+            roles_to_check = ["controller", "reasoning", "coder", "vision"]
+            for role in roles_to_check:
+                while True:
+                    async with self._state_lock:
+                        state = self._runtime.get(role)
+
+                    if state is None or state.active_inference_count == 0:
+                        break
+
+                    logger.info(
+                        "comfyui_gpu_wait_for_inference role=%s count=%d",
+                        role,
+                        state.active_inference_count,
+                    )
+                    await asyncio.sleep(2)
+
+            # Step 3: Get actual resident model from llama-router.
+            # This HTTP client is owned by this call (NOT the shared registry
+            # client) and is closed when the context exits.
+            async with await self._get_llm_client() as client:
+                try:
+                    resp = await client.get("/v1/models")
+                    resp.raise_for_status()
+                    models_data = resp.json()
+
+                    # Find the actually loaded model
+                    resident_model = None
+                    for model in models_data.get("data", []):
+                        status = model.get("status", {})
+                        if status.get("value") in ("loaded", "loading", "sleeping"):
+                            resident_model = model.get("id")
+                            break
+
+                    logger.info("comfyui_gpu: resident_model=%s", resident_model or "none")
+
+                    # Step 4: Unload the resident model if any
+                    if resident_model:
+                        logger.info("unload_llm_model_for_comfyui model=%s", resident_model)
+                        unload_resp = await client.post(
+                            "/models/unload",
+                            json={"model": resident_model}
+                        )
+                        unload_resp.raise_for_status()
+
+                        # Step 5: Poll until confirmed unloaded
+                        for _ in range(30):  # Wait up to 60 seconds
+                            await asyncio.sleep(2)
+                            check_resp = await client.get("/v1/models")
+                            check_resp.raise_for_status()
+                            models_data = check_resp.json()
+
+                            for model in models_data.get("data", []):
+                                if model.get("id") == resident_model:
+                                    status = model.get("status", {}).get("value")
+                                    if status == "unloaded":
+                                        logger.info("llm_model_confirmed_unloaded model=%s", resident_model)
+                                        resident_model = None
+                                        break
+
+                            if resident_model is None:
+                                break
+
+                    if resident_model is not None:
+                        raise LifecycleError(f"Failed to unload llama-router model: {resident_model}")
+
+                except httpx.HTTPError as e:
+                    logger.error("llama_router_api_error error=%r", e)
+                    raise LifecycleError(f"llama-router API error: {e}")
+
+            # Step 5.5: Capture the free-VRAM baseline for the release barrier.
+            # This is taken AFTER the LLM unload has been confirmed, so it
+            # reflects the memory available with no llama.cpp model resident.
+            # After image generation, ComfyUI must return free VRAM to (at
+            # least) this level before llama-router may load again.
+            #
+            # PRIMARY source is host GPU telemetry; fallback is ComfyUI's own
+            # /system_stats VRAM accounting. Both are REAL memory observables;
+            # llama-router model state is NEVER used as a release-success
+            # signal (see release_comfyui_gpu).
+            self._comfyui_vram_free_baseline_mb = await self._query_gpu_free_mem_mb()
+            if self._comfyui_vram_free_baseline_mb is not None:
+                logger.info(
+                    "comfyui_gpu_release_baseline_captured free_mb=%.0f",
+                    self._comfyui_vram_free_baseline_mb,
+                )
+            else:
+                self._comfyui_vram_free_baseline_mb = (
+                    await self._query_comfyui_free_mem_mb()
+                )
+            if self._comfyui_vram_free_baseline_mb is not None:
+                logger.info(
+                    "comfyui_gpu_release_baseline_captured free_mb=%.0f",
+                    self._comfyui_vram_free_baseline_mb,
+                )
+            else:
+                logger.warning(
+                    "comfyui_gpu_release_baseline_unavailable "
+                    "(no nvidia-smi telemetry AND no ComfyUI /system_stats "
+                    "observable on this host; the release barrier will fail "
+                    "closed until a real memory observable exists)"
+                )
+
+            # Step 6: Revalidate and atomically finalize COMFYUI_ACTIVE.
+            async with self._ownership_lock:
+                if self._gpu_owner != GPU_OWNER_TRANSITIONING_TO_COMFYUI:
+                    raise LifecycleError(
+                        "comfyui_gpu_reservation_lost "
+                        f"(owner={self._gpu_owner!r}); acquisition aborted"
+                    )
+                self._gpu_owner = GPU_OWNER_COMFYUI
+                logger.info("comfyui_gpu_acquired")
+            reservation_held = False
+
+        except BaseException:
+            # Roll back the atomic reservation so the GPU never wedges in the
+            # transitioning state after a failed preparation (unload error,
+            # timeout, cancellation, ...). Only revert if we still hold it.
+            if reservation_held:
+                async with self._ownership_lock:
+                    if self._gpu_owner == GPU_OWNER_TRANSITIONING_TO_COMFYUI:
+                        self._gpu_owner = previous_owner
+                        logger.info(
+                            "comfyui_gpu_reservation_rolled_back restored_owner=%s",
+                            previous_owner,
+                        )
+            raise
+
+    async def _query_gpu_free_mem_mb(self) -> float | None:
+        """Query free GPU memory (MB) via nvidia-smi telemetry.
+
+        Returns None when nvidia-smi is unavailable or fails (e.g. the
+        orchestrator runs in a container without GPU tooling). This is a
+        best-effort observable, never a hard dependency.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            # Multi-GPU hosts: the minimum free memory across GPUs is the
+            # conservative signal.
+            values = [
+                float(line.strip())
+                for line in stdout.decode().splitlines()
+                if line.strip()
+            ]
+            return min(values) if values else None
+        except ValueError:
+            return None
+
+    async def _invoke_comfyui_free(self) -> None:
+        """Ask ComfyUI to unload all models and free VRAM (POST /free).
+
+        This is a REQUIRED step of ``release_comfyui_gpu``: ComfyUI only
+        returns its allocated VRAM when explicitly told to via:
+
+            POST /free
+            Content-Type: application/json
+            {"unload_models": true, "free_memory": true}
+
+        A failure here is FATAL for the release barrier: the ownership state
+        stays in ``releasing_comfyui`` (blocked/non-free) and
+        ``LifecycleError`` is raised. The GPU is NEVER marked available merely
+        because an unload attempt failed.
+        """
+        base_url = str(
+            getattr(self.settings, "comfyui_lifecycle_base_url", "") or ""
+        ).strip()
+        if not base_url:
+            logger.warning("comfyui_free_endpoint_unconfigured_skipping_call")
+            return
+
+        timeout_s = max(
+            1.0, float(getattr(self.settings, "comfyui_free_timeout_s", 30.0))
+        )
+        try:
+            async with httpx.AsyncClient(
+                base_url=base_url.rstrip("/"),
+                timeout=httpx.Timeout(timeout_s),
+            ) as client:
+                resp = await client.post(
+                    "/free",
+                    headers={"Content-Type": "application/json"},
+                    json={"unload_models": True, "free_memory": True},
+                )
+                if resp.status_code >= 400:
+                    body = ""
+                    try:
+                        body = resp.text[:500]
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    logger.error(
+                        "comfyui_free_http_failed status=%d body=%r",
+                        resp.status_code,
+                        body,
+                    )
+                    raise LifecycleError(
+                        f"ComfyUI /free request failed "
+                        f"(HTTP {resp.status_code}): {body!r}. "
+                        f"The GPU remains owned by 'releasing_comfyui'."
+                    )
+                logger.info(
+                    "comfyui_free_accepted status=%d", resp.status_code
+                )
+        except httpx.HTTPError as exc:
+            logger.error("comfyui_free_transport_failed error=%r", exc)
+            raise LifecycleError(
+                f"ComfyUI /free transport error: {exc}. "
+                f"The GPU remains owned by 'releasing_comfyui'."
+            ) from exc
+
+    async def _query_comfyui_free_mem_mb(self) -> float | None:
+        """Query free VRAM directly from ComfyUI's /system_stats endpoint.
+
+        Returns the minimum reported per-device ``vram_free`` in MB, or None
+        when the endpoint is unreachable/unparsable. This is a direct observe
+        of COMFYUI's own GPU memory accounting — NOT llama-router model state.
+        """
+        base_url = str(
+            getattr(self.settings, "comfyui_lifecycle_base_url", "") or ""
+        ).strip()
+        if not base_url:
+            return None
+        try:
+            async with httpx.AsyncClient(
+                base_url=base_url.rstrip("/"), timeout=httpx.Timeout(5.0)
+            ) as client:
+                resp = await client.get("/system_stats")
+                resp.raise_for_status()
+                data = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        devices = data.get("devices") if isinstance(data, dict) else None
+        if not isinstance(devices, list):
+            return None
+        values_mb: list[float] = []
+        for device in devices:
+            vram_free = device.get("vram_free") if isinstance(device, dict) else None
+            # ComfyUI reports bytes.
+            if isinstance(vram_free, (int, float)):
+                values_mb.append(float(vram_free) / 1_000_000.0)
+        return min(values_mb) if values_mb else None
+
+    async def release_comfyui_gpu(self) -> None:
+        """Release GPU ownership after confirmed image-generation completion.
+
+        This is a BLOCKING RELEASE BARRIER. It does NOT simply clear the
+        ownership state: llama-router must never begin loading an LLM while
+        ComfyUI still holds VRAM.
+
+        State machine (all transitions under ``_ownership_lock``):
+
+            COMFYUI ("comfyui")
+                --atomic--> RELEASING_COMFYUI ("releasing_comfyui")
+                [outside lock] poll real observables until verified
+                --atomic--> FREE (None)
+
+        While the owner is ``releasing_comfyui``:
+
+        - LLM requests block in ``_wait_for_llm_gpu_availability`` (owner is
+          non-None and is not their container).
+        - Concurrent image requests serialize behind it in
+          ``acquire_comfyui_gpu``.
+        - The sentinel NEVER reaches Docker lifecycle operations (it is in
+          ``_IMAGE_GPU_SENTINELS``).
+
+        Observable verification (bounded by ``comfyui_release_timeout_s``,
+        which now bounds the FULL /free retry process):
+
+        1. ComfyUI is explicitly told to release its models via
+           ``POST /free {"unload_models": true, "free_memory": true}``. A
+           failed /free request raises ``LifecycleError`` while the owner
+           REMAINS ``releasing_comfyui`` — a failed request can never move
+           ownership to None.
+        2. VRAM release is verified from REAL GPU/ComfyUI memory observables
+           only (nvidia-smi free-memory telemetry and/or ComfyUI's own
+           /system_stats accounting), compared against the baseline captured
+           at acquisition time with a configurable tolerance. The HTTP-200
+           response of /free alone is NOT treated as proof of release, and
+           llama-router model state NEVER establishes VRAM release.
+        3. When verification has NOT yet succeeded, the barrier waits
+           ``comfyui_free_retry_interval_s`` and invokes /free AGAIN — this is
+           an ACTIVE retry mechanism, not a passive telemetry-polling loop.
+           The first /free fires immediately; no sleep precedes it.
+
+        On timeout: the owner REMAINS ``releasing_comfyui`` (safe blocked
+        state — nothing may claim the GPU), and LifecycleError is raised.
+        A false-positive release is never traded for availability.
+
+        Callers must ONLY invoke this after confirmed completion/failure of
+        the Open WebUI request. Unknown workload state retains ownership
+        (callers never invoke this method in that case; there is NO
+        unconditional ``finally`` release).
+        """
+        async with self._ownership_lock:
+            if self._gpu_owner != GPU_OWNER_COMFYUI:
+                logger.warning(
+                    "comfyui_gpu_release_invalid owner=%s", self._gpu_owner
+                )
+                return
+            self._gpu_owner = GPU_OWNER_RELEASING_COMFYUI
+
+        logger.info("comfyui_gpu_release_started")
+
+        # REQUIRED step: explicitly ask ComfyUI to unload its models and free
+        # VRAM. This happens BEFORE any verification; on failure the owner is
+        # still 'releasing_comfyui' and LifecycleError propagates — the GPU
+        # can never transition to None because of a failed /free request.
+        await self._invoke_comfyui_free()
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        timeout_s = max(
+            1.0, float(getattr(self.settings, "comfyui_release_timeout_s", 120.0))
+        )
+        retry_interval_s = max(
+            0.5,
+            float(
+                getattr(self.settings, "comfyui_free_retry_interval_s", 5.0)
+            ),
+        )
+        tolerance_mb = max(
+            0.0,
+            float(
+                getattr(self.settings, "comfyui_release_memory_tolerance_mb", 512.0)
+            ),
+        )
+        deadline = started + timeout_s
+        baseline_mb = self._comfyui_vram_free_baseline_mb
+
+        # ACTIVE RETRY LOOP:
+        #
+        #   /free (fired immediately above — no sleep precedes it)
+        #     → verify real memory observables against baseline/tolerance
+        #     → verified? owner → None, return
+        #     → deadline exceeded? owner REMAINS releasing_comfyui, raise
+        #     → else log sparsely, sleep retry_interval_s, POST /free AGAIN
+        #
+        # This replaces the old one-shot /free + ~1s telemetry diagnostic
+        # polling loop. llama-router is NOT queried here: router model state
+        # says nothing about VRAM and can never establish release.
+        attempt = 0
+        while True:
+            attempt += 1
+            if attempt > 1:
+                await self._invoke_comfyui_free()
+
+            # Only REAL GPU/ComfyUI memory observables can establish release:
+            # - nvidia-smi free-memory telemetry (host-level VRAM)
+            # - ComfyUI's own /system_stats free-VRAM accounting
+            gpu_free_mb = await self._query_gpu_free_mem_mb()
+            comfyui_free_mb = await self._query_comfyui_free_mem_mb()
+
+            memory_observables: dict[str, float] = {}
+            if gpu_free_mb is not None:
+                memory_observables["gpu_telemetry"] = gpu_free_mb
+            if comfyui_free_mb is not None:
+                memory_observables["comfyui_system_stats"] = comfyui_free_mb
+
+            verified = False
+            if baseline_mb is not None and memory_observables:
+                observed_parts = [
+                    f"{name}_free_mb={value:.0f}"
+                    for name, value in memory_observables.items()
+                ]
+                observed = (
+                    " ".join(observed_parts)
+                    + f" baseline_mb={baseline_mb:.0f} tolerance_mb={tolerance_mb:.0f}"
+                )
+                verified = all(
+                    value >= (baseline_mb - tolerance_mb)
+                    for value in memory_observables.values()
+                )
+            else:
+                observed = (
+                    f"memory_observables={list(memory_observables) or 'none'} "
+                    f"baseline={'captured' if baseline_mb is not None else 'unavailable'} "
+                )
+                # FAIL CLOSED: without a baseline AND at least one live
+                # memory observable, release cannot be established. Router
+                # state must NOT be used as a success condition.
+                logger.warning(
+                    "comfyui_gpu_release_unverifiable_without_memory_state %s",
+                    observed,
+                )
+
+            elapsed = loop.time() - started
+            if verified:
+                async with self._ownership_lock:
+                    if self._gpu_owner != GPU_OWNER_RELEASING_COMFYUI:
+                        raise LifecycleError(
+                            "comfyui_release_state_corrupted "
+                            f"(owner={self._gpu_owner!r})"
+                        )
+                    self._gpu_owner = None
+                logger.info(
+                    "comfyui_gpu_release_verified reason=memory_observables "
+                    "attempt=%d elapsed_s=%.2f %s",
+                    attempt,
+                    elapsed,
+                    observed,
+                )
+                logger.info("comfyui_gpu_available_for_llm")
+                return
+
+            if loop.time() >= deadline:
+                # SAFETY: leave the owner as releasing_comfyui — LLM
+                # acquisition stays blocked rather than risking a CUDA OOM.
+                logger.error(
+                    "comfyui_gpu_release_timeout attempts=%d elapsed_s=%.2f "
+                    "timeout_s=%.0f owner=%r %s; GPU NOT marked available "
+                    "for llama-router",
+                    attempt,
+                    elapsed,
+                    timeout_s,
+                    GPU_OWNER_RELEASING_COMFYUI,
+                    observed,
+                )
+                raise LifecycleError(
+                    f"ComfyUI GPU release not verified within {timeout_s:.0f}s "
+                    f"after {attempt} /free attempt(s) ({observed}); "
+                    f"llama-router loading remains blocked"
+                )
+
+            logger.info(
+                "comfyui_gpu_release_waiting attempt=%d elapsed_s=%.2f "
+                "timeout_s=%.0f retry_interval_s=%.1f %s",
+                attempt,
+                elapsed,
+                timeout_s,
+                retry_interval_s,
+                observed,
+            )
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(retry_interval_s, max(remaining, 0.05)))
+
+    async def _get_llm_client(self) -> httpx.AsyncClient:
+        """Create a short-lived HTTP client for llama-router API calls.
+
+        The returned client is owned by the caller and MUST be closed (use
+        ``async with``). It is intentionally NOT a shared registry client.
+        """
+        base_url = self.settings.model_router_url
+        if base_url.endswith("/v1"):
+            base_url = base_url[: -len("/v1")]
+        return httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=httpx.Timeout(30.0))
+
+    # ------------------------------------------------------------------
+    # Controller handoff: ComfyUI release → controller load → readiness
+    # ------------------------------------------------------------------
+
+    async def ensure_controller_ready(self) -> None:
+        """Ensure the controller model is loaded and READY before LLM inference.
+
+        This is the mandatory handoff gate called after image generation
+        completes (i.e. after ``release_comfyui_gpu``), before
+        ``controller.validate()`` runs.  It guarantees the full lifecycle
+        sequence required to avoid the production CUDA-OOM / HTTP-500
+        failure:
+
+            release_comfyui_gpu()
+                ↓  (verified VRAM release, _gpu_owner → None)
+            ensure_controller_ready()   ← THIS METHOD
+                ↓  1. wait for ComfyUI release (owner == None or controller)
+                ↓  2. load controller model via llama-router (POST /models/load)
+                ↓  3. verify controller READY (GET /v1/models polling)
+                ↓  4. transition _gpu_owner to controller container
+            controller.validate()
+
+        Guarantees:
+        - ComfyUI has fully released VRAM — the call blocks while
+          ``_gpu_owner`` is any image-generation sentinel
+          (``comfyui``, ``transitioning_to_comfyui``,
+          ``releasing_comfyui``, ``TRANSITIONING_TO_LLM``) and only
+          proceeds once ownership is ``None`` or already belongs to the
+          controller container.
+        - The controller model is loaded and READY in llama-router
+          (verified, not assumed). The load step is IDEMPOTENT: if the router
+          already reports a usable state ("loaded"/"ready"/"running") or an
+          in-flight transition ("loading"), no POST /models/load is issued,
+          so repeated calls converge on readiness without triggering the
+          router's HTTP 400 "model is already running" rejection.
+        - GPU ownership is transitioned to the controller container so
+          that concurrent LLM inference is correctly serialized.
+        - Model-load failures (e.g. CUDA OOM) are propagated as
+          ``LifecycleError`` — the graph fails rather than proceeding to
+          a broken validation call.  The caller must NOT proceed to
+          ``controller.validate()`` on failure.
+        """
+        role = "controller"
+        container_name = self.models.container_for_role(role)
+        model_name = self._model_name(role)
+
+        # Step 1: Wait for ComfyUI to fully release the GPU.
+        logger.info("ensure_controller_ready: waiting for GPU availability")
+        await self._wait_for_llm_gpu_availability(container_name)
+
+        # Step 2: Ensure the controller model is loaded in llama-router.
+        # This explicitly loads the model (so load failures are observable
+        # here rather than as a 500 during controller.validate()).
+        await self._ensure_llama_router_model_loaded(model_name)
+
+        # Step 3: Verify the controller is READY.
+        await self._wait_model_ready(role)
+
+        # Step 4: Transition ownership to the controller container so that
+        # subsequent LLM inference and validation are serialized correctly.
+        async with self._ownership_lock:
+            if self._gpu_owner is None:
+                self._gpu_owner = container_name
+            logger.info(
+                "ensure_controller_ready: controller ready owner=%s model=%s",
+                container_name,
+                model_name,
+            )
+
+    async def _ensure_llama_router_model_loaded(self, model_name: str) -> None:
+        """Ensure *model_name* is loaded in llama-router, loading it ONLY if needed.
+
+        Unlike the Docker-based ``ensure_warm``, this uses llama-router's
+        HTTP API directly (``GET /v1/models`` + ``POST /models/load``) because
+        llama-router owns model residency in the production architecture.
+
+        Idempotency & concurrency contract:
+        - If the router already reports a USABLE state ("loaded"/"ready"/
+          "running"), NO load request is issued.
+        - If the router reports an in-flight transition ("loading"), we do NOT
+          issue a competing load; the caller's readiness poll converges.
+        - Load transitions are serialized per model via ``_get_router_load_lock``
+          so two concurrent requests can never both decide "needs loading" and
+          race two POST /models/load calls (the router answers the loser with
+          HTTP 400 "model is already running").
+        - As a last-resort safety net, if a genuine race still yields an
+          "already running" rejection, the router state is re-queried and the
+          call converges on readiness instead of failing the graph.
+
+        Raises ``LifecycleError`` if the model genuinely cannot be loaded
+        (transport failure, non-recoverable router refusal such as CUDA OOM).
+        """
+        # Serialize load transitions per model. The state check is repeated
+        # inside the lock (double-checked) so that waiting callers observe the
+        # state produced by whichever caller performed the actual transition.
+        async with await self._get_router_load_lock(model_name):
+            await self._ensure_llama_router_model_locked(model_name)
+
+    async def _ensure_llama_router_model_locked(self, model_name: str) -> None:
+        async with await self._get_llm_client() as client:
+            models_data = None
+            # Check whether the model is already loaded and ready.
+            try:
+                resp = await client.get("/v1/models")
+                resp.raise_for_status()
+                models_data = resp.json()
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "llama_router_status_query_failed model=%s status=%s",
+                    model_name,
+                    getattr(exc.response, "status_code", "unknown"),
+                )
+                raise LifecycleError(
+                    f"Failed to query llama-router model status for "
+                    f"'{model_name}' (HTTP "
+                    f"{getattr(exc.response, 'status_code', 'unknown')})"
+                ) from exc
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "llama_router_status_transport_failed model=%s error=%r",
+                    model_name,
+                    exc,
+                )
+                raise LifecycleError(
+                    f"Transport error querying llama-router model status "
+                    f"for '{model_name}': {exc}"
+                ) from exc
+            except ValueError as exc:
+                raise LifecycleError(
+                    f"Invalid JSON from llama-router model listing for "
+                    f"'{model_name}': {exc}"
+                ) from exc
+
+            status_value: str | None = None
+            status_failed: bool | None = None
+            status_exit_code: int | None = None
+            found = False
+            for model in models_data.get("data", []):
+                if model.get("id") == model_name:
+                    found = True
+                    status = model.get("status", {})
+                    if isinstance(status, dict):
+                        status_value = status.get("value")
+                        # Full status metadata: a literal "unloaded" value can
+                        # carry failure/stale context ("failed": true,
+                        # "exit_code": 1) that must NOT be silently equated
+                        # with a clean, safe-to-load state.
+                        if isinstance(status.get("failed"), bool):
+                            status_failed = status["failed"]
+                        if isinstance(status.get("exit_code"), int):
+                            status_exit_code = status["exit_code"]
+                    else:
+                        status_value = status
+                    break
+
+            # Decision log: makes the next production run show exactly why
+            # /models/load was or was not called.
+            if not found:
+                status_value = "not_listed"
+                action = "load"
+            elif status_value in _ROUTER_READY_STATUSES:
+                # Router itself reports the model as resident/usable. Loading
+                # again would be rejected with "model is already running".
+                logger.info(
+                    "llama_router_controller_state "
+                    "model=%s status=%s action=skip_load",
+                    model_name,
+                    status_value,
+                )
+                return
+            elif status_value in _ROUTER_TRANSITIONAL_STATUSES:
+                # A residency transition is already in flight on the router.
+                # Issuing a competing /models/load here races that transition
+                # ("model is already running"). Do NOT load; the caller's
+                # readiness poll (_wait_model_ready) converges on readiness.
+                logger.info(
+                    "llama_router_controller_state "
+                    "model=%s status=%s action=wait_for_transition",
+                    model_name,
+                    status_value,
+                )
+                return
+            else:
+                # Genuinely not resident ("unloaded", or an unknown status we
+                # cannot prove usable) — request the load. Include any
+                # failure metadata so operators can see whether the prior
+                # state was a clean unload or a stale/failed instance.
+                action = "load"
+                if status_failed is not None or status_exit_code is not None:
+                    logger.info(
+                        "llama_router_prior_state_metadata model=%s "
+                        "status=%s failed=%s exit_code=%s",
+                        model_name,
+                        status_value,
+                        status_failed,
+                        status_exit_code,
+                    )
+
+            logger.info(
+                "llama_router_controller_state "
+                "model=%s status=%s action=%s",
+                model_name,
+                status_value,
+                action,
+            )
+            # Explicitly request llama-router to load it. This surfaces load
+            # failures (CUDA OOM, etc.) as LifecycleError *before*
+            # controller.validate() runs, rather than as an opaque HTTP 500
+            # from the chat call.
+            logger.info("llama_router_load_model model=%s", model_name)
+            try:
+                load_resp = await client.post(
+                    "/models/load",
+                    headers={"Content-Type": "application/json"},
+                    json={"model": model_name},
+                )
+                load_resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                status_code = getattr(exc.response, "status_code", "unknown")
+                body = ""
+                try:
+                    body = exc.response.text[:500]
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                logger.error(
+                    "llama_router_model_load_failed model=%s status=%s body=%r",
+                    model_name,
+                    status_code,
+                    body,
+                )
+
+                # The router is authoritative about lifecycle conflicts. An
+                # HTTP 400 "model is already running" response means a model
+                # instance/transition exists RIGHT NOW — even if the last
+                # /v1/models snapshot (which can be stale/inconsistent) said
+                # "unloaded". Treat it as a race/synchronization signal:
+                # wait for the existing router-side lifecycle to settle and
+                # become ready within the bounded timeout. A second
+                # POST /models/load MUST NOT be fired here.
+                if (
+                    isinstance(status_code, int)
+                    and status_code == 400
+                    and "already running" in body.lower()
+                ):
+                    logger.warning(
+                        "llama_router_load_conflict_already_running "
+                        "model=%s status=%s body=%r; treating as an active "
+                        "router-side transition, waiting for convergence "
+                        "(no competing load will be issued)",
+                        model_name,
+                        status_code,
+                        body,
+                    )
+                    await self._wait_router_model_settled(model_name)
+                    return
+
+                # Preserve the actual status/body so an operator can
+                # distinguish the real cause (e.g. invalid request vs.
+                # model-loading failure vs. CUDA OOM) instead of assuming a
+                # single hard-coded explanation for every HTTP 400/500.
+                if isinstance(status_code, int) and 400 <= status_code < 500:
+                    hint = (
+                        "llama-router rejected the load request "
+                        "(invalid request / refused by router)"
+                    )
+                else:
+                    hint = (
+                        "llama-router failed to load the model (possible "
+                        "model-loading or CUDA/OOM failure)"
+                    )
+                raise LifecycleError(
+                    f"Failed to load controller model '{model_name}' in "
+                    f"llama-router (HTTP {status_code}): {body!r}. {hint}."
+                ) from exc
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "llama_router_model_load_transport_failed model=%s error=%r",
+                    model_name,
+                    exc,
+                )
+                raise LifecycleError(
+                    f"Transport error loading controller model "
+                    f"'{model_name}' in llama-router: {exc}"
+                ) from exc
+
+    async def _wait_router_model_settled(self, model_name: str) -> None:
+        """Bounded wait for a router model to converge on readiness.
+
+        Used specifically as recovery for an HTTP 400 "model is already
+        running" response from POST /models/load: the router is authoritative
+        that an instance/transition exists even when the preceding
+        /v1/models snapshot was stale/inconsistent. This helper NEVER issues
+        another load request — it only re-queries /v1/models until the model
+        reports a ready status or ``controller_load_timeout_s`` expires.
+
+        Raises ``LifecycleError`` on timeout, preserving the last observed
+        status so operators can see exactly where the lifecycle stalled.
+        """
+        timeout_s = max(
+            1.0,
+            float(getattr(self.settings, "controller_load_timeout_s", 300.0)),
+        )
+        poll_interval_s = max(0.5, float(self.settings.health_poll_interval_s))
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        last_status: str | None = None
+
+        while loop.time() < deadline:
+            if self._closing:
+                raise LifecycleError(
+                    f"Lifecycle shutting down while waiting for "
+                    f"model '{model_name}' to settle"
+                )
+            try:
+                async with await self._get_llm_client() as client:
+                    resp = await client.get("/v1/models")
+                    resp.raise_for_status()
+                    models_data = resp.json()
+            except (httpx.HTTPError, ValueError):
+                # Transient probe failures during convergence are not fatal:
+                # keep polling until the bounded deadline expires.
+                await asyncio.sleep(poll_interval_s)
+                continue
+
+            found = False
+            for model in models_data.get("data", []):
+                if model.get("id") == model_name:
+                    found = True
+                    candidate_status = self._router_model_status_value(model)
+                    if candidate_status in _ROUTER_READY_STATUSES:
+                        logger.warning(
+                            "llama_router_already_running_resolved "
+                            "model=%s status=%s (load request was rejected "
+                            "with 'already running'; converged on verified "
+                            "readiness without issuing another load)",
+                            model_name,
+                            candidate_status,
+                        )
+                        return
+                    if candidate_status != last_status:
+                        logger.info(
+                            "llama_router_waiting_for_settle model=%s "
+                            "status=%s",
+                            model_name,
+                            candidate_status,
+                        )
+                        last_status = candidate_status
+                    break
+
+            if not found and last_status != "not_listed":
+                last_status = "not_listed"
+                logger.info(
+                    "llama_router_waiting_for_settle model=%s status=not_listed",
+                    model_name,
+                )
+
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(poll_interval_s, max(remaining, 0.05)))
+
+        raise LifecycleError(
+            f"llama-router reported 'model is already running' for "
+            f"'{model_name}' but the model did not reach a usable state "
+            f"within {timeout_s:.0f}s (last observed status: "
+            f"{last_status or 'unknown'}); controller loading remains blocked"
+        )
+
+    async def _wait_model_ready(
+        self, role: str, timeout_s: float | None = None
+    ) -> None:
+        """Poll llama-router until the model for *role* reports ready.
+
+        The model may be in any transitional state after the load request
+        (loading, loaded, or error).  This method polls
+        ``GET /v1/models`` until the model reports a usable status
+        ("loaded"/"ready"/"running") or the timeout expires.
+
+        Raises ``LifecycleError`` on timeout, load failure, or if the
+        lifecycle is shutting down.
+        """
+        if timeout_s is None:
+            timeout_s = float(
+                getattr(self.settings, "controller_load_timeout_s", 300.0)
+            )
+        model_name = self._model_name(role)
+        poll_interval_s = max(0.5, float(self.settings.health_poll_interval_s))
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        last_status: str | None = None
+
+        while loop.time() < deadline:
+            if self._closing:
+                raise LifecycleError(
+                    f"Lifecycle shutting down while waiting for "
+                    f"model ready: {role}"
+                )
+
+            status_value = None
+            found = False
+            async with await self._get_llm_client() as client:
+                try:
+                    resp = await client.get("/v1/models")
+                    resp.raise_for_status()
+                    models_data = resp.json()
+                except (httpx.HTTPError, ValueError) as exc:
+                    logger.warning(
+                        "llama_router_status_check_failed role=%s error=%r",
+                        role,
+                        exc,
+                    )
+                    await asyncio.sleep(poll_interval_s)
+                    continue
+
+            for model in models_data.get("data", []):
+                if model.get("id") == model_name:
+                    found = True
+                    status = model.get("status", {})
+                    status_value = (
+                        status.get("value")
+                        if isinstance(status, dict)
+                        else status
+                    )
+                    if status_value in _ROUTER_READY_STATUSES:
+                        logger.info(
+                            "model_ready role=%s model=%s status=%s",
+                            role,
+                            model_name,
+                            status_value,
+                        )
+                        return
+                    break
+
+            if not found:
+                status_str = "not_listed"
+            else:
+                status_str = status_value or "unknown"
+
+            if status_str != last_status:
+                logger.info(
+                    "waiting_for_model_ready role=%s model=%s status=%s",
+                    role,
+                    model_name,
+                    status_str,
+                )
+                last_status = status_str
+
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(poll_interval_s, max(remaining, 0.05)))
+
+        raise LifecycleError(
+            f"Controller model '{model_name}' did not become READY within "
+            f"{timeout_s:.0f}s (last status: {last_status or 'unknown'})"
+        )
+
+

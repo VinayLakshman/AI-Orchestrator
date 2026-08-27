@@ -8,6 +8,7 @@ from orchestrator.controller.engine import ControllerEngine
 from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import normalize_query
 from ..common.enums import ControllerAction, SpecialistType
+from ..common.constants import FALLBACK_NO_ANSWER
 from ..common.utils import _extract_json_object
 from ..context.assembler import build_conversation
 from ..context.conversation_evidence import (
@@ -907,7 +908,7 @@ def make_tools_node(settings: Settings):
     return tools_node
 
 
-def make_controller_validate_node(controller: ControllerEngine, settings: Settings):
+def make_controller_validate_node(controller: ControllerEngine, settings: Settings, model_lifecycle: Any = None):
     async def controller_validate_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         last_step = None
@@ -926,6 +927,20 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         stream = get_current_stream()
         if stream:
             await stream.validation_started()
+
+        # Ensure the controller model is loaded and READY before validation.
+        # After image generation, ComfyUI may still hold VRAM.  The lifecycle
+        # manager enforces the full handoff sequence:
+        #   1. wait for ComfyUI release (verified VRAM free)
+        #   2. load controller model via llama-router
+        #   3. verify controller READY
+        #   4. transition GPU ownership to the controller container
+        # controller.validate() must NEVER run without this guarantee,
+        # otherwise llama-router auto-loading the controller can hit CUDA OOM
+        # and return HTTP 500.
+        if model_lifecycle is not None:
+            logger.info("controller_validate: ensuring controller ready")
+            await model_lifecycle.ensure_controller_ready()
 
         validation = await controller.validate(state, last_step=last_step)
 
@@ -1104,7 +1119,7 @@ def make_finalize_node(controller: ControllerEngine, settings: Settings):
             answer = str(extract_assistant_text(generation.content) or extract_assistant_text(generation.raw) or "").strip()
 
         if not answer.strip():
-            answer = "I could not generate a complete answer for that request. Please try again with a little more detail."
+            answer = FALLBACK_NO_ANSWER
 
         response.final_response = answer
         response.finish_reason = "stop"

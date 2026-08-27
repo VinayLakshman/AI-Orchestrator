@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from orchestrator.logging import get_logger
 from orchestrator.logging.request_summary import log_request_summary
 
-from .common.constants import THREAD_ID_MAX_LENGTH
+from .common.constants import FALLBACK_NO_ANSWER, THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
 from .models.chat import ChatRequest
 from .models.state import OrchestratorState, RequestState
@@ -115,9 +115,58 @@ def _graph_input(state_input: OrchestratorState) -> dict[str, Any]:
     return {"request": state_input.request}
 
 
+def _image_urls_from_state(state: OrchestratorState) -> list[str]:
+    """Return the valid generated image URLs recorded by the terminal
+    image-generation node.
+
+    The image path intentionally ends at ``image_generation -> END`` without
+    running validate/finalize, so ``response.final_response`` is expected to be
+    empty for successful image workloads. The authoritative result lives in
+    ``response.metadata["image_urls"]`` (written by the node after the Open
+    WebUI response is captured and before verified GPU release).
+    """
+    if state.response.metadata.get("route") != "image_generation":
+        return []
+    raw = state.response.metadata.get("image_urls")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [str(url).strip() for url in raw if isinstance(url, (str,)) and str(url).strip()]
+
+
+def _image_assistant_content(image_urls: list[str]) -> str:
+    """Render generated images as assistant text content.
+
+    Format: markdown image syntax joined into a single message. This is the
+    smallest representation the existing architecture fully supports:
+
+    - non-streaming: ``OpenAIMessage.content`` is a plain string;
+    - streaming: ``openai_chunk(content=...)`` only transports string deltas,
+      so structured multimodal parts could never survive to the Pipe;
+    - Open WebUI renders markdown ``![alt](url)`` images directly in chat.
+
+    Every generated URL is preserved — not just the first one.
+    """
+    lines = [f"![Generated image {index}]({url})" for index, url in enumerate(image_urls, start=1)]
+    return "\n\n".join(lines)
+
+
 def _final_answer_from_state(state: OrchestratorState) -> str:
+    """Assistant answer for a completed graph.
+
+    An empty ``final_response`` does NOT imply failure for the terminal
+    image-generation route: when that route produced valid image URLs, the
+    images themselves are the assistant response. Only genuine non-image
+    results without any finalizer text fall back to the generic refusal.
+    """
+    image_urls = _image_urls_from_state(state)
+    if image_urls:
+        return _image_assistant_content(image_urls)
+
     answer = state.response.final_response.strip()
-    return answer or "I could not generate a complete answer for that request. Please try again with a little more detail."
+    return answer or FALLBACK_NO_ANSWER
+
 
 
 def _usage_from_response_state(state: OrchestratorState) -> OpenAIUsage:
@@ -441,7 +490,25 @@ async def openai_chat_completions(
                         event.kind,
                         event.payload,
                     )
+
                     if event.kind != StreamKind.LLM_TOKEN:
+                        # Lifecycle/state events (specialist progress,
+                        # image_generation_started/progress/finished,
+                        # validation, graph_finished/graph_failed, error)
+                        # MUST reach the client in real time.
+                        #
+                        # Previously every non-token event was dropped here
+                        # (`continue`), so the client saw no transition out of
+                        # "planning" during the entire GPU-acquisition + image-
+                        # generation window and had no signal separating image
+                        # completion from graph completion.
+                        #
+                        # Relay them verbatim using the project's canonical
+                        # StreamEvent SSE serialization (`id:`/`event:`/`data:`
+                        # lines — same format as GET /v1/streams/{request_id}).
+                        # Named SSE events are ignored by generic OpenAI chunk
+                        # parsers, so this stays wire-compatible.
+                        yield event.to_sse()
                         continue
 
                     payload_data = event.payload or {}

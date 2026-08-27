@@ -21,6 +21,7 @@ from ..settings import Settings
 from ..specialists.web import WebSpecialist
 from ..streaming.hub import StreamHub
 from ..vision.pipeline import VisionPipeline
+from .image_generation import make_image_generation_node
 from .nodes import (
     make_clarify_node,
     make_controller_plan_node,
@@ -116,6 +117,7 @@ class OrchestratorRuntime:
 
     controller: ControllerEngine
     knowledge_client: KnowledgeClient
+    model_lifecycle: Any
     client_registry: ClientRegistry
     vision_pipeline: VisionPipeline
     stream_hub: StreamHub
@@ -129,6 +131,7 @@ class OrchestratorRuntime:
             "model_manager": self.model_manager,
             "controller": self.controller,
             "knowledge_client": self.knowledge_client,
+            "model_lifecycle": self.model_lifecycle,
             "client_registry": self.client_registry,
             "vision_pipeline": self.vision_pipeline,
             "stream_hub": self.stream_hub,
@@ -183,6 +186,7 @@ def build_graph(
     controller: ControllerEngine,
     knowledge_client: KnowledgeClient,
     client_registry: ClientRegistry,
+    model_lifecycle: Any,
     vision_pipeline: VisionPipeline,
     searxng_client: SearXNGClient | None = None,
 ) -> tuple[Any, Any]:
@@ -203,8 +207,13 @@ def build_graph(
     coder_node = make_coder_node(controller, settings)
 
     tools_node = make_tools_node(settings)
-    validate_node = make_controller_validate_node(controller, settings)
+    validate_node = make_controller_validate_node(controller, settings, model_lifecycle)
     reasoning_node = make_reasoning_node(controller, settings)
+    image_generation_node = make_image_generation_node(
+        settings,
+        model_lifecycle=model_lifecycle,
+        client_registry=client_registry,
+    )
 
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
@@ -218,6 +227,7 @@ def build_graph(
     tools_node = timed_node("tools", tools_node, display_name="Tools")
     validate_node = timed_node("validation", validate_node, display_name="Validation")
     reasoning_node = timed_node("reasoning", reasoning_node, display_name="Reasoning")
+    image_generation_node = timed_node("image_generation", image_generation_node, display_name="Image Generation")
     clarify_node = timed_node("clarify", clarify_node, display_name="Clarification")
     finalize_node = timed_node("finalize", finalize_node, display_name="Finalizer")
 
@@ -230,6 +240,7 @@ def build_graph(
     builder.add_node("tools", tools_node)
     builder.add_node("validate", validate_node)
     builder.add_node("reasoning", reasoning_node)
+    builder.add_node("image_generation", image_generation_node)
     builder.add_node("clarify", clarify_node)
     builder.add_node("finalize", finalize_node)
 
@@ -311,6 +322,7 @@ def build_graph(
             "coder": "coder",
             "tools": "tools",
             "reasoning": "reasoning",
+            "image_generation": "image_generation",
             "finalize": "finalize",
             "clarify": "clarify",
         },
@@ -321,6 +333,33 @@ def build_graph(
     builder.add_edge("web", "validate")
     builder.add_edge("coder", "validate")
     builder.add_edge("tools", "validate")
+
+    # Image generation is a TERMINAL workload path. It must NOT fan out into
+    # normal controller validation or normal textual finalization:
+    #
+    #   - Both former edges ("image_generation" -> "validate" and
+    #     "image_generation" -> "finalize") scheduled two parallel sibling
+    #     nodes in the same Pregel superstep. Both nodes return the complete
+    #     OrchestratorState, so both wrote every channel — including the
+    #     reducer-less ``request`` LastValue channel — which raised
+    #     langgraph.errors.InvalidUpdateError
+    #     ("At key 'request': Can receive only one value per step").
+    #
+    #   - An image result never needs LLM validation/finalization; routing it
+    #     there made the controller stream a textual refusal after a
+    #     successful generation.
+    #
+    # The image-generation node itself owns the full lifecycle boundary and
+    # does not return until:
+    #
+    #   generate -> capture result -> image_generation_finished(success=True)
+    #            -> release_comfyui_gpu() (verified VRAM release) -> return
+    #
+    # It does NOT proactively reload the controller; the next request acquires
+    # whatever resource it needs through the normal lifecycle machinery.
+    # graph_finished is published by the API layer only after this node
+    # returns, so it cannot precede successful ComfyUI release.
+    builder.add_edge("image_generation", END)
 
     builder.add_conditional_edges(
         "validate",
@@ -350,6 +389,13 @@ def build_graph(
 async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     logger.info("registering runtime dependencies")
 
+    from ..runtime.model_lifecycle import ModelLifecycle
+    from ..runtime.docker_runtime import DockerRuntime
+
+    # Create Docker runtime for EXISTING LLM container management only.
+    # Docker is never used for Open WebUI / ComfyUI GPU arbitration.
+    docker = DockerRuntime()
+
     provider = ModelProvider(settings)
 
     router_health_timeout = max(1.0, min(5.0, float(settings.health_timeout_s)))
@@ -372,6 +418,19 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     )
 
     client_registry = ClientRegistry()
+
+    # Register Open WebUI client (image-generation delegation boundary).
+    # Open WebUI owns all image-generation configuration; the orchestrator
+    # only calls its authenticated image-generation API.
+    openwebui_client = None
+    if settings.openwebui_base_url:
+        from ..clients.openwebui import OpenWebUIClient
+        openwebui_http = httpx.AsyncClient(
+            base_url=settings.openwebui_base_url,
+            timeout=max(settings.image_generation_timeout, 60.0),
+        )
+        openwebui_client = OpenWebUIClient(settings=settings, client=openwebui_http)
+        client_registry.register("openwebui", openwebui_client)
 
     router_client = LlamaCppClient(
         settings=settings,
@@ -408,11 +467,22 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
     )
     stream_hub = StreamHub()
 
+    # ModelLifecycle depends on the fully constructed ModelManager, so it is
+    # created here — AFTER model_manager and BEFORE the graph/runtime that
+    # consume it (initialization order: settings -> DockerRuntime ->
+    # ModelManager -> ModelLifecycle -> graph -> OrchestratorRuntime).
+    model_lifecycle = ModelLifecycle(
+        settings=settings,
+        models=model_manager,
+        docker=docker,
+    )
+
     graph, checkpointer = build_graph(
         settings=settings,
         controller=controller,
         knowledge_client=knowledge_client,
         client_registry=client_registry,
+        model_lifecycle=model_lifecycle,
         vision_pipeline=vision_pipeline,
         searxng_client=searxng_client,
     )
@@ -422,6 +492,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         model_manager=model_manager,
         controller=controller,
         knowledge_client=knowledge_client,
+        model_lifecycle=model_lifecycle,
         client_registry=client_registry,
         vision_pipeline=vision_pipeline,
         stream_hub=stream_hub,

@@ -64,10 +64,6 @@ class DockerRuntime:
         running = stdout.strip().lower() == "true"
         return ContainerStatus(running=running, exists=True, name=container_name)
 
-    async def exists(self, container_name: str) -> bool:
-        status = await self.status(container_name)
-        return status.exists
-
     async def wait_stopped(self, container_name: str, *, timeout_s: float) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_s
         while True:

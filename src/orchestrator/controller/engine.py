@@ -14,13 +14,12 @@ from ..context.builder import (
     build_controller_messages,
     build_finalize_context,
     build_finalizer_messages,
-    estimate_text_tokens,
     render_request_context,
     render_structured_context,
 )
 from ..context.conversation_evidence import render_reusable_evidence_summary
 from ..context.conversation_state import render_conversation_state
-from ..context.parser import split_conversation
+from ..context.parser import estimate_text_tokens, split_conversation
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.manager import ModelManager

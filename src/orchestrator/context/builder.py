@@ -24,11 +24,10 @@ from ..request_normalizer import (
     _extract_attachment_reference,
     _is_file_part,
     _is_image_part,
-    _placeholder_for_attachment,
 )
 from .assembler import build_conversation
 from .conversation_state import render_conversation_state
-from .parser import estimate_text_tokens, split_conversation
+from .parser import split_conversation
 
 logger = get_logger(__name__)
 
@@ -75,33 +74,6 @@ def _truncate(text: str, limit: int = 220) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: max(0, limit - 1)].rstrip() + "…"
-
-
-def _dedupe_text_items(values: list[str]) -> tuple[list[str], int]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    removed = 0
-    for value in values:
-        item = _normalize_text(value)
-        if not item:
-            continue
-        key = item.lower()
-        if key in seen:
-            removed += 1
-            continue
-        seen.add(key)
-        deduped.append(item)
-    return deduped, removed
-
-
-def _compact_lines(text: str | None, *, max_items: int, max_chars: int) -> list[str]:
-    lines = [
-        _truncate(line.strip(" -•\t"), max_chars)
-        for line in str(text or "").splitlines()
-        if line.strip()
-    ]
-    deduped, _ = _dedupe_text_items(lines)
-    return deduped[:max_items]
 
 
 def _structured_source_entry(

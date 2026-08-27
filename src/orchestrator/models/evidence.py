@@ -158,6 +158,8 @@ class EvidenceLedger(BaseModel):
 
     reasoning: ReasoningEvidence | None = None
 
+    comfyui: dict | None = None  # ComfyUI job results
+
     @property
     def has_repository(self) -> bool:
         return self.repository is not None
@@ -182,50 +184,15 @@ class EvidenceLedger(BaseModel):
     def has_reasoning(self) -> bool:
         return self.reasoning is not None
 
-    def available_sources(self) -> list[str]:
-        """
-        Returns a list of populated evidence sections.
-        """
-
-        sources: list[str] = []
-
-        if self.has_repository:
-            sources.append("repository")
-
-        if self.has_web:
-            sources.append("web")
-
-        if self.has_vision:
-            sources.append("vision")
-
-        if self.has_code:
-            sources.append("code")
-
-        if self.has_tools:
-            sources.append("tools")
-
-        if self.has_reasoning:
-            sources.append("reasoning")
-
-        return sources
-
-    def populated(self) -> dict[str, Any]:
-        sections = {
-            "repository": self.repository,
-            "web": self.web,
-            "vision": self.vision,
-            "code": self.code,
-            "tools": self.tools,
-            "reasoning": self.reasoning,
-        }
-        return {
-            name: evidence.model_dump(exclude_none=True)
-            for name, evidence in sections.items()
-            if evidence is not None
-        }
-
-    def model_context(self) -> dict[str, Any]:
-        return self.populated()
+    @property
+    def comfyui_image_count(self) -> int:
+        """Number of generated images recorded in ``comfyui`` evidence."""
+        if self.comfyui is None:
+            return 0
+        images = (self.comfyui or {}).get("images")
+        if isinstance(images, list):
+            return sum(1 for item in images if isinstance(item, str) and item.strip())
+        return 0
 
 
 class ConversationEvidenceItem(BaseModel):
