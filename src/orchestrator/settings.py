@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -67,16 +67,12 @@ class Settings(BaseSettings):
     controller_finalize_max_tokens: int = 1200
     reasoning_max_tokens: int = 4096
     coder_max_tokens: int = 1200
-    vision_max_tokens: int = 1200
 
     # Knowledge service
     knowledge_service_url: str = "http://knowledge-service:8000"
-    knowledge_collection: str = "homelab-knowledge"
     knowledge_top_k: int = 6
     knowledge_candidate_limit: int = 12
     knowledge_neighbor_window: int = 1
-    knowledge_min_score: float = 0.55
-    knowledge_min_hits: int = 1
 
     # Native web retrieval
     web_search_enabled: bool = True
@@ -96,7 +92,6 @@ class Settings(BaseSettings):
 
     # MCP / tools
     mcp_enabled: bool = True
-    mcp_servers_json: str = "[]"
 
     # Checkpoint / storage
     checkpoint_sqlite_path: str = "/data/checkpoints.sqlite3"
@@ -106,10 +101,6 @@ class Settings(BaseSettings):
     # Conversation history is trimmed oldest-first until it fits this budget.
     max_context_history_tokens: int = 12000
     request_timeout_s: float = 300.0
-
-    # OpenAI-compatible surface
-    openai_api_key: SecretStr | None = None
-    openai_organization: str | None = None
 
     # Feature flags
     enable_rag: bool = True

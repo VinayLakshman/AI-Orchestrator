@@ -140,23 +140,6 @@ class StreamPublisher:
             payload["data"] = data
         return await self._emit(StreamKind.LLM_FINISHED, **payload)
 
-    async def error(
-        self,
-        error: str,
-        *,
-        stage: str | None = None,
-        data: dict[str, Any] | None = None,
-    ) -> StreamEvent:
-        payload: dict[str, Any] = {
-            "error": error,
-            "message": error,
-        }
-        if stage is not None:
-            payload["stage"] = stage
-        if data:
-            payload["data"] = data
-        return await self._emit(StreamKind.ERROR, **payload)
-
     async def routing_started(self, *, query: str | None = None) -> StreamEvent:
         return await self.specialist_started(
             specialist="routing",
@@ -409,23 +392,6 @@ class StreamPublisher:
             **_clean_payload(
                 specialist="image_generation",
                 message=message or "Image generation started.",
-                data=data or {},
-            ),
-        )
-
-    async def image_generation_progress(
-        self,
-        *,
-        progress: float,
-        message: str | None = None,
-        data: dict[str, Any] | None = None,
-    ) -> StreamEvent:
-        return await self._emit(
-            StreamKind.IMAGE_GENERATION_PROGRESS,
-            **_clean_payload(
-                specialist="image_generation",
-                progress=progress,
-                message=message or f"Image generation in progress: {progress}%",
                 data=data or {},
             ),
         )

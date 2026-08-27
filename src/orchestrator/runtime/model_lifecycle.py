@@ -772,25 +772,6 @@ class ModelLifecycle:
                 logger.exception("model_start_failed role=%s model=%s", role, state.name)
                 raise LifecycleError(str(exc)) from exc
 
-    def touch(self, role: str) -> None:
-        """Extend keep-warm window based on last usage."""
-        role = role.lower().strip()
-        now = time.time()
-
-        async def _touch() -> None:
-            async with self._state_lock:
-                if role not in self._runtime:
-                    return
-                policy = self._policy(role)
-                state = self._runtime[role]
-                state.last_used_at = now
-                state.keep_warm_until = now + policy.keep_alive_seconds
-                state.status = LifecycleState.IDLE
-                state.touch_invocations += 1
-
-        if not self._closing:
-            asyncio.create_task(_touch())
-
     async def keep_warm(self, role: str) -> None:
         """Mark model as IDLE but not evictable until keep_alive expires."""
         role = role.lower().strip()
@@ -803,43 +784,6 @@ class ModelLifecycle:
             state.last_used_at = state.last_used_at or now
             state.keep_warm_until = now + policy.keep_alive_seconds
             state.status = LifecycleState.IDLE
-
-    def request_preload(self, role: str) -> None:
-        """Schedule a background warm without awaiting.
-
-        Preload now means: "if no other container currently owns GPU residency,
-        proactively start this model." It must never violate the single-owner
-        invariant, so if another container owns the GPU it is skipped.
-        """
-        role = role.lower().strip()
-        policy = self._policy(role)
-        if not policy.preload_enabled or self._closing:
-            return
-
-        container_name = self.models.container_for_role(role)
-
-        async def _preload() -> None:
-            try:
-                # Only preload when no other container owns the GPU. Holding the
-                # ownership lock here guarantees the invariant is not violated.
-                async with self._ownership_lock:
-                    if self._gpu_owner is not None and self._gpu_owner != container_name:
-                        logger.info(
-                            "model_preload_skipped_owner_conflict role=%s owner=%s",
-                            role,
-                            self._gpu_owner,
-                        )
-                        return
-                await self.ensure_warm(role)
-                async with self._state_lock:
-                    state = self._runtime.get(role)
-                    if state is not None:
-                        state.status = LifecycleState.IDLE
-                        logger.info("model_preload_finished role=%s model=%s", role, state.name)
-            except Exception:
-                logger.exception("model_preload_failed role=%s", role)
-
-        asyncio.create_task(_preload())
 
     async def _begin_inference(self, role: str) -> None:
         role = role.lower().strip()
@@ -878,17 +822,6 @@ class ModelLifecycle:
         from .model_inference_guard import _InferenceGuard
 
         return _InferenceGuard(lifecycle=self, role=role)
-
-    def is_loaded(self, role: str) -> bool:
-        role = role.lower().strip()
-        st = self._runtime.get(role)
-        if st is None:
-            return False
-        return st.status in {
-            LifecycleState.WARM,
-            LifecycleState.IDLE,
-            LifecycleState.STARTING,
-        }
 
     async def evict_if_needed(self) -> None:
         """Evict models whose keep-warm window has expired.

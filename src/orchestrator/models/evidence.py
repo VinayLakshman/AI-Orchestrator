@@ -185,11 +185,6 @@ class EvidenceLedger(BaseModel):
         return self.reasoning is not None
 
     @property
-    def has_comfyui(self) -> bool:
-        """True when ComfyUI image-generation results are present."""
-        return self.comfyui is not None
-
-    @property
     def comfyui_image_count(self) -> int:
         """Number of generated images recorded in ``comfyui`` evidence."""
         if self.comfyui is None:
@@ -198,51 +193,6 @@ class EvidenceLedger(BaseModel):
         if isinstance(images, list):
             return sum(1 for item in images if isinstance(item, str) and item.strip())
         return 0
-
-    def available_sources(self) -> list[str]:
-        """
-        Returns a list of populated evidence sections.
-        """
-
-        sources: list[str] = []
-
-        if self.has_repository:
-            sources.append("repository")
-
-        if self.has_web:
-            sources.append("web")
-
-        if self.has_vision:
-            sources.append("vision")
-
-        if self.has_code:
-            sources.append("code")
-
-        if self.has_tools:
-            sources.append("tools")
-
-        if self.has_reasoning:
-            sources.append("reasoning")
-
-        return sources
-
-    def populated(self) -> dict[str, Any]:
-        sections = {
-            "repository": self.repository,
-            "web": self.web,
-            "vision": self.vision,
-            "code": self.code,
-            "tools": self.tools,
-            "reasoning": self.reasoning,
-        }
-        return {
-            name: evidence.model_dump(exclude_none=True)
-            for name, evidence in sections.items()
-            if evidence is not None
-        }
-
-    def model_context(self) -> dict[str, Any]:
-        return self.populated()
 
 
 class ConversationEvidenceItem(BaseModel):

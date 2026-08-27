@@ -28,11 +28,5 @@ class ClientRegistry:
             raise KeyError(f"No inference client registered for model role: {role}")
         return self._clients[role]
 
-    def has(self, role: str) -> bool:
-        return role.lower().strip() in self._clients
-
-    def roles(self) -> list[str]:
-        return list(self._clients.keys())
-
     def clients(self) -> list[Any]:
         return list(self._clients.values())
