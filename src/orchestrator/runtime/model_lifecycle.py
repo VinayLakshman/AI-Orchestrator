@@ -65,6 +65,19 @@ _IMAGE_GPU_SENTINELS = frozenset(
 )
 
 
+# llama-router model-status vocabulary (GET /v1/models, status.value).
+#
+# USABLE  : the router itself considers the model resident and serving
+#           ("model is already running" proves the router uses *more* active
+#           states than just "loaded" — e.g. "running"). Any of these must
+#           NEVER be followed by POST /models/load.
+# TRANSITIONAL: an in-flight residency transition. Issuing a competing load
+#           here can race the transition already under way (HTTP 400 "model
+#           is already running"); we wait instead.
+_ROUTER_READY_STATUSES = frozenset({"loaded", "ready", "running"})
+_ROUTER_TRANSITIONAL_STATUSES = frozenset({"loading", "sleeping"})
+
+
 def is_llm_container_owner(value: str | None) -> bool:
     """Return True only when ``value`` is a real llama.cpp container name.
 
@@ -241,6 +254,15 @@ class ModelLifecycle:
         # start/stop/health/shutdown commands.
         self._container_locks: dict[str, asyncio.Lock] = {}
 
+        # Protects the per-model llama-router load-lock registry.
+        self._router_load_registry_lock = asyncio.Lock()
+
+        # Per-model locks serialize llama-router load/readiness transitions so
+        # concurrent readiness requests cannot issue competing POST /models/load
+        # calls for the same model (the router rejects a second concurrent load
+        # with HTTP 400 "model is already running").
+        self._router_load_locks: dict[str, asyncio.Lock] = {}
+
         # Runtime state for each model role.
         self._runtime: dict[str, ModelRuntimeState] = {}
 
@@ -263,6 +285,28 @@ class ModelLifecycle:
                 lock = asyncio.Lock()
                 self._container_locks[container_name] = lock
             return lock
+
+    async def _get_router_load_lock(self, model_name: str) -> asyncio.Lock:
+        """Return the per-model lock serializing llama-router load transitions.
+
+        At most one load transition per model may be active at a time; other
+        readiness requests wait on this lock instead of issuing a competing
+        POST /models/load.
+        """
+        async with self._router_load_registry_lock:
+            lock = self._router_load_locks.get(model_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._router_load_locks[model_name] = lock
+            return lock
+
+    @staticmethod
+    def _router_model_status_value(model: dict[str, Any]) -> str | None:
+        """Extract the llama-router status value from a /v1/models entry."""
+        status = model.get("status")
+        if isinstance(status, dict):
+            return status.get("value")
+        return str(status) if status is not None else None
 
     def start_background_cleanup(self) -> None:
         if self._cleanup_task is not None:
@@ -1532,7 +1576,11 @@ class ModelLifecycle:
           proceeds once ownership is ``None`` or already belongs to the
           controller container.
         - The controller model is loaded and READY in llama-router
-          (verified, not assumed).
+          (verified, not assumed). The load step is IDEMPOTENT: if the router
+          already reports a usable state ("loaded"/"ready"/"running") or an
+          in-flight transition ("loading"), no POST /models/load is issued,
+          so repeated calls converge on readiness without triggering the
+          router's HTTP 400 "model is already running" rejection.
         - GPU ownership is transitioned to the controller container so
           that concurrent LLM inference is correctly serialized.
         - Model-load failures (e.g. CUDA OOM) are propagated as
@@ -1568,16 +1616,37 @@ class ModelLifecycle:
             )
 
     async def _ensure_llama_router_model_loaded(self, model_name: str) -> None:
-        """Ensure *model_name* is loaded in llama-router, loading it if necessary.
+        """Ensure *model_name* is loaded in llama-router, loading it ONLY if needed.
 
         Unlike the Docker-based ``ensure_warm``, this uses llama-router's
         HTTP API directly (``GET /v1/models`` + ``POST /models/load``) because
         llama-router owns model residency in the production architecture.
 
-        Raises ``LifecycleError`` if the load request itself fails (e.g.
-        HTTP 500 from llama-router indicating CUDA OOM).
+        Idempotency & concurrency contract:
+        - If the router already reports a USABLE state ("loaded"/"ready"/
+          "running"), NO load request is issued.
+        - If the router reports an in-flight transition ("loading"), we do NOT
+          issue a competing load; the caller's readiness poll converges.
+        - Load transitions are serialized per model via ``_get_router_load_lock``
+          so two concurrent requests can never both decide "needs loading" and
+          race two POST /models/load calls (the router answers the loser with
+          HTTP 400 "model is already running").
+        - As a last-resort safety net, if a genuine race still yields an
+          "already running" rejection, the router state is re-queried and the
+          call converges on readiness instead of failing the graph.
+
+        Raises ``LifecycleError`` if the model genuinely cannot be loaded
+        (transport failure, non-recoverable router refusal such as CUDA OOM).
         """
+        # Serialize load transitions per model. The state check is repeated
+        # inside the lock (double-checked) so that waiting callers observe the
+        # state produced by whichever caller performed the actual transition.
+        async with await self._get_router_load_lock(model_name):
+            await self._ensure_llama_router_model_locked(model_name)
+
+    async def _ensure_llama_router_model_locked(self, model_name: str) -> None:
         async with await self._get_llm_client() as client:
+            models_data = None
             # Check whether the model is already loaded and ready.
             try:
                 resp = await client.get("/v1/models")
@@ -1610,25 +1679,62 @@ class ModelLifecycle:
                     f"'{model_name}': {exc}"
                 ) from exc
 
+            status_value: str | None = None
+            found = False
             for model in models_data.get("data", []):
                 if model.get("id") == model_name:
+                    found = True
                     status = model.get("status", {})
                     status_value = (
                         status.get("value")
                         if isinstance(status, dict)
                         else status
                     )
-                    if status_value in ("loaded", "ready"):
-                        logger.info(
-                            "llama_router_model_already_loaded model=%s",
-                            model_name,
-                        )
-                        return
+                    break
 
-            # Not loaded — explicitly request llama-router to load it.
-            # This surfaces load failures (CUDA OOM, etc.) as LifecycleError
-            # *before* controller.validate() runs, rather than as an
-            # opaque HTTP 500 from the chat call.
+            # Decision log: makes the next production run show exactly why
+            # /models/load was or was not called.
+            if not found:
+                status_value = "not_listed"
+                action = "load"
+            elif status_value in _ROUTER_READY_STATUSES:
+                # Router itself reports the model as resident/usable. Loading
+                # again would be rejected with "model is already running".
+                logger.info(
+                    "llama_router_controller_state "
+                    "model=%s status=%s action=skip_load",
+                    model_name,
+                    status_value,
+                )
+                return
+            elif status_value in _ROUTER_TRANSITIONAL_STATUSES:
+                # A residency transition is already in flight on the router.
+                # Issuing a competing /models/load here races that transition
+                # ("model is already running"). Do NOT load; the caller's
+                # readiness poll (_wait_model_ready) converges on readiness.
+                logger.info(
+                    "llama_router_controller_state "
+                    "model=%s status=%s action=wait_for_transition",
+                    model_name,
+                    status_value,
+                )
+                return
+            else:
+                # Genuinely not resident ("unloaded", or an unknown status we
+                # cannot prove usable) — request the load.
+                action = "load"
+
+            logger.info(
+                "llama_router_controller_state "
+                "model=%s status=%s action=%s",
+                model_name,
+                status_value,
+                action,
+            )
+            # Explicitly request llama-router to load it. This surfaces load
+            # failures (CUDA OOM, etc.) as LifecycleError *before*
+            # controller.validate() runs, rather than as an opaque HTTP 500
+            # from the chat call.
             logger.info("llama_router_load_model model=%s", model_name)
             try:
                 load_resp = await client.post(
@@ -1650,6 +1756,47 @@ class ModelLifecycle:
                     status_code,
                     body,
                 )
+
+                # Benign race recovery: if another path loaded the model
+                # between our state check and this POST, the router answers
+                # 400 "model is already running". Re-query the router state;
+                # if the model is genuinely usable, converge on readiness.
+                if (
+                    isinstance(status_code, int)
+                    and status_code == 400
+                    and "already running" in body.lower()
+                ):
+                    try:
+                        recheck = await client.get("/v1/models")
+                        recheck.raise_for_status()
+                        recheck_data = recheck.json()
+                    except (httpx.HTTPError, ValueError):
+                        recheck_data = None
+                    if recheck_data is not None:
+                        for model in recheck_data.get("data", []):
+                            if model.get("id") != model_name:
+                                continue
+                            recheck_status = self._router_model_status_value(
+                                model
+                            )
+                            if recheck_status in _ROUTER_READY_STATUSES:
+                                logger.warning(
+                                    "llama_router_load_race_resolved "
+                                    "model=%s status=%s (router rejected "
+                                    "the load with 'already running' but "
+                                    "reports the model usable; converged "
+                                    "on verified readiness)",
+                                    model_name,
+                                    recheck_status,
+                                )
+                                return
+                    raise LifecycleError(
+                        f"Failed to load controller model '{model_name}' in "
+                        f"llama-router (HTTP {status_code}): {body!r}. The "
+                        f"router said 'already running' but does NOT report "
+                        f"the model as usable; refusing to guess readiness."
+                    ) from exc
+
                 # Preserve the actual status/body so an operator can
                 # distinguish the real cause (e.g. invalid request vs.
                 # model-loading failure vs. CUDA OOM) instead of assuming a
@@ -1686,8 +1833,8 @@ class ModelLifecycle:
 
         The model may be in any transitional state after the load request
         (loading, loaded, or error).  This method polls
-        ``GET /v1/models`` until the model reports a ``loaded``/``ready``
-        status or the timeout expires.
+        ``GET /v1/models`` until the model reports a usable status
+        ("loaded"/"ready"/"running") or the timeout expires.
 
         Raises ``LifecycleError`` on timeout, load failure, or if the
         lifecycle is shutting down.
@@ -1735,7 +1882,7 @@ class ModelLifecycle:
                         if isinstance(status, dict)
                         else status
                     )
-                    if status_value in ("loaded", "ready"):
+                    if status_value in _ROUTER_READY_STATUSES:
                         logger.info(
                             "model_ready role=%s model=%s status=%s",
                             role,
