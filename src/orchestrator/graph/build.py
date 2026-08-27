@@ -207,7 +207,7 @@ def build_graph(
     coder_node = make_coder_node(controller, settings)
 
     tools_node = make_tools_node(settings)
-    validate_node = make_controller_validate_node(controller, settings)
+    validate_node = make_controller_validate_node(controller, settings, model_lifecycle)
     reasoning_node = make_reasoning_node(controller, settings)
     image_generation_node = make_image_generation_node(
         settings,

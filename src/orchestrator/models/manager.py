@@ -65,3 +65,13 @@ class ModelManager:
     def client(self, role: str) -> Any:
         """Return the inference client for a model role."""
         return self.client_registry.get(role)
+
+    def endpoint_for_role(self, role: str) -> str:
+        """Return the inference endpoint URL for a given model role.
+
+        All roles are served by the same llama-router instance, so the
+        endpoint is the same regardless of role.  The URL is normalised to
+        the router origin (without a trailing ``/v1``) so callers can append
+        arbitrary llama-router paths (``/health``, ``/models/load``, etc.).
+        """
+        return self.provider.router_origin_url

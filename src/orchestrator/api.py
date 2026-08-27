@@ -441,7 +441,25 @@ async def openai_chat_completions(
                         event.kind,
                         event.payload,
                     )
+
                     if event.kind != StreamKind.LLM_TOKEN:
+                        # Lifecycle/state events (specialist progress,
+                        # image_generation_started/progress/finished,
+                        # validation, graph_finished/graph_failed, error)
+                        # MUST reach the client in real time.
+                        #
+                        # Previously every non-token event was dropped here
+                        # (`continue`), so the client saw no transition out of
+                        # "planning" during the entire GPU-acquisition + image-
+                        # generation window and had no signal separating image
+                        # completion from graph completion.
+                        #
+                        # Relay them verbatim using the project's canonical
+                        # StreamEvent SSE serialization (`id:`/`event:`/`data:`
+                        # lines — same format as GET /v1/streams/{request_id}).
+                        # Named SSE events are ignored by generic OpenAI chunk
+                        # parsers, so this stays wire-compatible.
+                        yield event.to_sse()
                         continue
 
                     payload_data = event.payload or {}

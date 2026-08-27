@@ -907,7 +907,7 @@ def make_tools_node(settings: Settings):
     return tools_node
 
 
-def make_controller_validate_node(controller: ControllerEngine, settings: Settings):
+def make_controller_validate_node(controller: ControllerEngine, settings: Settings, model_lifecycle: Any = None):
     async def controller_validate_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         last_step = None
@@ -926,6 +926,20 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         stream = get_current_stream()
         if stream:
             await stream.validation_started()
+
+        # Ensure the controller model is loaded and READY before validation.
+        # After image generation, ComfyUI may still hold VRAM.  The lifecycle
+        # manager enforces the full handoff sequence:
+        #   1. wait for ComfyUI release (verified VRAM free)
+        #   2. load controller model via llama-router
+        #   3. verify controller READY
+        #   4. transition GPU ownership to the controller container
+        # controller.validate() must NEVER run without this guarantee,
+        # otherwise llama-router auto-loading the controller can hit CUDA OOM
+        # and return HTTP 500.
+        if model_lifecycle is not None:
+            logger.info("controller_validate: ensuring controller ready")
+            await model_lifecycle.ensure_controller_ready()
 
         validation = await controller.validate(state, last_step=last_step)
 

@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     health_poll_interval_s: float = 2.0
     health_timeout_s: float = 120.0
 
+    # Max time to wait for the controller model to become READY in
+    # llama-router after the GPU has been released by ComfyUI.  This is the
+    # post-image-generation handoff: the controller must be verifiably loaded
+    # before controller.validate() runs.
+    controller_load_timeout_s: float = 300.0
+
     controller_keep_alive: str = "30m"
     reasoning_keep_alive: str = "15m"
     coder_keep_alive: str = "30m"

@@ -1334,4 +1334,248 @@ class ModelLifecycle:
             base_url = base_url[: -len("/v1")]
         return httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=httpx.Timeout(30.0))
 
-            
+    # ------------------------------------------------------------------
+    # Controller handoff: ComfyUI release → controller load → readiness
+    # ------------------------------------------------------------------
+
+    async def ensure_controller_ready(self) -> None:
+        """Ensure the controller model is loaded and READY before LLM inference.
+
+        This is the mandatory handoff gate called after image generation
+        completes (i.e. after ``release_comfyui_gpu``), before
+        ``controller.validate()`` runs.  It guarantees the full lifecycle
+        sequence required to avoid the production CUDA-OOM / HTTP-500
+        failure:
+
+            release_comfyui_gpu()
+                ↓  (verified VRAM release, _gpu_owner → None)
+            ensure_controller_ready()   ← THIS METHOD
+                ↓  1. wait for ComfyUI release (owner == None or controller)
+                ↓  2. load controller model via llama-router (POST /models/load)
+                ↓  3. verify controller READY (GET /v1/models polling)
+                ↓  4. transition _gpu_owner to controller container
+            controller.validate()
+
+        Guarantees:
+        - ComfyUI has fully released VRAM — the call blocks while
+          ``_gpu_owner`` is any image-generation sentinel
+          (``comfyui``, ``transitioning_to_comfyui``,
+          ``releasing_comfyui``, ``TRANSITIONING_TO_LLM``) and only
+          proceeds once ownership is ``None`` or already belongs to the
+          controller container.
+        - The controller model is loaded and READY in llama-router
+          (verified, not assumed).
+        - GPU ownership is transitioned to the controller container so
+          that concurrent LLM inference is correctly serialized.
+        - Model-load failures (e.g. CUDA OOM) are propagated as
+          ``LifecycleError`` — the graph fails rather than proceeding to
+          a broken validation call.  The caller must NOT proceed to
+          ``controller.validate()`` on failure.
+        """
+        role = "controller"
+        container_name = self.models.container_for_role(role)
+        model_name = self._model_name(role)
+
+        # Step 1: Wait for ComfyUI to fully release the GPU.
+        logger.info("ensure_controller_ready: waiting for GPU availability")
+        await self._wait_for_llm_gpu_availability(container_name)
+
+        # Step 2: Ensure the controller model is loaded in llama-router.
+        # This explicitly loads the model (so load failures are observable
+        # here rather than as a 500 during controller.validate()).
+        await self._ensure_llama_router_model_loaded(model_name)
+
+        # Step 3: Verify the controller is READY.
+        await self._wait_model_ready(role)
+
+        # Step 4: Transition ownership to the controller container so that
+        # subsequent LLM inference and validation are serialized correctly.
+        async with self._ownership_lock:
+            if self._gpu_owner is None:
+                self._gpu_owner = container_name
+            logger.info(
+                "ensure_controller_ready: controller ready owner=%s model=%s",
+                container_name,
+                model_name,
+            )
+
+    async def _ensure_llama_router_model_loaded(self, model_name: str) -> None:
+        """Ensure *model_name* is loaded in llama-router, loading it if necessary.
+
+        Unlike the Docker-based ``ensure_warm``, this uses llama-router's
+        HTTP API directly (``GET /v1/models`` + ``POST /models/load``) because
+        llama-router owns model residency in the production architecture.
+
+        Raises ``LifecycleError`` if the load request itself fails (e.g.
+        HTTP 500 from llama-router indicating CUDA OOM).
+        """
+        async with await self._get_llm_client() as client:
+            # Check whether the model is already loaded and ready.
+            try:
+                resp = await client.get("/v1/models")
+                resp.raise_for_status()
+                models_data = resp.json()
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "llama_router_status_query_failed model=%s status=%s",
+                    model_name,
+                    getattr(exc.response, "status_code", "unknown"),
+                )
+                raise LifecycleError(
+                    f"Failed to query llama-router model status for "
+                    f"'{model_name}' (HTTP "
+                    f"{getattr(exc.response, 'status_code', 'unknown')})"
+                ) from exc
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "llama_router_status_transport_failed model=%s error=%r",
+                    model_name,
+                    exc,
+                )
+                raise LifecycleError(
+                    f"Transport error querying llama-router model status "
+                    f"for '{model_name}': {exc}"
+                ) from exc
+            except ValueError as exc:
+                raise LifecycleError(
+                    f"Invalid JSON from llama-router model listing for "
+                    f"'{model_name}': {exc}"
+                ) from exc
+
+            for model in models_data.get("data", []):
+                if model.get("id") == model_name:
+                    status = model.get("status", {})
+                    status_value = (
+                        status.get("value")
+                        if isinstance(status, dict)
+                        else status
+                    )
+                    if status_value in ("loaded", "ready"):
+                        logger.info(
+                            "llama_router_model_already_loaded model=%s",
+                            model_name,
+                        )
+                        return
+
+            # Not loaded — explicitly request llama-router to load it.
+            # This surfaces load failures (CUDA OOM, etc.) as LifecycleError
+            # *before* controller.validate() runs, rather than as an
+            # opaque HTTP 500 from the chat call.
+            logger.info("llama_router_load_model model=%s", model_name)
+            try:
+                load_resp = await client.post(
+                    "/models/load", json={"model": model_name}
+                )
+                load_resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                status_code = getattr(exc.response, "status_code", "unknown")
+                logger.error(
+                    "llama_router_model_load_failed model=%s status=%s",
+                    model_name,
+                    status_code,
+                )
+                raise LifecycleError(
+                    f"Failed to load controller model '{model_name}' "
+                    f"in llama-router (HTTP {status_code}): "
+                    "GPU memory may not have been released by ComfyUI."
+                ) from exc
+            except httpx.HTTPError as exc:
+                logger.error(
+                    "llama_router_model_load_transport_failed model=%s error=%r",
+                    model_name,
+                    exc,
+                )
+                raise LifecycleError(
+                    f"Transport error loading controller model "
+                    f"'{model_name}' in llama-router: {exc}"
+                ) from exc
+
+    async def _wait_model_ready(
+        self, role: str, timeout_s: float | None = None
+    ) -> None:
+        """Poll llama-router until the model for *role* reports ready.
+
+        The model may be in any transitional state after the load request
+        (loading, loaded, or error).  This method polls
+        ``GET /v1/models`` until the model reports a ``loaded``/``ready``
+        status or the timeout expires.
+
+        Raises ``LifecycleError`` on timeout, load failure, or if the
+        lifecycle is shutting down.
+        """
+        if timeout_s is None:
+            timeout_s = float(
+                getattr(self.settings, "controller_load_timeout_s", 300.0)
+            )
+        model_name = self._model_name(role)
+        poll_interval_s = max(0.5, float(self.settings.health_poll_interval_s))
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        last_status: str | None = None
+
+        while loop.time() < deadline:
+            if self._closing:
+                raise LifecycleError(
+                    f"Lifecycle shutting down while waiting for "
+                    f"model ready: {role}"
+                )
+
+            status_value = None
+            found = False
+            async with await self._get_llm_client() as client:
+                try:
+                    resp = await client.get("/v1/models")
+                    resp.raise_for_status()
+                    models_data = resp.json()
+                except (httpx.HTTPError, ValueError) as exc:
+                    logger.warning(
+                        "llama_router_status_check_failed role=%s error=%r",
+                        role,
+                        exc,
+                    )
+                    await asyncio.sleep(poll_interval_s)
+                    continue
+
+            for model in models_data.get("data", []):
+                if model.get("id") == model_name:
+                    found = True
+                    status = model.get("status", {})
+                    status_value = (
+                        status.get("value")
+                        if isinstance(status, dict)
+                        else status
+                    )
+                    if status_value in ("loaded", "ready"):
+                        logger.info(
+                            "model_ready role=%s model=%s status=%s",
+                            role,
+                            model_name,
+                            status_value,
+                        )
+                        return
+                    break
+
+            if not found:
+                status_str = "not_listed"
+            else:
+                status_str = status_value or "unknown"
+
+            if status_str != last_status:
+                logger.info(
+                    "waiting_for_model_ready role=%s model=%s status=%s",
+                    role,
+                    model_name,
+                    status_str,
+                )
+                last_status = status_str
+
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(poll_interval_s, max(remaining, 0.05)))
+
+        raise LifecycleError(
+            f"Controller model '{model_name}' did not become READY within "
+            f"{timeout_s:.0f}s (last status: {last_status or 'unknown'})"
+        )
+
+
