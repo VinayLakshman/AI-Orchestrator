@@ -5,7 +5,7 @@ import math
 import re
 from typing import Any
 
-from .common.enums import ChatRole
+from .common.enums import ChatRole, KnowledgeServicePolicy
 from .logging import get_logger
 from .models.chat import ChatMessage
 from .models.state import RequestState
@@ -19,6 +19,8 @@ logger = get_logger(__name__)
 
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```", re.DOTALL)
+_TRUTHY_STRINGS = {"true", "1", "yes", "on"}
+_FALSY_STRINGS = {"false", "0", "no", "off", ""}
 
 
 def _is_image_part(part: dict[str, Any]) -> bool:
@@ -205,18 +207,80 @@ def _scan_text(messages: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _as_mapping(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(exclude_none=True)
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _normalize_knowledge_service_policy(value: Any) -> KnowledgeServicePolicy:
+    if isinstance(value, bool):
+        return (
+            KnowledgeServicePolicy.REQUIRED
+            if value
+            else KnowledgeServicePolicy.NORMAL
+        )
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUTHY_STRINGS:
+            return KnowledgeServicePolicy.REQUIRED
+        if normalized in _FALSY_STRINGS:
+            return KnowledgeServicePolicy.NORMAL
+        return KnowledgeServicePolicy.NORMAL
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 1:
+            return KnowledgeServicePolicy.REQUIRED
+        if value == 0:
+            return KnowledgeServicePolicy.NORMAL
+
+    return KnowledgeServicePolicy.NORMAL
+
+
+def _knowledge_service_policy_from_payload(
+    payload: OpenAIChatCompletionRequest,
+) -> KnowledgeServicePolicy:
+    metadata = _as_mapping(payload.metadata)
+    candidates = (
+        payload.params,
+        metadata.get("params"),
+        metadata.get("custom_params"),
+        metadata,
+    )
+
+    for candidate in candidates:
+        candidate_mapping = _as_mapping(candidate)
+        if "knowledge-service" in candidate_mapping:
+            return _normalize_knowledge_service_policy(
+                candidate_mapping.get("knowledge-service")
+            )
+        custom_params = _as_mapping(candidate_mapping.get("custom_params"))
+        if "knowledge-service" in custom_params:
+            return _normalize_knowledge_service_policy(
+                custom_params.get("knowledge-service")
+            )
+
+    return KnowledgeServicePolicy.NORMAL
+
+
 def normalize_openai_request(
     payload: OpenAIChatCompletionRequest,
     *,
     request_id: str = "",
     thread_id: str = "",
 ) -> RequestState:
+    knowledge_service_policy = _knowledge_service_policy_from_payload(payload)
     original_messages = [message.model_dump(exclude_none=True) for message in payload.messages]
     controller_messages, attachments, user_query = _extract_controller_messages(payload.messages)
     controller_text = _scan_text(controller_messages)
 
     logger.debug(
-        "NORMALIZE: request_id=%s thread_id=%s user_message_len=%d has_images=%s image_count=%d image_ref_kinds=%s message_count=%d user_message_preview=%r",
+        "NORMALIZE: request_id=%s thread_id=%s user_message_len=%d "
+        "has_images=%s image_count=%d image_ref_kinds=%s message_count=%d "
+        "user_message_preview=%r knowledge_service_policy=%s",
         request_id,
         thread_id,
         len(user_query or ""),
@@ -235,6 +299,7 @@ def normalize_openai_request(
         ],
         len(original_messages),
         (user_query or "")[:120],
+        knowledge_service_policy.value,
     )
 
     has_images = any(item.attachment_type == "image" for item in attachments)
@@ -270,6 +335,7 @@ def normalize_openai_request(
         resolved_query=user_query,
         is_followup=False,
         followup_confidence=0.0,
+        knowledge_service_policy=knowledge_service_policy,
         # The Vision specialist needs the actual image reference (data URL /
         # http URL). The controller-facing placeholder text stays in the message
         # content; the raw reference never reaches the controller.

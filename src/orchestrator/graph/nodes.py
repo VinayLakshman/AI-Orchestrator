@@ -7,7 +7,7 @@ from orchestrator.controller.engine import ControllerEngine
 
 from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import normalize_query
-from ..common.enums import ControllerAction, SpecialistType
+from ..common.enums import ControllerAction, KnowledgeServicePolicy, SpecialistType
 from ..common.constants import FALLBACK_NO_ANSWER
 from ..common.utils import _extract_json_object
 from ..context.assembler import build_conversation
@@ -171,6 +171,17 @@ def _update_used_tools(
     return state.debug
 
 
+def _promote_knowledge_queue(queue: list[SpecialistType]) -> list[SpecialistType]:
+    """Place KNOWLEDGE first while preserving the rest of the plan order."""
+    promoted: list[SpecialistType] = [SpecialistType.KNOWLEDGE]
+    for specialist in queue:
+        if specialist == SpecialistType.KNOWLEDGE:
+            continue
+        if specialist not in promoted:
+            promoted.append(specialist)
+    return promoted
+
+
 def make_prepare_node(settings: Settings):
     async def prepare_node(state: OrchestratorState) -> OrchestratorState:
         # Execution-scoped state is reset for the new request.
@@ -193,7 +204,9 @@ def make_prepare_node(settings: Settings):
         # thread_id. It is intentionally NOT reset here (the execution-scoped
         # EvidenceLedger above is the per-request store).
         logger.debug(
-            "conversation_prepared thread_id=%s topic=%r last_specialist=%s active_resources=%d has_web_results=%s last_web_query=%r reusable_evidence_items=%d",
+            "conversation_prepared thread_id=%s topic=%r last_specialist=%s "
+            "active_resources=%d has_web_results=%s last_web_query=%r "
+            "reusable_evidence_items=%d knowledge_service_policy=%s",
             request.thread_id,
             state.conversation.current_topic,
             state.conversation.last_specialist.value if state.conversation.last_specialist else None,
@@ -201,6 +214,7 @@ def make_prepare_node(settings: Settings):
             state.conversation.has_web_results,
             state.conversation.last_web_query,
             state.conversation_evidence.count,
+            state.request.knowledge_service_policy.value,
         )
         return state
 
@@ -216,10 +230,36 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
 
         plan = await controller.plan(state)
 
+        if state.request.knowledge_service_policy == KnowledgeServicePolicy.REQUIRED:
+            original_queue = list(plan.execution_queue or [])
+            promoted_queue = _promote_knowledge_queue(original_queue)
+            if promoted_queue != original_queue:
+                logger.debug(
+                    "knowledge_policy_applied policy=%s original_queue=%s adjusted_queue=%s",
+                    state.request.knowledge_service_policy.value,
+                    [step.value for step in original_queue],
+                    [step.value for step in promoted_queue],
+                )
+                plan = plan.model_copy(
+                    update={
+                        "execution_queue": promoted_queue,
+                        "requires_repository": SpecialistType.KNOWLEDGE in promoted_queue,
+                    }
+                )
+            elif not plan.requires_repository:
+                plan = plan.model_copy(
+                    update={
+                        "requires_repository": True,
+                    }
+                )
+
         if stream:
             await stream.controller_plan(
                 intent=getattr(plan, "classification", "general"),
-                steps=[step.value if hasattr(step, "value") else str(step) for step in (getattr(plan, "execution_queue", []) or [])],
+                steps=[
+                    step.value if hasattr(step, "value") else str(step)
+                    for step in (getattr(plan, "execution_queue", []) or [])
+                ],
             )
 
         execution = state.execution
@@ -228,7 +268,8 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
         execution.initialize()
         # DEBUG: trace planner->runtime queue transfer
         logger.debug(
-            "DEBUG planner_to_runtime queue_after_initialize=%s plan_classification=%s plan_execution_queue=%s",
+            "DEBUG planner_to_runtime queue_after_initialize=%s "
+            "plan_classification=%s plan_execution_queue=%s",
             [s.value for s in execution.runtime.queue],
             getattr(execution.plan, "classification", None),
             [s.value for s in (getattr(execution.plan, "execution_queue", []) or [])],

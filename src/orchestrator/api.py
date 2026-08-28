@@ -73,6 +73,7 @@ def _openai_request_from_chat_request(payload: ChatRequest) -> OpenAIChatComplet
         stream=payload.stream,
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
+        params=payload.params,
         metadata=payload.metadata,
     )
 

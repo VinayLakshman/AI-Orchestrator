@@ -20,4 +20,5 @@ class ChatRequest(BaseModel):
     stream: bool = True
     temperature: float | None = None
     max_tokens: int | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)

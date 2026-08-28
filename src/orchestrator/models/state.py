@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from orchestrator.common.enums import SpecialistType
+from orchestrator.common.enums import KnowledgeServicePolicy, SpecialistType
 from orchestrator.models.chat import ChatMessage
 from pydantic import BaseModel, Field
 
@@ -43,6 +43,10 @@ class RequestState(BaseModel):
     is_followup: bool = False
 
     followup_confidence: float = 0.0
+
+    knowledge_service_policy: KnowledgeServicePolicy = (
+        KnowledgeServicePolicy.NORMAL
+    )
 
     images: list[str] = Field(default_factory=list)
 
