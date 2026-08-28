@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import re
 from typing import Any
@@ -215,6 +216,43 @@ def _as_mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
+_LOG_REDACT_KEYS = {
+    "api_key",
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "session",
+    "token",
+}
+
+
+def _redact_log_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(exclude_none=True)
+
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if any(marker in key_text for marker in _LOG_REDACT_KEYS):
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = _redact_log_value(item)
+        return redacted
+
+    if isinstance(value, list):
+        return [_redact_log_value(item) for item in value]
+
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) > 240:
+            return text[:237].rstrip() + "..."
+        return text
+
+    return value
+
+
 def _normalize_knowledge_service_policy(value: Any) -> KnowledgeServicePolicy:
     if isinstance(value, bool):
         return (
@@ -243,27 +281,53 @@ def _normalize_knowledge_service_policy(value: Any) -> KnowledgeServicePolicy:
 def _knowledge_service_policy_from_payload(
     payload: OpenAIChatCompletionRequest,
 ) -> KnowledgeServicePolicy:
+    policy, _ = _knowledge_service_policy_details_from_payload(payload)
+    return policy
+
+
+def _knowledge_service_policy_details_from_payload(
+    payload: OpenAIChatCompletionRequest,
+) -> tuple[KnowledgeServicePolicy, dict[str, Any]]:
     metadata = _as_mapping(payload.metadata)
-    candidates = (
-        payload.params,
-        metadata.get("params"),
-        metadata.get("custom_params"),
-        metadata,
+    payload_params = _as_mapping(payload.params)
+    payload_custom_params = _as_mapping(payload_params.get("custom_params"))
+
+    diagnostics: dict[str, Any] = {
+        "params": _redact_log_value(payload_params),
+        "custom_params": _redact_log_value(payload_custom_params),
+        "custom_params_source": (
+            "payload.params.custom_params" if payload_custom_params else ""
+        ),
+        "knowledge_service_raw_value": None,
+        "knowledge_service_source": "",
+    }
+
+    candidates: tuple[tuple[str, dict[str, Any]], ...] = (
+        ("payload.params", payload_params),
+        ("metadata.params", _as_mapping(metadata.get("params"))),
+        ("metadata.custom_params", _as_mapping(metadata.get("custom_params"))),
+        ("metadata", metadata),
     )
 
-    for candidate in candidates:
-        candidate_mapping = _as_mapping(candidate)
+    for source_name, candidate_mapping in candidates:
         if "knowledge-service" in candidate_mapping:
-            return _normalize_knowledge_service_policy(
-                candidate_mapping.get("knowledge-service")
-            )
+            raw_value = candidate_mapping.get("knowledge-service")
+            diagnostics["knowledge_service_raw_value"] = raw_value
+            diagnostics["knowledge_service_source"] = f"{source_name}.knowledge-service"
+            return _normalize_knowledge_service_policy(raw_value), diagnostics
+
         custom_params = _as_mapping(candidate_mapping.get("custom_params"))
         if "knowledge-service" in custom_params:
-            return _normalize_knowledge_service_policy(
-                custom_params.get("knowledge-service")
+            raw_value = custom_params.get("knowledge-service")
+            diagnostics["custom_params"] = _redact_log_value(custom_params)
+            diagnostics["custom_params_source"] = f"{source_name}.custom_params"
+            diagnostics["knowledge_service_raw_value"] = raw_value
+            diagnostics["knowledge_service_source"] = (
+                f"{source_name}.custom_params.knowledge-service"
             )
+            return _normalize_knowledge_service_policy(raw_value), diagnostics
 
-    return KnowledgeServicePolicy.NORMAL
+    return KnowledgeServicePolicy.NORMAL, diagnostics
 
 
 def normalize_openai_request(
@@ -272,34 +336,42 @@ def normalize_openai_request(
     request_id: str = "",
     thread_id: str = "",
 ) -> RequestState:
-    knowledge_service_policy = _knowledge_service_policy_from_payload(payload)
+    knowledge_service_policy, knowledge_service_details = _knowledge_service_policy_details_from_payload(payload)
     original_messages = [message.model_dump(exclude_none=True) for message in payload.messages]
     controller_messages, attachments, user_query = _extract_controller_messages(payload.messages)
     controller_text = _scan_text(controller_messages)
 
     logger.debug(
-        "NORMALIZE: request_id=%s thread_id=%s user_message_len=%d "
-        "has_images=%s image_count=%d image_ref_kinds=%s message_count=%d "
-        "user_message_preview=%r knowledge_service_policy=%s",
-        request_id,
-        thread_id,
-        len(user_query or ""),
-        any(item.attachment_type == "image" for item in attachments),
-        sum(1 for item in attachments if item.attachment_type == "image"),
-        [
-            "data_uri"
-            if item.reference.startswith("data:image/")
-            else "http_url"
-            if item.reference.startswith(("http://", "https://"))
-            else "placeholder"
-            if item.placeholder.startswith("[")
-            else "other"
-            for item in attachments
-            if item.attachment_type == "image"
-        ],
-        len(original_messages),
-        (user_query or "")[:120],
-        knowledge_service_policy.value,
+        "openwebui_request_boundary %s",
+        json.dumps(
+            {
+                "request_id": request_id or None,
+                "thread_id": thread_id or None,
+                "params": knowledge_service_details["params"],
+                "custom_params": knowledge_service_details["custom_params"],
+                "custom_params_source": knowledge_service_details["custom_params_source"] or None,
+                "knowledge_service_raw_value": knowledge_service_details["knowledge_service_raw_value"],
+                "knowledge_service_source": knowledge_service_details["knowledge_service_source"] or None,
+                "knowledge_service_policy": knowledge_service_policy.value,
+                "user_message_len": len(user_query or ""),
+                "has_images": any(item.attachment_type == "image" for item in attachments),
+                "image_count": sum(1 for item in attachments if item.attachment_type == "image"),
+                "image_ref_kinds": [
+                    "data_uri"
+                    if item.reference.startswith("data:image/")
+                    else "http_url"
+                    if item.reference.startswith(("http://", "https://"))
+                    else "placeholder"
+                    if item.placeholder.startswith("[")
+                    else "other"
+                    for item in attachments
+                    if item.attachment_type == "image"
+                ],
+                "message_count": len(original_messages),
+            },
+            sort_keys=True,
+            default=str,
+        ),
     )
 
     has_images = any(item.attachment_type == "image" for item in attachments)

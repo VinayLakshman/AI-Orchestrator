@@ -104,6 +104,21 @@ Example:
 This is a new subject even if the conversation previously focused on Docker.
 
 --------------------------------------------------
+KNOWLEDGE SERVICE POLICY
+--------------------------------------------------
+
+The request context may include an explicit `knowledge_service_policy`.
+
+- REQUIRED: include KNOWLEDGE when repository, document, log, or
+  implementation evidence is materially needed to answer correctly.
+- NORMAL: do not schedule KNOWLEDGE unless the request explicitly includes
+  repository/document resources or another explicit capability requires
+  repository evidence.
+
+Do not schedule KNOWLEDGE merely because the request is technical, general,
+or could be related to private project context.
+
+--------------------------------------------------
 REUSABLE SPECIALIST EVIDENCE
 --------------------------------------------------
 

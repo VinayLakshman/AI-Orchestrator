@@ -14,6 +14,7 @@ import re
 from typing import Any, Iterable
 
 from ..logging import get_logger
+from ..common.enums import KnowledgeServicePolicy
 from ..models.chat import ChatMessage
 from ..models.evidence import (
     EvidenceLedger,
@@ -306,6 +307,11 @@ def render_structured_context(state: OrchestratorState) -> str:
 def render_request_context(request: RequestState) -> str:
     payload = {
         "query": request.user_message,
+        "knowledge_service_policy": (
+            request.knowledge_service_policy.value
+            if isinstance(request.knowledge_service_policy, KnowledgeServicePolicy)
+            else str(request.knowledge_service_policy or KnowledgeServicePolicy.NORMAL.value)
+        ),
         "metadata": {
             "message_count": int(request.metadata.get("message_count", 0) or 0),
             "images": int(request.metadata.get("image_count", 0) or 0),

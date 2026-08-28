@@ -182,6 +182,85 @@ def _promote_knowledge_queue(queue: list[SpecialistType]) -> list[SpecialistType
     return promoted
 
 
+_REPOSITORY_RESOURCE_TYPES = {"pdf", "document", "file"}
+
+
+def _has_explicit_repository_resources(state: OrchestratorState) -> bool:
+    attachment_types = state.request.metadata.get("attachment_types")
+    if isinstance(attachment_types, list):
+        for attachment_type in attachment_types:
+            if str(attachment_type).strip().lower() in _REPOSITORY_RESOURCE_TYPES:
+                return True
+
+    if bool(state.request.metadata.get("has_files")):
+        return True
+
+    for resource in state.conversation.active_resources:
+        if str(getattr(resource, "resource_type", "") or "").strip().lower() in _REPOSITORY_RESOURCE_TYPES:
+            return True
+
+    return False
+
+
+def _apply_knowledge_service_policy(
+    plan: ExecutionPlan,
+    state: OrchestratorState,
+) -> ExecutionPlan:
+    policy = state.request.knowledge_service_policy
+    original_queue = list(plan.execution_queue or [])
+    original_requires_repository = bool(plan.requires_repository)
+    explicit_repository_resources = _has_explicit_repository_resources(state)
+
+    adjusted_queue = original_queue
+    adjusted_requires_repository = original_requires_repository
+    action = "preserve"
+
+    if policy == KnowledgeServicePolicy.REQUIRED:
+        adjusted_queue = _promote_knowledge_queue(original_queue)
+        adjusted_requires_repository = SpecialistType.KNOWLEDGE in adjusted_queue
+        action = "inject" if SpecialistType.KNOWLEDGE not in original_queue else "promote"
+    elif SpecialistType.KNOWLEDGE in original_queue and not explicit_repository_resources:
+        adjusted_queue = [
+            specialist
+            for specialist in original_queue
+            if specialist != SpecialistType.KNOWLEDGE
+        ]
+        adjusted_requires_repository = SpecialistType.KNOWLEDGE in adjusted_queue
+        action = "strip"
+    elif SpecialistType.KNOWLEDGE in original_queue:
+        action = "preserve_explicit"
+
+    if (
+        adjusted_queue != original_queue
+        or adjusted_requires_repository != original_requires_repository
+    ):
+        plan = plan.model_copy(
+            update={
+                "execution_queue": adjusted_queue,
+                "requires_repository": adjusted_requires_repository,
+            }
+        )
+
+    logger.debug(
+        "knowledge_policy_decision %s",
+        json.dumps(
+            {
+                "policy": policy.value,
+                "action": action,
+                "explicit_repository_resources": explicit_repository_resources,
+                "original_queue": [step.value for step in original_queue],
+                "adjusted_queue": [step.value for step in adjusted_queue],
+                "original_requires_repository": original_requires_repository,
+                "adjusted_requires_repository": adjusted_requires_repository,
+            },
+            sort_keys=True,
+            default=str,
+        ),
+    )
+
+    return plan
+
+
 def make_prepare_node(settings: Settings):
     async def prepare_node(state: OrchestratorState) -> OrchestratorState:
         # Execution-scoped state is reset for the new request.
@@ -229,29 +308,7 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
             await stream.controller_started(step="planning")
 
         plan = await controller.plan(state)
-
-        if state.request.knowledge_service_policy == KnowledgeServicePolicy.REQUIRED:
-            original_queue = list(plan.execution_queue or [])
-            promoted_queue = _promote_knowledge_queue(original_queue)
-            if promoted_queue != original_queue:
-                logger.debug(
-                    "knowledge_policy_applied policy=%s original_queue=%s adjusted_queue=%s",
-                    state.request.knowledge_service_policy.value,
-                    [step.value for step in original_queue],
-                    [step.value for step in promoted_queue],
-                )
-                plan = plan.model_copy(
-                    update={
-                        "execution_queue": promoted_queue,
-                        "requires_repository": SpecialistType.KNOWLEDGE in promoted_queue,
-                    }
-                )
-            elif not plan.requires_repository:
-                plan = plan.model_copy(
-                    update={
-                        "requires_repository": True,
-                    }
-                )
+        plan = _apply_knowledge_service_policy(plan, state)
 
         if stream:
             await stream.controller_plan(
