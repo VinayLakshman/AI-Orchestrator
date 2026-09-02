@@ -26,6 +26,7 @@ from .prompts import (
     build_controller_plan_prompt,
     build_controller_validation_prompt,
 )
+from ..controller.prompts import build_knowledge_retrieval_query_prompt
 from ..logging import get_logger
 from ..models.evidence import (
     CodeEvidence,
@@ -62,6 +63,80 @@ def _request_user_text(
     state: OrchestratorState,
 ) -> str:
     return state.request.user_message
+
+
+_KNOWLEDGE_RETRIEVAL_QUERY_MAX_CHARS = 220
+
+
+def _sanitize_retrieval_query(value: Any, *, max_chars: int = _KNOWLEDGE_RETRIEVAL_QUERY_MAX_CHARS) -> str:
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'", "“", "”", "‘", "’"}:
+        text = text[1:-1].strip()
+
+    text = " ".join(text.split())
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    if lowered.startswith(("answer:", "the answer is", "here is", "here's", "here are", "analysis:", "explanation:", "query:", "search query:")):
+        return ""
+    if lowered.startswith(("what is ", "why ", "how ", "when ", "where ")) and "?" in text:
+        return ""
+    if len(text) > max_chars:
+        return ""
+
+    return text
+
+
+def _fallback_retrieval_query(user_message: str, *, max_chars: int = _KNOWLEDGE_RETRIEVAL_QUERY_MAX_CHARS) -> str:
+    candidate = " ".join((user_message or "").split())
+    return _sanitize_retrieval_query(candidate, max_chars=max_chars)
+
+
+async def _derive_retrieval_query(
+    state: OrchestratorState,
+    controller: ControllerEngine | None,
+) -> tuple[str, str, str]:
+    user_message = _request_user_text(state)
+    fallback_query = _fallback_retrieval_query(user_message)
+
+    if not user_message.strip():
+        return "", "empty", "empty_request"
+
+    if controller is None:
+        if fallback_query:
+            return fallback_query, "fallback", "controller_unavailable"
+        return "", "unavailable", "no_safe_fallback"
+
+    try:
+        messages = build_conversation(
+            system_prompt=build_knowledge_retrieval_query_prompt(),
+            latest_user_message=user_message,
+        )
+        response = await controller.models.client("controller").chat(
+            model=controller.models.controller().name,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=64,
+            stream=False,
+        )
+        text = extract_assistant_text(getattr(response, "content", "") or getattr(response, "raw", "") or "")
+        query = _sanitize_retrieval_query(text)
+        if query:
+            return query, "llm", "ok"
+    except Exception:
+        logger.warning("knowledge_query_derivation_failed", exc_info=True)
+
+    if fallback_query:
+        return fallback_query, "fallback", "llm_failed_fallback"
+
+    return "", "unavailable", "llm_failed_no_safe_fallback"
 
 
 def _current_step_name(
@@ -469,7 +544,11 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
     return vision_node
 
 
-def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
+def make_knowledge_node(
+    knowledge_client: KnowledgeClient,
+    settings: Settings,
+    controller: ControllerEngine | None = None,
+):
     async def knowledge_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
@@ -534,12 +613,44 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
             _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
             return state
 
+        retrieval_query, retrieval_query_source, retrieval_query_status = await _derive_retrieval_query(state, controller)
+        if not retrieval_query:
+            evidence.repository = RepositoryEvidence(
+                repository=None,
+                branch=None,
+                commit=None,
+                question=query,
+                retrieval_reason="retrieval query derivation failed",
+                confidence=0.0,
+                context="",
+                hit_count=0,
+                primary_hits=[],
+                expanded_hits=[],
+                metadata={
+                    "status": "failed",
+                    "reason": "query_derivation_failed",
+                    "retrieval_query": "",
+                    "retrieval_query_source": retrieval_query_source,
+                    "retrieval_query_derivation_status": retrieval_query_status,
+                    "user_message_length": len(query),
+                },
+            )
+            execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=False, error="query_derivation_failed")
+            state.execution = execution
+            _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
+            _update_used_tools(state, "knowledge.retrieve")
+            return state
+
+        execution.runtime.metadata["knowledge_retrieval_query"] = retrieval_query
+        execution.runtime.metadata["knowledge_retrieval_query_source"] = retrieval_query_source
+        execution.runtime.metadata["knowledge_retrieval_query_status"] = retrieval_query_status
+
         stream = get_current_stream()
         if stream:
-            await stream.knowledge_started(query=query[:200])
+            await stream.knowledge_started(query=retrieval_query[:200])
 
         result = await knowledge_client.retrieve(
-            question=query,
+            question=retrieval_query,
             top_k=settings.knowledge_top_k,
             candidate_limit=settings.knowledge_candidate_limit,
             neighbor_window=settings.knowledge_neighbor_window,
@@ -556,7 +667,7 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
             repository=(primary_hits[0].get("repository") if primary_hits else None),
             branch=(primary_hits[0].get("branch") if primary_hits else None),
             commit=(primary_hits[0].get("commit") if primary_hits else None),
-            question=str(getattr(result, "question", "") or query),
+            question=str(getattr(result, "question", "") or retrieval_query),
             retrieval_reason=str(getattr(result, "retrieval_reason", "") or ""),
             confidence=float(getattr(result, "confidence", 0.0) or 0.0),
             context=str(getattr(result, "context", "") or ""),
@@ -570,6 +681,10 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
                 "expansion_time": getattr(result, "expansion_time", None),
                 "total_time": getattr(result, "total_time", None),
                 "grounded": bool(getattr(result, "grounded", False)),
+                "retrieval_query": retrieval_query,
+                "retrieval_query_source": retrieval_query_source,
+                "retrieval_query_derivation_status": retrieval_query_status,
+                "original_request_length": len(query),
             },
         )
 

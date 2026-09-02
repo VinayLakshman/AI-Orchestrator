@@ -202,7 +202,7 @@ def build_graph(
     vision_node = make_vision_node(vision_pipeline, settings)
 
 
-    knowledge_node = make_knowledge_node(knowledge_client, settings)
+    knowledge_node = make_knowledge_node(knowledge_client, settings, controller)
     web_node = make_web_node(WebSpecialist(searxng_client), settings)
     coder_node = make_coder_node(controller, settings)
 
