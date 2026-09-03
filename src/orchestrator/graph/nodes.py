@@ -7,7 +7,7 @@ from orchestrator.controller.engine import ControllerEngine
 
 from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import normalize_query
-from ..common.enums import ControllerAction, SpecialistType
+from ..common.enums import ControllerAction, KnowledgeServicePolicy, SpecialistType
 from ..common.constants import FALLBACK_NO_ANSWER
 from ..common.utils import _extract_json_object
 from ..context.assembler import build_conversation
@@ -26,6 +26,7 @@ from .prompts import (
     build_controller_plan_prompt,
     build_controller_validation_prompt,
 )
+from ..controller.prompts import build_knowledge_retrieval_query_prompt
 from ..logging import get_logger
 from ..models.evidence import (
     CodeEvidence,
@@ -62,6 +63,80 @@ def _request_user_text(
     state: OrchestratorState,
 ) -> str:
     return state.request.user_message
+
+
+_KNOWLEDGE_RETRIEVAL_QUERY_MAX_CHARS = 220
+
+
+def _sanitize_retrieval_query(value: Any, *, max_chars: int = _KNOWLEDGE_RETRIEVAL_QUERY_MAX_CHARS) -> str:
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'", "“", "”", "‘", "’"}:
+        text = text[1:-1].strip()
+
+    text = " ".join(text.split())
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    if lowered.startswith(("answer:", "the answer is", "here is", "here's", "here are", "analysis:", "explanation:", "query:", "search query:")):
+        return ""
+    if lowered.startswith(("what is ", "why ", "how ", "when ", "where ")) and "?" in text:
+        return ""
+    if len(text) > max_chars:
+        return ""
+
+    return text
+
+
+def _fallback_retrieval_query(user_message: str, *, max_chars: int = _KNOWLEDGE_RETRIEVAL_QUERY_MAX_CHARS) -> str:
+    candidate = " ".join((user_message or "").split())
+    return _sanitize_retrieval_query(candidate, max_chars=max_chars)
+
+
+async def _derive_retrieval_query(
+    state: OrchestratorState,
+    controller: ControllerEngine | None,
+) -> tuple[str, str, str]:
+    user_message = _request_user_text(state)
+    fallback_query = _fallback_retrieval_query(user_message)
+
+    if not user_message.strip():
+        return "", "empty", "empty_request"
+
+    if controller is None:
+        if fallback_query:
+            return fallback_query, "fallback", "controller_unavailable"
+        return "", "unavailable", "no_safe_fallback"
+
+    try:
+        messages = build_conversation(
+            system_prompt=build_knowledge_retrieval_query_prompt(),
+            latest_user_message=user_message,
+        )
+        response = await controller.models.client("controller").chat(
+            model=controller.models.controller().name,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=64,
+            stream=False,
+        )
+        text = extract_assistant_text(getattr(response, "content", "") or getattr(response, "raw", "") or "")
+        query = _sanitize_retrieval_query(text)
+        if query:
+            return query, "llm", "ok"
+    except Exception:
+        logger.warning("knowledge_query_derivation_failed", exc_info=True)
+
+    if fallback_query:
+        return fallback_query, "fallback", "llm_failed_fallback"
+
+    return "", "unavailable", "llm_failed_no_safe_fallback"
 
 
 def _current_step_name(
@@ -171,6 +246,96 @@ def _update_used_tools(
     return state.debug
 
 
+def _promote_knowledge_queue(queue: list[SpecialistType]) -> list[SpecialistType]:
+    """Place KNOWLEDGE first while preserving the rest of the plan order."""
+    promoted: list[SpecialistType] = [SpecialistType.KNOWLEDGE]
+    for specialist in queue:
+        if specialist == SpecialistType.KNOWLEDGE:
+            continue
+        if specialist not in promoted:
+            promoted.append(specialist)
+    return promoted
+
+
+_REPOSITORY_RESOURCE_TYPES = {"pdf", "document", "file"}
+
+
+def _has_explicit_repository_resources(state: OrchestratorState) -> bool:
+    attachment_types = state.request.metadata.get("attachment_types")
+    if isinstance(attachment_types, list):
+        for attachment_type in attachment_types:
+            if str(attachment_type).strip().lower() in _REPOSITORY_RESOURCE_TYPES:
+                return True
+
+    if bool(state.request.metadata.get("has_files")):
+        return True
+
+    for resource in state.conversation.active_resources:
+        if str(getattr(resource, "resource_type", "") or "").strip().lower() in _REPOSITORY_RESOURCE_TYPES:
+            return True
+
+    return False
+
+
+def _apply_knowledge_service_policy(
+    plan: ExecutionPlan,
+    state: OrchestratorState,
+) -> ExecutionPlan:
+    policy = state.request.knowledge_service_policy
+    original_queue = list(plan.execution_queue or [])
+    original_requires_repository = bool(plan.requires_repository)
+    explicit_repository_resources = _has_explicit_repository_resources(state)
+
+    adjusted_queue = original_queue
+    adjusted_requires_repository = original_requires_repository
+    action = "preserve"
+
+    if policy == KnowledgeServicePolicy.REQUIRED:
+        adjusted_queue = _promote_knowledge_queue(original_queue)
+        adjusted_requires_repository = SpecialistType.KNOWLEDGE in adjusted_queue
+        action = "inject" if SpecialistType.KNOWLEDGE not in original_queue else "promote"
+    elif SpecialistType.KNOWLEDGE in original_queue and not explicit_repository_resources:
+        adjusted_queue = [
+            specialist
+            for specialist in original_queue
+            if specialist != SpecialistType.KNOWLEDGE
+        ]
+        adjusted_requires_repository = SpecialistType.KNOWLEDGE in adjusted_queue
+        action = "strip"
+    elif SpecialistType.KNOWLEDGE in original_queue:
+        action = "preserve_explicit"
+
+    if (
+        adjusted_queue != original_queue
+        or adjusted_requires_repository != original_requires_repository
+    ):
+        plan = plan.model_copy(
+            update={
+                "execution_queue": adjusted_queue,
+                "requires_repository": adjusted_requires_repository,
+            }
+        )
+
+    logger.debug(
+        "knowledge_policy_decision %s",
+        json.dumps(
+            {
+                "policy": policy.value,
+                "action": action,
+                "explicit_repository_resources": explicit_repository_resources,
+                "original_queue": [step.value for step in original_queue],
+                "adjusted_queue": [step.value for step in adjusted_queue],
+                "original_requires_repository": original_requires_repository,
+                "adjusted_requires_repository": adjusted_requires_repository,
+            },
+            sort_keys=True,
+            default=str,
+        ),
+    )
+
+    return plan
+
+
 def make_prepare_node(settings: Settings):
     async def prepare_node(state: OrchestratorState) -> OrchestratorState:
         # Execution-scoped state is reset for the new request.
@@ -193,7 +358,9 @@ def make_prepare_node(settings: Settings):
         # thread_id. It is intentionally NOT reset here (the execution-scoped
         # EvidenceLedger above is the per-request store).
         logger.debug(
-            "conversation_prepared thread_id=%s topic=%r last_specialist=%s active_resources=%d has_web_results=%s last_web_query=%r reusable_evidence_items=%d",
+            "conversation_prepared thread_id=%s topic=%r last_specialist=%s "
+            "active_resources=%d has_web_results=%s last_web_query=%r "
+            "reusable_evidence_items=%d knowledge_service_policy=%s",
             request.thread_id,
             state.conversation.current_topic,
             state.conversation.last_specialist.value if state.conversation.last_specialist else None,
@@ -201,6 +368,7 @@ def make_prepare_node(settings: Settings):
             state.conversation.has_web_results,
             state.conversation.last_web_query,
             state.conversation_evidence.count,
+            state.request.knowledge_service_policy.value,
         )
         return state
 
@@ -215,11 +383,15 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
             await stream.controller_started(step="planning")
 
         plan = await controller.plan(state)
+        plan = _apply_knowledge_service_policy(plan, state)
 
         if stream:
             await stream.controller_plan(
                 intent=getattr(plan, "classification", "general"),
-                steps=[step.value if hasattr(step, "value") else str(step) for step in (getattr(plan, "execution_queue", []) or [])],
+                steps=[
+                    step.value if hasattr(step, "value") else str(step)
+                    for step in (getattr(plan, "execution_queue", []) or [])
+                ],
             )
 
         execution = state.execution
@@ -228,7 +400,8 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
         execution.initialize()
         # DEBUG: trace planner->runtime queue transfer
         logger.debug(
-            "DEBUG planner_to_runtime queue_after_initialize=%s plan_classification=%s plan_execution_queue=%s",
+            "DEBUG planner_to_runtime queue_after_initialize=%s "
+            "plan_classification=%s plan_execution_queue=%s",
             [s.value for s in execution.runtime.queue],
             getattr(execution.plan, "classification", None),
             [s.value for s in (getattr(execution.plan, "execution_queue", []) or [])],
@@ -371,7 +544,11 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
     return vision_node
 
 
-def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
+def make_knowledge_node(
+    knowledge_client: KnowledgeClient,
+    settings: Settings,
+    controller: ControllerEngine | None = None,
+):
     async def knowledge_node(state: OrchestratorState) -> OrchestratorState:
         execution = state.execution
         evidence = state.evidence
@@ -436,12 +613,44 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
             _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
             return state
 
+        retrieval_query, retrieval_query_source, retrieval_query_status = await _derive_retrieval_query(state, controller)
+        if not retrieval_query:
+            evidence.repository = RepositoryEvidence(
+                repository=None,
+                branch=None,
+                commit=None,
+                question=query,
+                retrieval_reason="retrieval query derivation failed",
+                confidence=0.0,
+                context="",
+                hit_count=0,
+                primary_hits=[],
+                expanded_hits=[],
+                metadata={
+                    "status": "failed",
+                    "reason": "query_derivation_failed",
+                    "retrieval_query": "",
+                    "retrieval_query_source": retrieval_query_source,
+                    "retrieval_query_derivation_status": retrieval_query_status,
+                    "user_message_length": len(query),
+                },
+            )
+            execution = _advance_runtime(execution, SpecialistType.KNOWLEDGE, success=False, error="query_derivation_failed")
+            state.execution = execution
+            _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
+            _update_used_tools(state, "knowledge.retrieve")
+            return state
+
+        execution.runtime.metadata["knowledge_retrieval_query"] = retrieval_query
+        execution.runtime.metadata["knowledge_retrieval_query_source"] = retrieval_query_source
+        execution.runtime.metadata["knowledge_retrieval_query_status"] = retrieval_query_status
+
         stream = get_current_stream()
         if stream:
-            await stream.knowledge_started(query=query[:200])
+            await stream.knowledge_started(query=retrieval_query[:200])
 
         result = await knowledge_client.retrieve(
-            question=query,
+            question=retrieval_query,
             top_k=settings.knowledge_top_k,
             candidate_limit=settings.knowledge_candidate_limit,
             neighbor_window=settings.knowledge_neighbor_window,
@@ -458,7 +667,7 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
             repository=(primary_hits[0].get("repository") if primary_hits else None),
             branch=(primary_hits[0].get("branch") if primary_hits else None),
             commit=(primary_hits[0].get("commit") if primary_hits else None),
-            question=str(getattr(result, "question", "") or query),
+            question=str(getattr(result, "question", "") or retrieval_query),
             retrieval_reason=str(getattr(result, "retrieval_reason", "") or ""),
             confidence=float(getattr(result, "confidence", 0.0) or 0.0),
             context=str(getattr(result, "context", "") or ""),
@@ -472,6 +681,10 @@ def make_knowledge_node(knowledge_client: KnowledgeClient, settings: Settings):
                 "expansion_time": getattr(result, "expansion_time", None),
                 "total_time": getattr(result, "total_time", None),
                 "grounded": bool(getattr(result, "grounded", False)),
+                "retrieval_query": retrieval_query,
+                "retrieval_query_source": retrieval_query_source,
+                "retrieval_query_derivation_status": retrieval_query_status,
+                "original_request_length": len(query),
             },
         )
 

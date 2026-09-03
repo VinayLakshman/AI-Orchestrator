@@ -20,6 +20,11 @@ class RouteType(str, Enum):
     CLARIFY = "clarify"
 
 
+class KnowledgeServicePolicy(StrEnum):
+    NORMAL = "normal"
+    REQUIRED = "required"
+
+
 class SpecialistType(StrEnum):
     KNOWLEDGE = "knowledge"
     WEB = "web"

@@ -25,6 +25,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

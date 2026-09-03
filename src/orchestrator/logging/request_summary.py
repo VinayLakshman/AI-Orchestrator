@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..common.enums import ControllerAction
+from ..common.enums import ControllerAction, KnowledgeServicePolicy
 from ..models.evidence import EvidenceLedger
 from ..models.state import OrchestratorState
 from . import get_logger
@@ -53,6 +53,20 @@ def _controller_model(state: OrchestratorState) -> str:
 def _final_model(state: OrchestratorState) -> str:
     model = str(state.response.metadata.get("final_model") or "").strip()
     return model or "skipped"
+
+
+def _knowledge_service_policy(state: OrchestratorState) -> str:
+    policy = getattr(
+        state.request,
+        "knowledge_service_policy",
+        KnowledgeServicePolicy.NORMAL,
+    )
+    if isinstance(policy, KnowledgeServicePolicy):
+        return policy.value
+    return (
+        str(policy or KnowledgeServicePolicy.NORMAL.value).strip()
+        or KnowledgeServicePolicy.NORMAL.value
+    )
 
 
 def _image_urls_from_metadata(state: OrchestratorState) -> list[str]:
@@ -175,6 +189,7 @@ def build_request_summary(
         _format_row("Request ID", request_id or str(state.request.request_id or "")),
         _format_row("Prompt", prompt),
         _format_row("Classification", str(state.execution.plan.classification or "GENERAL")),
+        _format_row("Knowledge Policy", _knowledge_service_policy(state)),
         "",
         "Execution Path",
         "--------------",

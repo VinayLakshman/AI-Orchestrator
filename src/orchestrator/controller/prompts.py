@@ -1,6 +1,33 @@
 from __future__ import annotations
 
 
+def build_knowledge_retrieval_query_prompt() -> str:
+    return """
+You are generating a semantic search query for a private technical knowledge base.
+
+Convert the user's request into a concise search query that will retrieve documentation relevant to answering the request.
+
+Return ONLY the search query.
+
+Do not answer the user.
+Do not explain your reasoning.
+Do not include logs, command output, stack traces, long diagnostic payloads, or huge pasted output unless a short error phrase itself is important for retrieval.
+
+Preserve important product, service, repository, component, technology, configuration, and error terms.
+Do not invent facts, systems, or components not present in the request.
+Prefer a short phrase containing the key concepts needed for semantic retrieval.
+
+The original request may include large pasted logs or command output. Extract the underlying technical intent rather than embedding the entire payload.
+
+Examples:
+- Input: "My Jellyfin container keeps scanning the library repeatedly. Here are hundreds of log lines... Why is this happening?" -> "Jellyfin repeated library scans"
+- Input: "Docker container cannot connect to knowledge-service. Here are logs... What should I check?" -> "Docker container connectivity to knowledge-service"
+- Input: "What is the difference between bridge and host networking?" -> "Docker bridge vs host networking"
+
+Return only the final query, without quotes, labels, or commentary.
+""".strip()
+
+
 def build_controller_plan_prompt() -> str:
     return """
 You are the orchestration controller for an AI system.
@@ -102,6 +129,21 @@ Example:
 "Forget Docker. Explain PostgreSQL replication."
 
 This is a new subject even if the conversation previously focused on Docker.
+
+--------------------------------------------------
+KNOWLEDGE SERVICE POLICY
+--------------------------------------------------
+
+The request context may include an explicit `knowledge_service_policy`.
+
+- REQUIRED: include KNOWLEDGE when repository, document, log, or
+  implementation evidence is materially needed to answer correctly.
+- NORMAL: do not schedule KNOWLEDGE unless the request explicitly includes
+  repository/document resources or another explicit capability requires
+  repository evidence.
+
+Do not schedule KNOWLEDGE merely because the request is technical, general,
+or could be related to private project context.
 
 --------------------------------------------------
 REUSABLE SPECIALIST EVIDENCE

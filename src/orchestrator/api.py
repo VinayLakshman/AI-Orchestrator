@@ -73,6 +73,7 @@ def _openai_request_from_chat_request(payload: ChatRequest) -> OpenAIChatComplet
         stream=payload.stream,
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
+        params=payload.params,
         metadata=payload.metadata,
     )
 
@@ -341,7 +342,11 @@ async def _input_state_from_request(
     request_id: str | None = None,
     thread_id: str | None = None,
 ) -> OrchestratorState:
-    request_state = normalize_openai_request(_openai_request_from_chat_request(payload))
+    request_state = normalize_openai_request(
+        _openai_request_from_chat_request(payload),
+        request_id=request_id or "",
+        thread_id=thread_id or "",
+    )
     resolved = await resolve_conversation_context(
         request_state,
         settings=runtime.settings,
@@ -394,7 +399,7 @@ async def openai_chat_completions(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ):
     request_id = str(uuid4())
-    request_state = normalize_openai_request(payload)
+    request_state = normalize_openai_request(payload, request_id=request_id)
     resolved = await resolve_conversation_context(
         request_state,
         settings=runtime.settings,
