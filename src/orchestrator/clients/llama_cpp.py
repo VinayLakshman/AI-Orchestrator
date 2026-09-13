@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -153,7 +155,21 @@ class LlamaCppClient:
         )
 
     def _log_payload(self, payload: dict[str, Any]) -> None:
-        logger.debug("llama_cpp_request_payload=%s", json.dumps(payload, sort_keys=True, default=str))
+        if logger.isEnabledFor(logging.DEBUG):
+            # Payload serialization is surprisingly expensive for long
+            # conversations and multimodal requests. Never pay that cost at
+            # normal INFO/WARN log levels.
+            serialized = json.dumps(payload, sort_keys=True, default=str)
+            serialized = re.sub(r"data:[^\"\\s]+", "[redacted-data-url]", serialized)
+            logger.debug(
+                "llama_cpp_request_payload=%s",
+                serialized[:12000],
+            )
+
+    async def aclose(self) -> None:
+        """Close an injected/shared transport during application shutdown."""
+        if self.client is not None:
+            await self.client.aclose()
 
     async def _get_client(self, *, streaming: bool = False) -> tuple[httpx.AsyncClient, bool]:
         timeout = self._build_timeout(streaming=streaming)

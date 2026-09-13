@@ -73,8 +73,8 @@ def extract_resources_from_request(
     Only identity/reference metadata is stored; never the contents. The
     controller-facing ``reference`` is the safe placeholder text (e.g.
     ``[Image Attached]``); the raw data URL / base64 payload is never stored
-    here. Specialists resolve the original attachment via
-    ``RequestState.images`` / the attachment ``raw`` metadata.
+    here. Specialists resolve the original image attachment via
+    ``RequestState.images``; ``raw`` contains only safe display metadata.
     """
     resources: list[ConversationResource] = []
 
@@ -117,6 +117,8 @@ def extract_resources_from_request(
 def merge_request_resources(
     conversation: ConversationState,
     request: RequestState,
+    *,
+    max_items: int = 32,
 ) -> ConversationState:
     """Merge current-request resource references into conversation resources.
 
@@ -144,6 +146,7 @@ def merge_request_resources(
     if added == 0:
         return conversation
 
+    merged = merged[-max(1, max_items):]
     return conversation.model_copy(
         update={
             "active_resources": merged,
@@ -301,4 +304,3 @@ def render_conversation_state(conversation: ConversationState) -> str:
         lines.append(f"- Last web query: {conversation.last_web_query}")
 
     return "\n".join(lines)
-

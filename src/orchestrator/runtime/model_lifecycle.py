@@ -14,6 +14,7 @@ from ..models.manager import ModelManager
 from ..settings import Settings
 from .docker_runtime import DockerRuntime
 from .model_catalog import CODER, CONTROLLER, REASONING, VISION, ModelPolicy
+from .metrics import runtime_metrics
 
 logger = get_logger(__name__)
 
@@ -244,6 +245,12 @@ class ModelLifecycle:
         # two threads from racing to start/stop different containers simultaneously.
         self._ownership_lock = asyncio.Lock()
 
+        # Serializes actual GPU workloads. This is intentionally separate from
+        # ownership transitions: a model lease remains held for the complete
+        # inference stream, while image generation holds it until its verified
+        # release barrier completes.
+        self._workload_lock = asyncio.Lock()
+
         # Protects the per-role lock registry.
         self._registry_lock = asyncio.Lock()
 
@@ -273,6 +280,9 @@ class ModelLifecycle:
         self._closing = False
         self._cleanup_task: asyncio.Task[None] | None = None
         self._health_client: httpx.AsyncClient | None = None
+        self._llm_client: httpx.AsyncClient | None = None
+        self._ready_model_name: str | None = None
+        self._image_workload_lock_held = False
 
     async def _get_lock(self, role: str) -> asyncio.Lock:
         async with self._registry_lock:
@@ -323,6 +333,12 @@ class ModelLifecycle:
         if client is not None:
             await client.aclose()
 
+    async def _close_llm_client(self) -> None:
+        client = self._llm_client
+        self._llm_client = None
+        if client is not None:
+            await client.aclose()
+
     def _health_request_timeout_s(self) -> float:
         value = getattr(self.settings, "health_request_timeout_s", None)
         if value is not None:
@@ -365,6 +381,9 @@ class ModelLifecycle:
             self._cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._cleanup_task
+
+        await self._close_health_client()
+        await self._close_llm_client()
 
         # Stop any containers still believed to be active.
         async with self._state_lock:
@@ -444,7 +463,9 @@ class ModelLifecycle:
         if hasattr(self.models, "model_for_role"):
             try:
                 model = self.models.model_for_role(role)
-                return getattr(model, "name", getattr(model, "model", role))
+                if isinstance(model, str):
+                    return model
+                return str(getattr(model, "name", getattr(model, "model", role)))
             except Exception:
                 pass
 
@@ -594,7 +615,10 @@ class ModelLifecycle:
             async with self._ownership_lock:
                 owner = self._gpu_owner
 
-            if owner is None or owner == container_name:
+            # The workload lock serializes LLM calls and image generation. A
+            # prior LLM owner is therefore not a reason to block another role;
+            # the router readiness path below handles the model transition.
+            if owner is None or owner == container_name or is_llm_container_owner(owner):
                 return
 
             if self._closing:
@@ -722,6 +746,8 @@ class ModelLifecycle:
                                 if st.status != LifecycleState.STARTING:
                                     st.status = LifecycleState.UNLOADED
                                     st.keep_warm_until = None
+                    if self._ready_model_name is not None:
+                        self._ready_model_name = None
                     self._gpu_owner = None
 
                 # Start the target container and wait for health.
@@ -817,11 +843,85 @@ class ModelLifecycle:
                     state.active_inference_count,
                 )
 
+    async def _acquire_workload_lock(self) -> None:
+        timeout_s = max(1.0, float(getattr(self.settings, "model_queue_timeout_s", 1800.0)))
+        try:
+            await asyncio.wait_for(self._workload_lock.acquire(), timeout=timeout_s)
+        except asyncio.TimeoutError as exc:
+            raise LifecycleError(
+                f"Timed out waiting for the model/GPU workload queue after {timeout_s:.0f}s"
+            ) from exc
+
+    async def _release_workload_lock(self) -> None:
+        if self._workload_lock.locked():
+            self._workload_lock.release()
+
     def active_inference(self, role: str):
         """Async context manager protecting against eviction during inference."""
         from .model_inference_guard import _InferenceGuard
 
         return _InferenceGuard(lifecycle=self, role=role)
+
+    @contextlib.asynccontextmanager
+    async def llm_inference(self, role: str):
+        """Serialize one complete LLM workload on the shared GPU.
+
+        Every role-scoped inference client uses this context manager. Keeping
+        the lock around the complete call prevents concurrent requests from
+        switching models or colliding with image-generation acquisition.
+        """
+        role = role.lower().strip()
+        if self._closing:
+            raise LifecycleError("Lifecycle is shutting down")
+
+        queue_started = time.perf_counter()
+        await self._acquire_workload_lock()
+        runtime_metrics.observe(
+            "orchestrator_model_queue_wait_ms",
+            (time.perf_counter() - queue_started) * 1000.0,
+            labels={"role": role},
+        )
+        try:
+            container_name = self.models.container_for_role(role)
+            await self._wait_for_llm_gpu_availability(container_name)
+            switch_started = time.perf_counter()
+            previous_model = self._ready_model_name
+            await self.ensure_model_ready(role)
+            runtime_metrics.observe(
+                "orchestrator_model_switch_delay_ms",
+                (time.perf_counter() - switch_started) * 1000.0
+                if previous_model != self._ready_model_name
+                else 0.0,
+                labels={"role": role},
+            )
+            await self._begin_inference(role)
+            try:
+                yield
+            finally:
+                await self._end_inference(role)
+        finally:
+            await self._release_workload_lock()
+
+    async def ensure_model_ready(self, role: str) -> None:
+        """Ensure the configured router model for *role* is ready once per switch."""
+        role = role.lower().strip()
+        model_name = self._model_name(role)
+        if self._ready_model_name == model_name:
+            return
+
+        if self._ready_model_name and self._ready_model_name != model_name:
+            await self._unload_router_model(self._ready_model_name)
+            self._ready_model_name = None
+
+        await self._ensure_llama_router_model_loaded(model_name)
+        await self._wait_model_ready(role)
+        self._ready_model_name = model_name
+
+        async with self._ownership_lock:
+            if self._gpu_owner is None or is_llm_container_owner(self._gpu_owner):
+                self._gpu_owner = self.models.container_for_role(role)
+
+        logger.info("llm_model_ready role=%s model=%s", role, model_name)
 
     async def evict_if_needed(self) -> None:
         """Evict models whose keep-warm window has expired.
@@ -935,6 +1035,7 @@ class ModelLifecycle:
                     finally:
                         if self._gpu_owner == container_name:
                             self._gpu_owner = None
+                            self._ready_model_name = None
 
             async with self._state_lock:
                 st = self._runtime.get(role)
@@ -954,6 +1055,17 @@ class ModelLifecycle:
                 logger.exception("model_lifecycle_cleanup_loop_error")
                 
     async def acquire_comfyui_gpu(self) -> None:
+        """Acquire the fair workload lease, then reserve the image GPU."""
+        await self._acquire_workload_lock()
+        self._image_workload_lock_held = True
+        try:
+            await self._acquire_comfyui_gpu_locked()
+        except BaseException:
+            self._image_workload_lock_held = False
+            await self._release_workload_lock()
+            raise
+
+    async def _acquire_comfyui_gpu_locked(self) -> None:
         """Acquire exclusive GPU ownership for image generation.
 
         Ownership state machine (all transitions under ``_ownership_lock``):
@@ -1023,7 +1135,8 @@ class ModelLifecycle:
             # Step 3: Get actual resident model from llama-router.
             # This HTTP client is owned by this call (NOT the shared registry
             # client) and is closed when the context exits.
-            async with await self._get_llm_client() as client:
+            client = await self._get_llm_client()
+            try:
                 try:
                     resp = await client.get("/v1/models")
                     resp.raise_for_status()
@@ -1072,6 +1185,8 @@ class ModelLifecycle:
                 except httpx.HTTPError as e:
                     logger.error("llama_router_api_error error=%r", e)
                     raise LifecycleError(f"llama-router API error: {e}")
+            finally:
+                self._ready_model_name = None
 
             # Step 5.5: Capture the free-VRAM baseline for the release barrier.
             # This is taken AFTER the LLM unload has been confirmed, so it
@@ -1257,6 +1372,16 @@ class ModelLifecycle:
         return min(values_mb) if values_mb else None
 
     async def release_comfyui_gpu(self) -> None:
+        """Release image ownership and its workload lease after verification."""
+        await self._release_comfyui_gpu_locked()
+        # A verified release makes the GPU available to the next queued
+        # workload. On a failed/unknown release the lock remains held so the
+        # safety barrier cannot be bypassed by another model call.
+        if self._gpu_owner is None and self._image_workload_lock_held:
+            self._image_workload_lock_held = False
+            await self._release_workload_lock()
+
+    async def _release_comfyui_gpu_locked(self) -> None:
         """Release GPU ownership after confirmed image-generation completion.
 
         This is a BLOCKING RELEASE BARRIER. It does NOT simply clear the
@@ -1408,6 +1533,7 @@ class ModelLifecycle:
                             f"(owner={self._gpu_owner!r})"
                         )
                     self._gpu_owner = None
+                    self._ready_model_name = None
                 logger.info(
                     "comfyui_gpu_release_verified reason=memory_observables "
                     "attempt=%d elapsed_s=%.2f %s",
@@ -1450,21 +1576,70 @@ class ModelLifecycle:
             await asyncio.sleep(min(retry_interval_s, max(remaining, 0.05)))
 
     async def _get_llm_client(self) -> httpx.AsyncClient:
-        """Create a short-lived HTTP client for llama-router API calls.
+        """Return the lifecycle's shared llama-router control client."""
+        if self._llm_client is None:
+            base_url = self.settings.model_router_url
+            if base_url.endswith("/v1"):
+                base_url = base_url[: -len("/v1")]
+            self._llm_client = httpx.AsyncClient(
+                base_url=base_url.rstrip("/"),
+                timeout=httpx.Timeout(30.0),
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            )
+        return self._llm_client
 
-        The returned client is owned by the caller and MUST be closed (use
-        ``async with``). It is intentionally NOT a shared registry client.
-        """
-        base_url = self.settings.model_router_url
-        if base_url.endswith("/v1"):
-            base_url = base_url[: -len("/v1")]
-        return httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=httpx.Timeout(30.0))
+    async def _unload_router_model(self, model_name: str) -> None:
+        """Unload a known resident router model before a model switch."""
+        client = await self._get_llm_client()
+        try:
+            response = await client.post(
+                "/models/unload",
+                headers={"Content-Type": "application/json"},
+                json={"model": model_name},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise LifecycleError(f"Failed to unload router model '{model_name}': {exc}") from exc
+
+        timeout_s = max(1.0, float(getattr(self.settings, "controller_load_timeout_s", 300.0)))
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        interval = max(0.25, float(self.settings.health_poll_interval_s))
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                response = await client.get("/v1/models")
+                response.raise_for_status()
+                models = response.json().get("data", [])
+            except (httpx.HTTPError, ValueError):
+                await asyncio.sleep(interval)
+                continue
+
+            status = None
+            for model in models:
+                if model.get("id") == model_name:
+                    status = self._router_model_status_value(model)
+                    break
+            if status is None or status not in _ROUTER_READY_STATUSES | _ROUTER_TRANSITIONAL_STATUSES:
+                logger.info("llama_router_model_unloaded model=%s", model_name)
+                return
+            await asyncio.sleep(interval)
+
+        raise LifecycleError(
+            f"Router model '{model_name}' did not unload within {timeout_s:.0f}s"
+        )
 
     # ------------------------------------------------------------------
     # Controller handoff: ComfyUI release → controller load → readiness
     # ------------------------------------------------------------------
 
     async def ensure_controller_ready(self) -> None:
+        """Run the controller handoff behind the same workload lease."""
+        await self._acquire_workload_lock()
+        try:
+            await self._ensure_controller_ready_locked()
+        finally:
+            await self._release_workload_lock()
+
+    async def _ensure_controller_ready_locked(self) -> None:
         """Ensure the controller model is loaded and READY before LLM inference.
 
         This is the mandatory handoff gate called after image generation
@@ -1510,13 +1685,8 @@ class ModelLifecycle:
         logger.info("ensure_controller_ready: waiting for GPU availability")
         await self._wait_for_llm_gpu_availability(container_name)
 
-        # Step 2: Ensure the controller model is loaded in llama-router.
-        # This explicitly loads the model (so load failures are observable
-        # here rather than as a 500 during controller.validate()).
-        await self._ensure_llama_router_model_loaded(model_name)
-
-        # Step 3: Verify the controller is READY.
-        await self._wait_model_ready(role)
+        # Step 2-3: Ensure the configured controller model is loaded and ready.
+        await self.ensure_model_ready(role)
 
         # Step 4: Transition ownership to the controller container so that
         # subsequent LLM inference and validation are serialized correctly.
@@ -1559,7 +1729,8 @@ class ModelLifecycle:
             await self._ensure_llama_router_model_locked(model_name)
 
     async def _ensure_llama_router_model_locked(self, model_name: str) -> None:
-        async with await self._get_llm_client() as client:
+        client = await self._get_llm_client()
+        try:
             models_data = None
             # Check whether the model is already loaded and ready.
             try:
@@ -1614,6 +1785,16 @@ class ModelLifecycle:
                     else:
                         status_value = status
                     break
+
+            # The router may retain a resident model after a process restart
+            # when the in-memory readiness marker is empty. Enforce the
+            # single-model GPU invariant before requesting a different load.
+            for model in models_data.get("data", []):
+                other_name = str(model.get("id") or "")
+                if not other_name or other_name == model_name:
+                    continue
+                if self._router_model_status_value(model) in _ROUTER_READY_STATUSES:
+                    await self._unload_router_model(other_name)
 
             # Decision log: makes the next production run show exactly why
             # /models/load was or was not called.
@@ -1744,6 +1925,10 @@ class ModelLifecycle:
                     f"Transport error loading controller model "
                     f"'{model_name}' in llama-router: {exc}"
                 ) from exc
+        finally:
+            # The shared client remains open for reuse; this finally block is
+            # intentionally only a structural boundary for the lock scope.
+            pass
 
     async def _wait_router_model_settled(self, model_name: str) -> None:
         """Bounded wait for a router model to converge on readiness.
@@ -1775,10 +1960,13 @@ class ModelLifecycle:
                     f"model '{model_name}' to settle"
                 )
             try:
-                async with await self._get_llm_client() as client:
+                client = await self._get_llm_client()
+                try:
                     resp = await client.get("/v1/models")
                     resp.raise_for_status()
                     models_data = resp.json()
+                finally:
+                    pass
             except (httpx.HTTPError, ValueError):
                 # Transient probe failures during convergence are not fatal:
                 # keep polling until the bounded deadline expires.
@@ -1860,7 +2048,8 @@ class ModelLifecycle:
 
             status_value = None
             found = False
-            async with await self._get_llm_client() as client:
+            client = await self._get_llm_client()
+            try:
                 try:
                     resp = await client.get("/v1/models")
                     resp.raise_for_status()
@@ -1873,6 +2062,8 @@ class ModelLifecycle:
                     )
                     await asyncio.sleep(poll_interval_s)
                     continue
+            finally:
+                pass
 
             for model in models_data.get("data", []):
                 if model.get("id") == model_name:
@@ -1914,5 +2105,3 @@ class ModelLifecycle:
             f"Controller model '{model_name}' did not become READY within "
             f"{timeout_s:.0f}s (last status: {last_status or 'unknown'})"
         )
-
-

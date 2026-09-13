@@ -66,6 +66,17 @@ def _first_text(values: list[Any], *, limit: int = 220) -> str:
     return ""
 
 
+def _compact_fact(value: Any, *, max_chars: int = 1400) -> Any:
+    """Keep finalizer evidence useful without embedding full retrieval blobs."""
+    dumped = _dump_if_possible(value)
+    if not isinstance(dumped, (dict, list)):
+        return _truncate(str(dumped), max_chars)
+    encoded = json.dumps(dumped, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(encoded) <= max_chars:
+        return dumped
+    return {"summary": _truncate(encoded, max_chars)}
+
+
 def _normalize_text(text: str | None) -> str:
     return " ".join(str(text or "").split()).strip()
 
@@ -92,15 +103,15 @@ def _structured_source_entry(
         "source": provenance.get("source", source_type),
         "status": "validated",
         "confidence": confidence,
-        "summary": summary,
+        "summary": _truncate(summary, 1200),
         "relevant_excerpts": [item for item in relevant_excerpts if item.strip()][:8],
         "supporting_facts": [
-            _dump_if_possible(item)
+            _compact_fact(item)
             for item in supporting_facts
             if item is not None
         ][:8],
         "provenance": provenance,
-        "metadata": metadata,
+        "metadata": _compact_fact(metadata, max_chars=1000),
     }
 
 
@@ -109,12 +120,12 @@ def _build_validated_evidence_sources(evidence: EvidenceLedger) -> list[dict[str
 
     if evidence.repository:
         primary_hits = [
-            _dump_if_possible(hit)
+            _compact_fact(hit)
             for hit in (evidence.repository.primary_hits or [])
             if hit is not None
         ]
         expanded_hits = [
-            _dump_if_possible(hit)
+            _compact_fact(hit)
             for hit in (evidence.repository.expanded_hits or [])
             if hit is not None
         ]
@@ -147,7 +158,7 @@ def _build_validated_evidence_sources(evidence: EvidenceLedger) -> list[dict[str
 
     if evidence.web:
         results = [
-            _dump_if_possible(item)
+            _compact_fact(item)
             for item in (evidence.web.results or [])
             if item is not None
         ]
@@ -592,6 +603,7 @@ def build_controller_messages(
     request_context: str = "",
     structured_context: str = "",
     additional_context: str = "",
+    token_budget: int | None = None,
 ) -> list[ChatMessage]:
     """Build the controller/finalizer conversation.
 
@@ -601,7 +613,8 @@ def build_controller_messages(
     the text-only controller never sees raw multimodal/file payloads.
     """
     history_messages, latest_user_message, conversation_info = split_conversation(
-        [_sanitize_raw_message(m) for m in (messages or [])]
+        [_sanitize_raw_message(m) for m in (messages or [])],
+        **({"token_budget": token_budget} if token_budget is not None else {}),
     )
 
     outgoing = build_conversation(
@@ -632,9 +645,11 @@ def build_finalizer_messages(
     system_prompt: str,
     messages: list[dict[str, Any]] | None = None,
     evidence_context: str = "",
+    token_budget: int | None = None,
 ) -> list[ChatMessage]:
     return build_controller_messages(
         system_prompt=system_prompt,
         messages=messages,
         structured_context=evidence_context,
+        token_budget=token_budget,
     )

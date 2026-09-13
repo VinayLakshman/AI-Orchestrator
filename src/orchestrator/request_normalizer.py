@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import math
 import re
@@ -126,6 +125,33 @@ def _placeholder_for_type(part: dict[str, Any], attachment_type: str) -> str:
     return _placeholder_for_attachment(attachment_type)
 
 
+def _safe_attachment_metadata(part: dict[str, Any]) -> dict[str, Any]:
+    """Keep only lightweight attachment metadata in checkpointed state."""
+    safe: dict[str, Any] = {}
+    for key in (
+        "type",
+        "filename",
+        "name",
+        "path",
+        "file_id",
+        "mime_type",
+        "media_type",
+    ):
+        value = part.get(key)
+        if isinstance(value, (str, int, float, bool)) and str(value).strip():
+            safe[key] = value
+    return safe
+
+
+def _checkpoint_attachment(attachment: NormalizedAttachment) -> dict[str, Any]:
+    """Serialize attachment metadata without embedding data/base64 payloads."""
+    payload = attachment.model_dump(exclude_none=True)
+    reference = str(payload.get("reference") or "").strip()
+    if reference.lower().startswith("data:") or "base64" in reference.lower():
+        payload["reference"] = f"data-url:{attachment.attachment_type}"
+    return payload
+
+
 def _content_to_text(content: Any, *, attachments: list[NormalizedAttachment]) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -147,7 +173,7 @@ def _content_to_text(content: Any, *, attachments: list[NormalizedAttachment]) -
                         attachment_type=attachment_type,
                         placeholder=_placeholder_for_type(item, attachment_type),
                         reference=_attachment_reference(item),
-                        raw=copy.deepcopy(item),
+                        raw=_safe_attachment_metadata(item),
                     )
                 )
                 parts.append(_placeholder_for_type(item, attachment_type))
@@ -414,7 +440,7 @@ def normalize_openai_request(
         images=[item.reference for item in attachments if item.attachment_type == "image"],
         metadata={
             **metadata,
-            "attachments": [item.model_dump(exclude_none=True) for item in attachments],
+            "attachments": [_checkpoint_attachment(item) for item in attachments],
             "file_count": sum(item.attachment_type != "image" for item in attachments),
         },
     )

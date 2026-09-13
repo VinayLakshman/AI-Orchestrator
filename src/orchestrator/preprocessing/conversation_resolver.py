@@ -480,7 +480,7 @@ def _build_resolver_messages(
         structured_context_json = json.dumps(
             structured_context,
             ensure_ascii=False,
-            indent=2,
+            separators=(",", ":"),
         )
     except Exception:
         structured_context_json = json.dumps(
@@ -595,11 +595,23 @@ async def resolve_conversation_context(
         is_followup=False,
     )
 
-    context = build_resolver_context(request.messages)
+    context = build_resolver_context(
+        request.messages,
+        token_budget=min(settings.max_context_history_tokens, settings.max_model_context_tokens),
+    )
     started = perf_counter()
     structured_context = _structured_context_payload(context, original_query=original_query)
 
-    if not original_query or not context.has_history:
+    has_resources = bool(request.images or request.metadata.get("attachments"))
+    long_self_contained_turn = (
+        settings.adaptive_fast_paths
+        and not settings.legacy_execution_mode
+        and context.has_history
+        and len(context.latest_user_message or original_query) > 240
+        and not has_resources
+    )
+
+    if not original_query or not context.has_history or long_self_contained_turn:
         elapsed_ms = (perf_counter() - started) * 1000.0
         updated = request.model_copy(
             update={

@@ -29,10 +29,10 @@ logger = get_logger(__name__)
 
 
 def _pretty_json(content: str) -> str:
-    """Pretty-print ``content`` when it is valid JSON, otherwise return as-is."""
+    """Compact JSON context to reduce prompt tokens without changing meaning."""
     try:
         parsed = json.loads(content)
-        return json.dumps(parsed, indent=2, ensure_ascii=False)
+        return json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
     except Exception:
         return content
 

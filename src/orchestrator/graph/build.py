@@ -14,6 +14,7 @@ from ..clients.registry import ClientRegistry
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
 from ..runtime.model_provider import ModelProvider
+from ..runtime.inference_gateway import ManagedInferenceClient
 
 from ..models.state import OrchestratorState
 from ..logging import get_logger
@@ -148,7 +149,21 @@ class OrchestratorRuntime:
 
     async def close(self) -> None:
         """Close runtime-owned transports exactly once."""
+        # Stop lifecycle activity before closing transports used by its
+        # readiness and GPU-release paths.
+        close_lifecycle = getattr(self.model_lifecycle, "close", None)
+        if close_lifecycle is not None:
+            await close_lifecycle()
+
         clients = [self.knowledge_client.client, *self.client_registry.clients()]
+
+        # Managed role views intentionally do not own the shared router
+        # transport. Close that transport exactly once through the underlying
+        # LlamaCppClient.
+        for client in self.client_registry.clients():
+            underlying = getattr(client, "underlying_client", None)
+            if underlying is not None:
+                clients.append(underlying)
 
         if self.searxng_client is not None:
             clients.append(self.searxng_client.client)
@@ -160,10 +175,15 @@ class OrchestratorRuntime:
             if client is None or id(client) in closed:
                 continue
             closed.add(id(client))
-            await client.aclose()
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
 
 
 def build_checkpointer(settings: Settings) -> tuple[Any, CheckpointerKind]:
+    if settings.checkpoint_backend == "memory":
+        return MemorySaver(), "memory"
+
     sqlite_path = settings.checkpoint_sqlite_path.strip()
 
     try:
@@ -177,8 +197,11 @@ def build_checkpointer(settings: Settings) -> tuple[Any, CheckpointerKind]:
             conn_string = f"sqlite:///{sqlite_path}"
 
         return SqliteSaver.from_conn_string(conn_string), "sqlite"
-    except Exception:
-        return MemorySaver(), "memory"
+    except Exception as exc:
+        raise RuntimeError(
+            "CHECKPOINT_BACKEND=sqlite was requested, but the SQLite LangGraph "
+            "checkpointer dependency or configuration is unavailable"
+        ) from exc
 
 
 def build_graph(
@@ -312,6 +335,33 @@ def build_graph(
 
         return selected
 
+    def route_after_specialist(state: OrchestratorState) -> str:
+        """Skip validation only for a proven, single-step success.
+
+        Multi-specialist, low-confidence, failed, and legacy executions retain
+        the existing validator/retry path. This keeps quality-sensitive and
+        fallback behavior unchanged while removing one controller round trip
+        from the common simple-request path.
+        """
+        plan = state.execution.plan
+        runtime = state.execution.runtime
+        eligible = (
+            settings.adaptive_fast_paths
+            and not settings.legacy_execution_mode
+            and len(runtime.queue) == 1
+            and float(plan.confidence or 0.0) >= settings.adaptive_confidence_threshold
+            and runtime.metadata.get("last_status") == "success"
+        )
+        selected = _next_node(state) if eligible else "validate"
+        state.execution.runtime.metadata["validation_fast_path"] = bool(eligible)
+        _log_transition(
+            "route_after_specialist",
+            selected_next_node=selected,
+            validation_fast_path=bool(eligible),
+            **_state_snapshot(state),
+        )
+        return selected
+
     builder.add_conditional_edges(
         "plan",
         route_after_plan,
@@ -328,11 +378,23 @@ def build_graph(
         },
     )
 
-    builder.add_edge("vision", "validate")
-    builder.add_edge("knowledge", "validate")
-    builder.add_edge("web", "validate")
-    builder.add_edge("coder", "validate")
-    builder.add_edge("tools", "validate")
+    specialist_route_map = {
+        "vision": "vision",
+        "knowledge": "knowledge",
+        "web": "web",
+        "coder": "coder",
+        "tools": "tools",
+        "validate": "validate",
+        "finalize": "finalize",
+        "clarify": "clarify",
+        "reasoning": "reasoning",
+    }
+    for specialist_name in ("vision", "knowledge", "web", "coder", "tools"):
+        builder.add_conditional_edges(
+            specialist_name,
+            route_after_specialist,
+            specialist_route_map,
+        )
 
     # Image generation is a TERMINAL workload path. It must NOT fan out into
     # normal controller validation or normal textual finalization:
@@ -432,8 +494,22 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         openwebui_client = OpenWebUIClient(settings=settings, client=openwebui_http)
         client_registry.register("openwebui", openwebui_client)
 
+    router_http = httpx.AsyncClient(
+        base_url=provider.router_base_url,
+        timeout=httpx.Timeout(settings.request_timeout_s),
+        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        headers={
+            "Content-Type": "application/json",
+            **(
+                {"Authorization": f"Bearer {settings.llama_cpp_api_key}"}
+                if settings.llama_cpp_api_key
+                else {}
+            ),
+        },
+    )
     router_client = LlamaCppClient(
         settings=settings,
+        client=router_http,
         base_url=provider.router_base_url,
     )
     for role in ("controller", "reasoning", "coder", "vision"):
@@ -460,12 +536,7 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         base_url=settings.vision_fetch_base_url,
         timeout=settings.vision_timeout_s,
     )
-    vision_pipeline = VisionPipeline(
-        settings=settings,
-        client=vision_fetch_http,
-        model_client=client_registry.get("vision"),
-    )
-    stream_hub = StreamHub()
+    stream_hub = StreamHub(max_events=settings.stream_replay_max_events)
 
     # ModelLifecycle depends on the fully constructed ModelManager, so it is
     # created here — AFTER model_manager and BEFORE the graph/runtime that
@@ -476,6 +547,28 @@ async def build_runtime(settings: Settings) -> OrchestratorRuntime:
         models=model_manager,
         docker=docker,
     )
+
+    # Replace raw role registrations with managed views only after lifecycle
+    # construction. All model calls now share the same GPU lease and router
+    # transport, while callers retain the existing client.chat API.
+    for role in ("controller", "reasoning", "coder", "vision"):
+        client_registry.register(
+            role,
+            ManagedInferenceClient(
+                role=role,
+                transport=router_client,
+                lifecycle=model_lifecycle,
+                model_name=provider.model_for_role(role),
+            ),
+        )
+
+    vision_pipeline = VisionPipeline(
+        settings=settings,
+        client=vision_fetch_http,
+        model_client=client_registry.get("vision"),
+    )
+
+    model_lifecycle.start_background_cleanup()
 
     graph, checkpointer = build_graph(
         settings=settings,

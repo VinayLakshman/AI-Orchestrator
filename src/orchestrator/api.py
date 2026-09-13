@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from orchestrator.logging import get_logger
 from orchestrator.logging.request_summary import log_request_summary
 
@@ -30,6 +30,7 @@ from .streaming.context import stream_scope
 from .streaming.models import StreamKind
 from .streaming.publisher import StreamPublisher
 from .streaming.sse import openai_chunk, openai_done
+from .runtime.metrics import runtime_metrics
 
 router = APIRouter(tags=["orchestrator"])
 logger = get_logger(__name__)
@@ -56,6 +57,15 @@ def _thread_id_from_request(payload: ChatRequest) -> str:
     if payload.thread_id:
         return payload.thread_id[:THREAD_ID_MAX_LENGTH]
     return str(uuid4())
+
+
+def _openai_thread_id(request: Request, payload: OpenAIChatCompletionRequest) -> str:
+    """Resolve an optional stable conversation identity for OpenAI clients."""
+    header_value = request.headers.get("x-orchestrator-thread-id")
+    metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
+    metadata_value = metadata.get("thread_id")
+    candidate = str(header_value or metadata_value or "").strip()
+    return candidate[:THREAD_ID_MAX_LENGTH] if candidate else str(uuid4())
 
 
 def _openai_request_from_chat_request(payload: ChatRequest) -> OpenAIChatCompletionRequest:
@@ -272,6 +282,13 @@ def _emit_request_summary(
     execution_trace: list[dict[str, Any]] | None,
     total_duration_ms: int | float,
 ) -> None:
+    runtime_metrics.observe("orchestrator_total_latency_ms", float(total_duration_ms))
+    for stage, duration_ms in state.debug.timings.items():
+        runtime_metrics.observe(
+            "orchestrator_stage_duration_ms",
+            float(duration_ms),
+            labels={"stage": stage},
+        )
     log_request_summary(
         request_id=request_id,
         state=state,
@@ -293,6 +310,11 @@ async def readyz(runtime: OrchestratorRuntime = Depends(get_runtime)) -> dict[st
         "graph": "compiled",
         "checkpointer": runtime.checkpointer.__class__.__name__,
     }
+
+
+@router.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    return PlainTextResponse(runtime_metrics.render(), media_type="text/plain; version=0.0.4")
 
 
 @router.get("/v1/models", response_model=OpenAIModelListResponse)
@@ -358,7 +380,7 @@ async def _input_state_from_request(
         thread_id=thread_id or _thread_id_from_request(payload),
         request_id=request_id,
         model=payload.model or "orchestrator",
-        stream=payload.stream,
+        stream=payload.stream and runtime.settings.enable_streaming,
     )
 
 
@@ -399,28 +421,18 @@ async def openai_chat_completions(
     runtime: OrchestratorRuntime = Depends(get_runtime),
 ):
     request_id = str(uuid4())
-    request_state = normalize_openai_request(payload, request_id=request_id)
-    resolved = await resolve_conversation_context(
-        request_state,
-        settings=runtime.settings,
-        model_manager=runtime.model_manager,
-        client_registry=runtime.client_registry,
-    )
-    thread_id = str(uuid4())
-    started_at = perf_counter()
-
-    state_input = _input_state_from_request_state(
-        resolved.request,
-        thread_id=thread_id,
+    thread_id = _openai_thread_id(request, payload)
+    request_state = normalize_openai_request(
+        payload,
         request_id=request_id,
-        model=str(payload.model or "orchestrator"),
-        stream=payload.stream,
+        thread_id=thread_id,
     )
+    started_at = perf_counter()
 
     stream = runtime.stream_hub.get_or_create(request_id, conversation_id=thread_id)
     publisher = StreamPublisher(stream)
 
-    if payload.stream:
+    if payload.stream and runtime.settings.enable_streaming:
 
         async def sse_generator():
             token_seen = False
@@ -435,6 +447,27 @@ async def openai_chat_completions(
                 request_id=request_id,
                 model=str(payload.model),
                 role="assistant",
+            )
+            runtime_metrics.observe(
+                "orchestrator_time_to_first_token_ms",
+                (perf_counter() - started_at) * 1000.0,
+            )
+
+            # Defer model-backed conversation resolution until after the
+            # initial SSE role chunk so clients receive an immediate response
+            # signal even when the request has a long history.
+            resolved = await resolve_conversation_context(
+                request_state,
+                settings=runtime.settings,
+                model_manager=runtime.model_manager,
+                client_registry=runtime.client_registry,
+            )
+            state_input = _input_state_from_request_state(
+                resolved.request,
+                thread_id=thread_id,
+                request_id=request_id,
+                model=str(payload.model or "orchestrator"),
+                stream=payload.stream and runtime.settings.enable_streaming,
             )
 
             async def relay_events() -> None:
@@ -491,9 +524,8 @@ async def openai_chat_completions(
                         break
 
                     logger.debug(
-                        "SSE: event kind=%s payload=%s",
+                        "SSE: event kind=%s",
                         event.kind,
-                        event.payload,
                     )
 
                     if event.kind != StreamKind.LLM_TOKEN:
@@ -581,6 +613,20 @@ async def openai_chat_completions(
             media_type="text/event-stream",
             headers=_request_headers(request_id, thread_id),
         )
+
+    resolved = await resolve_conversation_context(
+        request_state,
+        settings=runtime.settings,
+        model_manager=runtime.model_manager,
+        client_registry=runtime.client_registry,
+    )
+    state_input = _input_state_from_request_state(
+        resolved.request,
+        thread_id=thread_id,
+        request_id=request_id,
+        model=str(payload.model or "orchestrator"),
+        stream=payload.stream and runtime.settings.enable_streaming,
+    )
 
     result: OrchestratorState = await runtime.graph.ainvoke(
         _graph_input(state_input),

@@ -413,6 +413,7 @@ class ControllerEngine:
             additional_context="\n\n".join(
                 part for part in (conversation_context, reusable_evidence_context) if part
             ),
+            token_budget=min(self.settings.planner_context_tokens, self.settings.max_model_context_tokens),
         )
 
         logger.debug(
@@ -514,6 +515,7 @@ class ControllerEngine:
             messages=_request_messages(state),
             request_context=render_request_context(state.request),
             structured_context=render_structured_context(state),
+            token_budget=min(self.settings.validation_context_tokens, self.settings.max_model_context_tokens),
         )
 
         response = await self.models.client("controller").chat(
@@ -578,6 +580,7 @@ class ControllerEngine:
             system_prompt=finalizer_prompt,
             messages=_request_messages(state),
             evidence_context=context_json,
+            token_budget=min(self.settings.finalizer_context_tokens, self.settings.max_model_context_tokens),
         )
 
         logger.debug(
@@ -656,7 +659,10 @@ class ControllerEngine:
         # Reasoning Specialist consistent with every other orchestrator node.
         history_messages: list[ChatMessage] = []
         try:
-            history_messages, _, _ = split_conversation(state.request.messages)
+            history_messages, _, _ = split_conversation(
+                state.request.messages,
+                token_budget=min(self.settings.reasoning_context_tokens, self.settings.max_model_context_tokens),
+            )
         except ValueError:
             history_messages = []
 
