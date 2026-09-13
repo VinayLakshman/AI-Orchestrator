@@ -12,9 +12,10 @@ import httpx
 from ..logging import get_logger
 from ..models.manager import ModelManager
 from ..settings import Settings
-from .docker_runtime import DockerRuntime
+from .legacy_docker import DockerRuntime
 from .model_catalog import CODER, CONTROLLER, REASONING, VISION, ModelPolicy
 from .metrics import runtime_metrics
+from .router_residency import ROUTER_READY_STATUSES, ROUTER_TRANSITIONAL_STATUSES
 
 logger = get_logger(__name__)
 
@@ -77,10 +78,8 @@ _IMAGE_GPU_SENTINELS = frozenset(
 # TRANSITIONAL: an in-flight residency transition. Issuing a competing load
 #          here can race the transition already under way (HTTP 400 "model
 #          is already running"); we wait instead.
-_ROUTER_READY_STATUSES = frozenset(
-    {"loaded", "ready", "running", "sleeping"}
-)
-_ROUTER_TRANSITIONAL_STATUSES = frozenset({"loading"})
+_ROUTER_READY_STATUSES = ROUTER_READY_STATUSES
+_ROUTER_TRANSITIONAL_STATUSES = ROUTER_TRANSITIONAL_STATUSES
 
 
 def is_llm_container_owner(value: str | None) -> bool:
@@ -109,6 +108,11 @@ class ModelRuntimeState:
     # Active inference tracking.
     # Stopping/eviction is only allowed when this count is zero.
     active_inference_count: int = 0
+
+    # Router-managed inference and legacy Docker-managed residency share the
+    # same role state. This marker prevents the Docker cleanup loop from
+    # acting on router-owned models.
+    managed_by_docker: bool = False
 
     # Used for informational/logging.
     warm_invocations: int = 0
@@ -389,7 +393,12 @@ class ModelLifecycle:
         async with self._state_lock:
             roles = list(self._runtime.keys())
 
-        containers = {self.models.container_for_role(role) for role in roles}
+        containers = {
+            self.models.container_for_role(role)
+            for role in roles
+            if self._runtime.get(role) is not None
+            and self._runtime[role].managed_by_docker
+        }
 
         for container_name in containers:
             container_lock = await self._get_container_lock(container_name)
@@ -650,6 +659,7 @@ class ModelLifecycle:
 
         async with self._state_lock:
             state = self._ensure_state(role, model_name)
+            state.managed_by_docker = True
 
         # Fast path: reconcile against Docker. If this role's container is already
         # running, healthy, AND is the current GPU owner (or no owner is recorded),
@@ -936,6 +946,8 @@ class ModelLifecycle:
 
         async with self._state_lock:
             for role, state in self._runtime.items():
+                if not state.managed_by_docker:
+                    continue
                 if state.status not in {LifecycleState.IDLE, LifecycleState.WARM}:
                     continue
                 policy = self._policy(role)

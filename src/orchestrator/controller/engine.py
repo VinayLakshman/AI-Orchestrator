@@ -8,7 +8,7 @@ from orchestrator.models.state import OrchestratorState
 from orchestrator.streaming.publisher import StreamPublisher
 
 from ..common.enums import ChatRole, SpecialistType
-from ..common.utils import _extract_json_object
+from .parsing import extract_json_object
 from ..context.assembler import build_conversation
 from ..context.builder import (
     build_controller_messages,
@@ -23,7 +23,7 @@ from ..context.parser import estimate_text_tokens, split_conversation
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.manager import ModelManager
-from ..models.ollama import (
+from ..models.generation import (
     ModelGenerationResponse,
     extract_assistant_text,
     normalize_generation_response,
@@ -441,7 +441,7 @@ class ControllerEngine:
 
         raw_content = _response_text(response)
         _log_planner_response(raw_content)
-        parsed = _extract_json_object(raw_content)
+        parsed = extract_json_object(raw_content)
         if not isinstance(parsed, dict):
             parsed = {}
 
@@ -528,7 +528,7 @@ class ControllerEngine:
         )
 
         raw_content = response.content or response.raw or "{}"
-        parsed = _extract_json_object(raw_content)
+        parsed = extract_json_object(raw_content)
         if not isinstance(parsed, dict):
             parsed = {}
 

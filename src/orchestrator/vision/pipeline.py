@@ -21,7 +21,7 @@ from .fetcher import (
 )
 from ..models.chat import ChatMessage
 from ..models.vision import ResolvedImage, VisionAnalysis, VisionResult
-from ..models.ollama import extract_assistant_text
+from ..models.generation import extract_assistant_text
 from ..models.state import OrchestratorState
 from ..context.conversation_evidence import is_fresh_analysis_requested
 from .prompts import build_vision_system_prompt, render_vision_context

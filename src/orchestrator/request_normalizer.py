@@ -304,13 +304,6 @@ def _normalize_knowledge_service_policy(value: Any) -> KnowledgeServicePolicy:
     return KnowledgeServicePolicy.NORMAL
 
 
-def _knowledge_service_policy_from_payload(
-    payload: OpenAIChatCompletionRequest,
-) -> KnowledgeServicePolicy:
-    policy, _ = _knowledge_service_policy_details_from_payload(payload)
-    return policy
-
-
 def _knowledge_service_policy_details_from_payload(
     payload: OpenAIChatCompletionRequest,
 ) -> tuple[KnowledgeServicePolicy, dict[str, Any]]:

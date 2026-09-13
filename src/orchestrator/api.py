@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
-from time import perf_counter, time
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -11,26 +11,33 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from orchestrator.logging import get_logger
 from orchestrator.logging.request_summary import log_request_summary
 
-from .common.constants import FALLBACK_NO_ANSWER, THREAD_ID_MAX_LENGTH
 from .graph.build import OrchestratorRuntime
 from .models.chat import ChatRequest
 from .models.state import OrchestratorState, RequestState
 from .request_normalizer import normalize_openai_request
 from .preprocessing.conversation_resolver import resolve_conversation_context
 from .schemas import (
-    OpenAIChatCompletionChoice,
     OpenAIChatCompletionRequest,
     OpenAIChatCompletionResponse,
-    OpenAIMessage,
     OpenAIModelCard,
     OpenAIModelListResponse,
-    OpenAIUsage,
 )
-from .streaming.context import stream_scope
+from .http.adapters import (
+    completion_from_state as _completion_from_state,
+    final_answer_from_state as _final_answer_from_state,
+    graph_input as _graph_input,
+    input_state_from_request_state as _input_state_from_request_state,
+    native_thread_id as _thread_id_from_request,
+    openai_request_from_chat_request as _openai_request_from_chat_request,
+    openai_thread_id as _openai_thread_id,
+    orchestrator_chat_result as _orchestrator_chat_result,
+    request_headers as _request_headers,
+)
 from .streaming.models import StreamKind
 from .streaming.publisher import StreamPublisher
 from .streaming.sse import openai_chunk, openai_done
 from .runtime.metrics import runtime_metrics
+from .http.streaming import run_graph_with_stream as _run_graph_with_stream
 
 router = APIRouter(tags=["orchestrator"])
 logger = get_logger(__name__)
@@ -41,238 +48,6 @@ def get_runtime(request: Request) -> OrchestratorRuntime:
     if runtime is None:
         raise HTTPException(status_code=503, detail="Orchestrator runtime is not ready")
     return runtime
-
-
-def _request_headers(request_id: str, thread_id: str) -> dict[str, str]:
-    return {
-        "cache-control": "no-cache",
-        "connection": "keep-alive",
-        "x-accel-buffering": "no",
-        "x-orchestrator-request-id": request_id,
-        "x-orchestrator-thread-id": thread_id,
-    }
-
-
-def _thread_id_from_request(payload: ChatRequest) -> str:
-    if payload.thread_id:
-        return payload.thread_id[:THREAD_ID_MAX_LENGTH]
-    return str(uuid4())
-
-
-def _openai_thread_id(request: Request, payload: OpenAIChatCompletionRequest) -> str:
-    """Resolve an optional stable conversation identity for OpenAI clients."""
-    header_value = request.headers.get("x-orchestrator-thread-id")
-    metadata = payload.metadata if isinstance(payload.metadata, dict) else {}
-    metadata_value = metadata.get("thread_id")
-    candidate = str(header_value or metadata_value or "").strip()
-    return candidate[:THREAD_ID_MAX_LENGTH] if candidate else str(uuid4())
-
-
-def _openai_request_from_chat_request(payload: ChatRequest) -> OpenAIChatCompletionRequest:
-    return OpenAIChatCompletionRequest(
-        model=payload.model or "orchestrator",
-        messages=[
-            OpenAIMessage(
-                role=message.role,
-                content=message.content,
-                name=message.name,
-                tool_call_id=message.tool_call_id,
-            )
-            for message in payload.messages
-        ],
-        stream=payload.stream,
-        temperature=payload.temperature,
-        max_tokens=payload.max_tokens,
-        params=payload.params,
-        metadata=payload.metadata,
-    )
-
-
-def _input_state_from_request_state(
-    request_state: RequestState,
-    *,
-    thread_id: str,
-    request_id: str | None = None,
-    model: str = "orchestrator",
-    stream: bool = False,
-) -> OrchestratorState:
-    request_id = request_id or str(uuid4())
-    request_state = request_state.model_copy(
-        update={
-            "request_id": request_id,
-            "conversation_id": thread_id,
-            "thread_id": thread_id,
-            "model": model,
-            "stream": stream,
-            "metadata": {
-                **request_state.metadata,
-                "request_headers": _request_headers(request_id, thread_id),
-            },
-        }
-    )
-
-    return OrchestratorState(request=request_state)
-
-
-def _graph_input(state_input: OrchestratorState) -> dict[str, Any]:
-    """Build a partial graph input that preserves the checkpointed conversation.
-
-    The graph schema owns a ``conversation`` channel that is conversation-level
-    (persisted per ``thread_id``) and must NOT be overwritten on every request.
-    Passing a partial dict that updates only the ``request`` channel lets the
-    existing LangGraph checkpointer keep the prior ``conversation`` for the
-    same thread while this request supplies only fresh request-level data.
-    """
-    return {"request": state_input.request}
-
-
-def _image_urls_from_state(state: OrchestratorState) -> list[str]:
-    """Return the valid generated image URLs recorded by the terminal
-    image-generation node.
-
-    The image path intentionally ends at ``image_generation -> END`` without
-    running validate/finalize, so ``response.final_response`` is expected to be
-    empty for successful image workloads. The authoritative result lives in
-    ``response.metadata["image_urls"]`` (written by the node after the Open
-    WebUI response is captured and before verified GPU release).
-    """
-    if state.response.metadata.get("route") != "image_generation":
-        return []
-    raw = state.response.metadata.get("image_urls")
-    if isinstance(raw, str):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
-    return [str(url).strip() for url in raw if isinstance(url, (str,)) and str(url).strip()]
-
-
-def _image_assistant_content(image_urls: list[str]) -> str:
-    """Render generated images as assistant text content.
-
-    Format: markdown image syntax joined into a single message. This is the
-    smallest representation the existing architecture fully supports:
-
-    - non-streaming: ``OpenAIMessage.content`` is a plain string;
-    - streaming: ``openai_chunk(content=...)`` only transports string deltas,
-      so structured multimodal parts could never survive to the Pipe;
-    - Open WebUI renders markdown ``![alt](url)`` images directly in chat.
-
-    Every generated URL is preserved — not just the first one.
-    """
-    lines = [f"![Generated image {index}]({url})" for index, url in enumerate(image_urls, start=1)]
-    return "\n\n".join(lines)
-
-
-def _final_answer_from_state(state: OrchestratorState) -> str:
-    """Assistant answer for a completed graph.
-
-    An empty ``final_response`` does NOT imply failure for the terminal
-    image-generation route: when that route produced valid image URLs, the
-    images themselves are the assistant response. Only genuine non-image
-    results without any finalizer text fall back to the generic refusal.
-    """
-    image_urls = _image_urls_from_state(state)
-    if image_urls:
-        return _image_assistant_content(image_urls)
-
-    answer = state.response.final_response.strip()
-    return answer or FALLBACK_NO_ANSWER
-
-
-
-def _usage_from_response_state(state: OrchestratorState) -> OpenAIUsage:
-    usage = state.response.usage
-    return OpenAIUsage(
-        prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
-        completion_tokens=int(usage.get("completion_tokens", 0) or 0),
-        total_tokens=int(usage.get("total_tokens", 0) or 0),
-    )
-
-
-def _orchestrator_chat_result(thread_id: str, state: OrchestratorState) -> dict[str, Any]:
-    return {
-        "thread_id": thread_id,
-        "answer": _final_answer_from_state(state),
-        "request": state.request.model_dump(
-            mode="json",
-            exclude_none=True,
-            exclude={
-                "original_query",
-                "resolved_query",
-                "is_followup",
-                "followup_confidence",
-            },
-        ),
-        "execution": state.execution.model_dump(mode="json", exclude_none=True),
-        "evidence": state.evidence.model_dump(mode="json", exclude_none=True),
-        "response": state.response.model_dump(mode="json", exclude_none=True),
-        "debug": state.debug.model_dump(mode="json", exclude_none=True),
-        "used_models": state.debug.used_models,
-        "used_tools": state.debug.used_tools,
-        "metadata": state.response.metadata,
-    }
-
-
-def _completion_from_state(
-    *,
-    request_id: str,
-    payload: OpenAIChatCompletionRequest,
-    state: OrchestratorState,
-    thread_id: str,
-) -> OpenAIChatCompletionResponse:
-    answer = _final_answer_from_state(state)
-    usage = _usage_from_response_state(state)
-    response_metadata = dict(state.response.metadata)
-    response_metadata.update(
-        {
-            "thread_id": thread_id,
-            "request_id": request_id,
-        }
-    )
-
-    return OpenAIChatCompletionResponse(
-        id=request_id,
-        created=int(time()),
-        model=str(payload.model),
-        choices=[
-            OpenAIChatCompletionChoice(
-                index=0,
-                message=OpenAIMessage(role="assistant", content=answer),
-                finish_reason="stop",
-            )
-        ],
-        usage=usage,
-        metadata=response_metadata,
-    )
-
-
-async def _run_graph_with_stream(
-    *,
-    runtime: OrchestratorRuntime,
-    request_id: str,
-    thread_id: str,
-    state_input: OrchestratorState,
-    publisher: StreamPublisher,
-) -> OrchestratorState:
-    logger.debug("GRAPH: entered _run_graph_with_stream")
-    try:
-        async with stream_scope(publisher):
-            await publisher.graph_started()
-            logger.debug("GRAPH: invoking graph")
-            result = await runtime.graph.ainvoke(
-                _graph_input(state_input),
-                config={"configurable": {"thread_id": thread_id}},
-            )
-            logger.debug("GRAPH: graph finished")
-            route_name = result.execution.plan.route.value
-            await publisher.graph_finished(route=route_name)
-            return result
-    except Exception as exc:
-        await publisher.graph_failed(str(exc))
-        raise
-    finally:
-        logger.debug("GRAPH: closing stream")
-        await runtime.stream_hub.close(request_id)
 
 
 def _emit_request_summary(

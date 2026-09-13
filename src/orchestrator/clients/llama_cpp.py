@@ -12,7 +12,7 @@ import httpx
 
 from ..logging import get_logger
 from ..models.chat import ChatMessage
-from ..models.ollama import ModelGenerationResponse
+from ..models.generation import ModelGenerationResponse
 from ..settings import Settings
 
 logger = get_logger(__name__)

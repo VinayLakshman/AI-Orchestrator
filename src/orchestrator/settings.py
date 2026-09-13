@@ -3,15 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class LlamaCppModelConfig(BaseModel):
-    """Endpoint + container metadata for a single llama.cpp model role."""
-
-    endpoint: str
-    container_name: str
 
 
 class Settings(BaseSettings):

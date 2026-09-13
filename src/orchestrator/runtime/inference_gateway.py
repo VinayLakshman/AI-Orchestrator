@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..clients.llama_cpp import LlamaCppClient, LlamaCppStreamChunk
-from ..models.ollama import ModelGenerationResponse
+from ..models.generation import ModelGenerationResponse
 
 
 @dataclass(slots=True)

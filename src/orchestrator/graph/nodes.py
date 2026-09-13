@@ -9,7 +9,7 @@ from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import normalize_query
 from ..common.enums import ControllerAction, KnowledgeServicePolicy, SpecialistType
 from ..common.constants import FALLBACK_NO_ANSWER
-from ..common.utils import _extract_json_object
+from ..controller.parsing import extract_json_object
 from ..context.assembler import build_conversation
 from ..context.conversation_evidence import (
     lookup_document_evidence,
@@ -37,7 +37,7 @@ from ..models.evidence import (
     VisionEvidence,
     WebEvidence,
 )
-from ..models.ollama import extract_assistant_text
+from ..models.generation import extract_assistant_text
 from ..models.state import DebugState, OrchestratorState, ResponseState
 from ..context.conversation_state import (
     merge_request_resources,
@@ -1141,7 +1141,7 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
         )
 
         text = extract_assistant_text(response.content) or extract_assistant_text(response.raw) or ""
-        parsed = _extract_json_object(text)
+        parsed = extract_json_object(text)
         if not isinstance(parsed, dict):
             parsed = {}
 

@@ -169,15 +169,19 @@ streams are retained only for a short replay window before cleanup.
 ```text
 src/orchestrator/
   api.py                 Public HTTP and SSE routes.
+  http/                  HTTP request/state adapters kept separate from routes.
   settings.py            Environment-backed configuration.
   main.py                FastAPI application and lifecycle.
   graph/                 LangGraph construction and specialist nodes.
+    specialists/         Capability-specific node entry points.
   controller/            Planner, validator, reasoning, and finalizer calls.
-  runtime/               Model provider, lifecycle, gateway, and metrics.
+  runtime/               Lifecycle facade, router residency, GPU arbitration,
+                         legacy Docker support, gateway, and metrics.
   clients/               Router, retrieval, web, and Open WebUI clients.
   context/               Conversation assembly, parsing, and evidence reuse.
   preprocessing/         Request normalization and conversation resolution.
   vision/                Image fetching, preprocessing, caching, and analysis.
+  models/generation.py   Provider-neutral generation response helpers.
   streaming/             Bounded internal event streams and SSE serialization.
 Dockerfile               Root container build and port-8001 launch command.
 pyproject.toml            Packaging and runtime dependencies.
