@@ -404,7 +404,13 @@ def build_finalize_context(
         ],
         "has_web_results": conversation.has_web_results,
         "last_web_query": conversation.last_web_query,
-        "last_web_at": conversation.last_web_at,
+        # Keep controller context JSON-native; checkpoint state may retain the
+        # original datetime object for runtime decisions.
+        "last_web_at": (
+            conversation.last_web_at.isoformat()
+            if conversation.last_web_at is not None
+            else None
+        ),
     }
 
     memory_settings = settings or get_settings()

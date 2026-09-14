@@ -583,6 +583,10 @@ class ControllerEngine:
             finalizer_context,
             separators=(",", ":"),
             ensure_ascii=False,
+            # Finalizer context is an internal prompt boundary. Keep a
+            # malformed/legacy checkpoint metadata value from taking down the
+            # completed specialist response.
+            default=str,
         )
 
         finalizer_prompt = build_controller_final_prompt()
