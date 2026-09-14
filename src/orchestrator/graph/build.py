@@ -21,6 +21,8 @@ from .image_generation import make_image_generation_node
 from .nodes import (
     make_controller_plan_node,
     make_controller_validate_node,
+    make_commit_conversation_node,
+    make_conversation_resolve_node,
     make_prepare_node,
     _state_snapshot,
     _log_transition,
@@ -217,6 +219,11 @@ def build_graph(
     )
 
     prepare_node = make_prepare_node(settings)
+    resolve_node = make_conversation_resolve_node(
+        controller,
+        settings,
+        client_registry,
+    )
     plan_node = make_controller_plan_node(controller, settings)
     vision_node = make_vision_node(vision_pipeline, settings)
 
@@ -236,8 +243,10 @@ def build_graph(
 
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
+    commit_node = make_commit_conversation_node(settings)
 
     prepare_node = timed_node("prepare", prepare_node, display_name="Prepare")
+    resolve_node = timed_node("conversation_resolution", resolve_node, display_name="Conversation Resolution")
     plan_node = timed_node("planner", plan_node, display_name="Planner")
     vision_node = timed_node("vision", vision_node, display_name="Vision")
     knowledge_node = timed_node("knowledge", knowledge_node, display_name="Knowledge")
@@ -249,8 +258,10 @@ def build_graph(
     image_generation_node = timed_node("image_generation", image_generation_node, display_name="Image Generation")
     clarify_node = timed_node("clarify", clarify_node, display_name="Clarification")
     finalize_node = timed_node("finalize", finalize_node, display_name="Finalizer")
+    commit_node = timed_node("conversation_commit", commit_node, display_name="Conversation Commit")
 
     builder.add_node("prepare", prepare_node)
+    builder.add_node("conversation_resolution", resolve_node)
     builder.add_node("plan", plan_node)
     builder.add_node("vision", vision_node)
     builder.add_node("knowledge", knowledge_node)
@@ -262,9 +273,11 @@ def build_graph(
     builder.add_node("image_generation", image_generation_node)
     builder.add_node("clarify", clarify_node)
     builder.add_node("finalize", finalize_node)
+    builder.add_node("conversation_commit", commit_node)
 
     builder.add_edge(START, "prepare")
-    builder.add_edge("prepare", "plan")
+    builder.add_edge("prepare", "conversation_resolution")
+    builder.add_edge("conversation_resolution", "plan")
 
     def _next_node(state: OrchestratorState) -> str:
         # DEBUG: trace runtime queue -> selected node
@@ -417,7 +430,7 @@ def build_graph(
     # whatever resource it needs through the normal lifecycle machinery.
     # graph_finished is published by the API layer only after this node
     # returns, so it cannot precede successful ComfyUI release.
-    builder.add_edge("image_generation", END)
+    builder.add_edge("image_generation", "conversation_commit")
 
     builder.add_conditional_edges(
         "validate",
@@ -435,8 +448,9 @@ def build_graph(
     )
 
     builder.add_edge("reasoning", "finalize")
-    builder.add_edge("clarify", END)
-    builder.add_edge("finalize", END)
+    builder.add_edge("clarify", "conversation_commit")
+    builder.add_edge("finalize", "conversation_commit")
+    builder.add_edge("conversation_commit", END)
 
     checkpointer, _kind = build_checkpointer(settings)
     graph = TypedGraphFacade(builder.compile(checkpointer=checkpointer))

@@ -93,6 +93,40 @@ class ConversationResource(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ConversationTurn(BaseModel):
+    """Sanitized, bounded record of one completed conversation turn."""
+
+    turn_id: str = ""
+    request_id: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    messages: list[ChatMessage] = Field(default_factory=list)
+    user_text: str = ""
+    resolved_query: str = ""
+    assistant_text: str = ""
+    assistant_summary: str = ""
+    finish_reason: str = "stop"
+    intent: str = ""
+    confidence: float = 0.0
+    resource_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConversationMemoryState(BaseModel):
+    """Bounded checkpoint-safe memory used to answer follow-up turns."""
+
+    schema_version: int = 1
+    turns: list[ConversationTurn] = Field(default_factory=list)
+    system_messages: list[ChatMessage] = Field(default_factory=list)
+    developer_messages: list[ChatMessage] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    corrections: list[str] = Field(default_factory=list)
+    pending_clarification: dict[str, Any] = Field(default_factory=dict)
+    last_answer_artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ConversationState(BaseModel):
     """
     Conversation-level state.
@@ -109,8 +143,9 @@ class ConversationState(BaseModel):
     ConversationState survives across requests sharing the same ``thread_id``
     via the existing LangGraph checkpoint mechanism.
 
-    It must NOT become a dumping ground (no summaries, embeddings, web result
-    payloads, extracted document text, or per-request evidence caches).
+    Conversation memory is bounded and sanitized. It contains only recent
+    messages, compact summaries, and references; it never stores embeddings,
+    raw attachments, web payloads, extracted document text, or debug prompts.
     """
 
     current_topic: str = ""
@@ -124,6 +159,10 @@ class ConversationState(BaseModel):
     has_web_results: bool = False
 
     last_web_query: str = ""
+
+    last_web_at: datetime | None = None
+
+    memory: ConversationMemoryState = Field(default_factory=ConversationMemoryState)
 
     metadata: dict[str, Any] = Field(default_factory=dict)
 

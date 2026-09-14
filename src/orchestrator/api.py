@@ -58,6 +58,23 @@ def _emit_request_summary(
     total_duration_ms: int | float,
 ) -> None:
     runtime_metrics.observe("orchestrator_total_latency_ms", float(total_duration_ms))
+    memory = state.conversation.memory
+    resolution = state.request.metadata.get("conversation_resolution") or {}
+    runtime_metrics.observe(
+        "orchestrator_conversation_memory_turns",
+        float(len(memory.turns)),
+    )
+    memory_source = str(
+        state.request.metadata.get("conversation_context_source") or "none"
+    )
+    runtime_metrics.increment(
+        "orchestrator_conversation_memory_hit"
+        if memory_source in {"checkpoint_memory", "request_history"}
+        else "orchestrator_conversation_memory_miss",
+        labels={"source": memory_source},
+    )
+    if isinstance(resolution, dict) and resolution.get("applied"):
+        runtime_metrics.increment("orchestrator_followup_resolution_applied")
     for stage, duration_ms in state.debug.timings.items():
         runtime_metrics.observe(
             "orchestrator_stage_duration_ms",
@@ -144,14 +161,20 @@ async def _input_state_from_request(
         request_id=request_id or "",
         thread_id=thread_id or "",
     )
-    resolved = await resolve_conversation_context(
-        request_state,
-        settings=runtime.settings,
-        model_manager=runtime.model_manager,
-        client_registry=runtime.client_registry,
-    )
+    resolved_request = request_state
+    # Legacy mode keeps the historical route-side resolver. Optimized mode
+    # resolves inside the graph after checkpoint state has been restored.
+    if runtime.settings.legacy_execution_mode:
+        resolved_request = (
+            await resolve_conversation_context(
+                request_state,
+                settings=runtime.settings,
+                model_manager=runtime.model_manager,
+                client_registry=runtime.client_registry,
+            )
+        ).request
     return _input_state_from_request_state(
-        resolved.request,
+        resolved_request,
         thread_id=thread_id or _thread_id_from_request(payload),
         request_id=request_id,
         model=payload.model or "orchestrator",
@@ -231,14 +254,18 @@ async def openai_chat_completions(
             # Defer model-backed conversation resolution until after the
             # initial SSE role chunk so clients receive an immediate response
             # signal even when the request has a long history.
-            resolved = await resolve_conversation_context(
-                request_state,
-                settings=runtime.settings,
-                model_manager=runtime.model_manager,
-                client_registry=runtime.client_registry,
-            )
+            resolved_request = request_state
+            if runtime.settings.legacy_execution_mode:
+                resolved_request = (
+                    await resolve_conversation_context(
+                        request_state,
+                        settings=runtime.settings,
+                        model_manager=runtime.model_manager,
+                        client_registry=runtime.client_registry,
+                    )
+                ).request
             state_input = _input_state_from_request_state(
-                resolved.request,
+                resolved_request,
                 thread_id=thread_id,
                 request_id=request_id,
                 model=str(payload.model or "orchestrator"),
@@ -389,14 +416,18 @@ async def openai_chat_completions(
             headers=_request_headers(request_id, thread_id),
         )
 
-    resolved = await resolve_conversation_context(
-        request_state,
-        settings=runtime.settings,
-        model_manager=runtime.model_manager,
-        client_registry=runtime.client_registry,
-    )
+    resolved_request = request_state
+    if runtime.settings.legacy_execution_mode:
+        resolved_request = (
+            await resolve_conversation_context(
+                request_state,
+                settings=runtime.settings,
+                model_manager=runtime.model_manager,
+                client_registry=runtime.client_registry,
+            )
+        ).request
     state_input = _input_state_from_request_state(
-        resolved.request,
+        resolved_request,
         thread_id=thread_id,
         request_id=request_id,
         model=str(payload.model or "orchestrator"),

@@ -22,6 +22,7 @@ Persistence is owned by the existing LangGraph checkpoint system.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 
 from typing import Any
 
@@ -253,6 +254,7 @@ def record_web_success(
         update={
             "has_web_results": True,
             "last_web_query": query.strip(),
+            "last_web_at": datetime.utcnow(),
         }
     )
     logger.debug(

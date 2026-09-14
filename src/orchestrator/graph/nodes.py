@@ -46,6 +46,8 @@ from ..context.conversation_state import (
     record_thread,
     update_topic,
 )
+from ..context.memory import build_memory_context, commit_conversation_turn
+from ..preprocessing.conversation_resolver import resolve_conversation_context
 from ..models.execution import (
     ExecutionState,
     RetryState,
@@ -367,7 +369,6 @@ def make_prepare_node(settings: Settings):
         # requests sharing the same thread_id. It is intentionally NOT reset.
         request = state.request
         conversation = record_thread(state.conversation, request.thread_id)
-        conversation = update_topic(conversation, request)
         conversation = merge_request_resources(
             conversation,
             request,
@@ -395,6 +396,69 @@ def make_prepare_node(settings: Settings):
         return state
 
     return prepare_node
+
+
+def make_conversation_resolve_node(
+    controller: ControllerEngine,
+    settings: Settings,
+    client_registry: Any,
+):
+    """Resolve follow-ups after checkpoint state has been restored."""
+
+    async def resolve_node(state: OrchestratorState) -> OrchestratorState:
+        request = state.request
+        existing_resolution = request.metadata.get("conversation_resolution")
+        has_route_resolution = isinstance(existing_resolution, dict)
+
+        if has_route_resolution and (
+            settings.legacy_execution_mode or bool(existing_resolution.get("applied"))
+        ):
+            state.conversation = update_topic(state.conversation, request)
+            return state
+
+        memory_context = build_memory_context(
+            state,
+            settings,
+            token_budget=min(
+                settings.max_context_history_tokens,
+                settings.max_model_context_tokens,
+            ),
+        )
+        # The resolver accepts the existing RequestState contract. Supplying a
+        # merged, sanitized message list lets it resolve latest-only requests
+        # from checkpoint memory without exposing raw attachments.
+        resolver_request = request.model_copy(
+            update={"messages": memory_context.history_messages}
+        )
+        try:
+            resolved = await resolve_conversation_context(
+                resolver_request,
+                settings=settings,
+                model_manager=controller.models,
+                client_registry=client_registry,
+            )
+            state.request = resolved.request
+        except Exception:
+            logger.exception("checkpoint_conversation_resolution_failed")
+            state.request = resolver_request
+
+        state.request.metadata = {
+            **state.request.metadata,
+            "conversation_context_source": memory_context.source,
+            "conversation_context_turns": memory_context.selected_turns,
+            "conversation_context_truncated": memory_context.truncated,
+        }
+        state.conversation = update_topic(state.conversation, state.request)
+        return state
+
+    return resolve_node
+
+
+def make_commit_conversation_node(settings: Settings):
+    async def commit_node(state: OrchestratorState) -> OrchestratorState:
+        return commit_conversation_turn(state, settings)
+
+    return commit_node
 
 
 def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
@@ -1094,13 +1158,13 @@ Do not expose internal reasoning.
         structured_context="\n\n".join(structured_sections),
         history=_coder_history(
             state,
-            min(settings.max_context_history_tokens, settings.max_model_context_tokens),
+            settings,
         ),
         latest_user_message=_request_user_text(state),
     )
 
 
-def _coder_history(state: OrchestratorState, token_budget: int) -> list[ChatMessage]:
+def _coder_history(state: OrchestratorState, settings: Settings) -> list[ChatMessage]:
     """Recover conversation history for the coder.
 
     The coder is a specialist operating inside the orchestration graph. It
@@ -1109,9 +1173,14 @@ def _coder_history(state: OrchestratorState, token_budget: int) -> list[ChatMess
     treated purely as history.
     """
     try:
+        memory_context = build_memory_context(
+            state,
+            settings,
+            token_budget=min(settings.max_context_history_tokens, settings.max_model_context_tokens),
+        )
         history_messages, _, _ = split_conversation(
-            state.request.messages,
-            token_budget=token_budget,
+            memory_context.history_messages,
+            token_budget=min(settings.max_context_history_tokens, settings.max_model_context_tokens),
         )
         return history_messages
     except ValueError:

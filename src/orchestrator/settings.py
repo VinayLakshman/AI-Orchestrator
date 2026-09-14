@@ -113,6 +113,15 @@ class Settings(BaseSettings):
     stream_replay_max_events: int = 4096
     vision_fetch_concurrency: int = 4
 
+    # Bounded ChatGPT-like follow-up memory. Memory is checkpointed only for
+    # callers that reuse a stable thread id.
+    conversation_memory_enabled: bool = True
+    conversation_memory_max_turns: int = 12
+    conversation_memory_recent_turns: int = 4
+    conversation_memory_max_tokens: int = 3072
+    conversation_memory_max_chars: int = 24000
+    conversation_memory_answer_max_chars: int = 6000
+
     # Feature flags
     enable_rag: bool = True
     enable_vision: bool = True

@@ -20,6 +20,7 @@ from ..models.evidence import (
     EvidenceLedger,
 )
 from ..models.state import OrchestratorState, RequestState
+from ..settings import Settings, get_settings
 from ..request_normalizer import (
     _attachment_type,
     _extract_attachment_reference,
@@ -28,6 +29,7 @@ from ..request_normalizer import (
 )
 from .assembler import build_conversation
 from .conversation_state import render_conversation_state
+from .memory import build_memory_context
 from .parser import split_conversation
 
 logger = get_logger(__name__)
@@ -306,9 +308,9 @@ def _build_validated_evidence_sources(evidence: EvidenceLedger) -> list[dict[str
     return sources
 
 
-def render_structured_context(state: OrchestratorState) -> str:
+def render_structured_context(state: OrchestratorState, settings: Settings | None = None) -> str:
     return json.dumps(
-        build_finalize_context(state),
+        build_finalize_context(state, settings=settings),
         indent=2,
         ensure_ascii=False,
         default=str,
@@ -335,7 +337,11 @@ def render_request_context(request: RequestState) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
-def build_finalize_context(state: OrchestratorState) -> dict[str, Any]:
+def build_finalize_context(
+    state: OrchestratorState,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
     request = state.request
     execution = state.execution
     evidence = state.evidence
@@ -398,12 +404,19 @@ def build_finalize_context(state: OrchestratorState) -> dict[str, Any]:
         ],
         "has_web_results": conversation.has_web_results,
         "last_web_query": conversation.last_web_query,
+        "last_web_at": conversation.last_web_at,
     }
+
+    memory_settings = settings or get_settings()
 
     return {
         "question": question,
         "conversation": conversation_context,
         "conversation_text": render_conversation_state(conversation),
+        "conversation_memory": build_memory_context(
+            state,
+            memory_settings,
+        ).structured,
         "execution": execution_summary,
         "sources": _build_validated_evidence_sources(evidence),
     }

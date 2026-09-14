@@ -44,8 +44,9 @@ The controller produces a semantic `ExecutionPlan`; routing is not based on a
 keyword table. The graph then executes only the planned specialists:
 
 ```text
-prepare -> plan -> specialist queue -> validate when needed -> finalize
-                                      \\-> image_generation -> END
+prepare -> conversation resolution -> plan -> specialist queue
+                                      -> validate when needed -> finalize
+                                      \\-> image_generation -> conversation commit -> END
 ```
 
 Supported specialist paths are:
@@ -112,11 +113,22 @@ Important settings include:
 | `VISION_MAX_DIMENSION` | `2048` | Maximum image dimension after preprocessing. |
 | `VISION_CACHE_MAX_ITEMS` | `32` | Vision LRU cache size. |
 | `VISION_CACHE_TTL_S` | `1800` | Vision cache lifetime. |
+| `CONVERSATION_MEMORY_ENABLED` | `true` | Enables bounded checkpoint-backed follow-up memory. |
+| `CONVERSATION_MEMORY_MAX_TURNS` | `12` | Maximum persisted conversation turns. |
+| `CONVERSATION_MEMORY_RECENT_TURNS` | `4` | Recent turns retained with full answer text. |
+| `CONVERSATION_MEMORY_MAX_TOKENS` | `3072` | Model-facing follow-up memory budget. |
+| `CONVERSATION_MEMORY_MAX_CHARS` | `24000` | Maximum persisted memory text size. |
+| `CONVERSATION_MEMORY_ANSWER_MAX_CHARS` | `6000` | Maximum stored assistant answer size. |
 
 `CHECKPOINT_BACKEND=sqlite` is explicit. It raises a startup error if the
 SQLite LangGraph checkpointer is not installed or configured; it does not
 silently fall back to memory. The default remains memory for compatibility with
 the base installation.
+
+When a stable thread ID is reused, completed user and assistant turns are
+stored as bounded, sanitized conversation memory. Recent follow-ups can use
+that memory even when the client sends only the latest message. Requests
+without a stable identity remain stateless.
 
 ## Build and run
 
