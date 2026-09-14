@@ -5,6 +5,7 @@ from time import perf_counter
 from typing import Awaitable, Callable, TypeVar
 
 from ..models.state import OrchestratorState
+from ..runtime.metrics import runtime_metrics
 
 
 StateT = TypeVar("StateT", bound=OrchestratorState)
@@ -28,6 +29,11 @@ def timed_node(
             elapsed_ms = (perf_counter() - started) * 1000.0
             target = result if result is not None else state
             target.debug.timings[timing_key] = elapsed_ms
+            runtime_metrics.observe(
+                "orchestrator_specialist_duration_ms",
+                elapsed_ms,
+                labels={"stage": timing_key},
+            )
             target.debug.execution_trace.append(
                 {
                     "key": timing_key,

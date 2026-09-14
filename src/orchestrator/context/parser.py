@@ -17,7 +17,7 @@ from typing import Any
 
 from ..common.enums import ChatRole
 from ..models.chat import ChatMessage
-from .conversation_builder import (
+from .history import (
     ConversationContextBuilder,
     estimate_text_tokens,
     DEFAULT_HISTORY_TOKEN_BUDGET as CONVERSATION_HISTORY_TOKEN_BUDGET,

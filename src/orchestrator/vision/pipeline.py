@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -18,8 +21,9 @@ from .fetcher import (
 )
 from ..models.chat import ChatMessage
 from ..models.vision import ResolvedImage, VisionAnalysis, VisionResult
-from ..models.ollama import extract_assistant_text
+from ..models.generation import extract_assistant_text
 from ..models.state import OrchestratorState
+from ..context.conversation_evidence import is_fresh_analysis_requested
 from .prompts import build_vision_system_prompt, render_vision_context
 
 logger = get_logger(__name__)
@@ -30,7 +34,27 @@ class VisionPipeline:
     settings: Settings
     client: httpx.AsyncClient
     model_client: Any
-    _cache: dict[str, VisionResult] = field(default_factory=dict)
+    _cache: OrderedDict[str, tuple[float, VisionResult]] = field(default_factory=OrderedDict)
+    _cache_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _inflight: dict[str, asyncio.Task[VisionResult]] = field(default_factory=dict)
+
+    def _cache_get(self, key: str) -> VisionResult | None:
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        created_at, result = entry
+        if monotonic() - created_at > max(0.0, self.settings.vision_cache_ttl_s):
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return result.model_copy(deep=True)
+
+    def _cache_put(self, key: str, result: VisionResult) -> None:
+        self._cache[key] = (monotonic(), result.model_copy(deep=True))
+        self._cache.move_to_end(key)
+        limit = max(1, int(self.settings.vision_cache_max_items))
+        while len(self._cache) > limit:
+            self._cache.popitem(last=False)
 
     def _image_source_kind(self, ref: str) -> str:
         if ref.startswith("data:image/"):
@@ -172,6 +196,96 @@ class VisionPipeline:
                 raw_text=raw_text,
             )
 
+    async def _analyze_resolved_images(
+        self,
+        *,
+        task_type: VisionTaskType,
+        user_text: str,
+        resolved_images: list[ResolvedImage],
+        image_hashes: list[str],
+        cleaned_messages: list[dict[str, Any]],
+        request_id: str,
+        request_image_sources: list[str],
+    ) -> VisionResult:
+        system_prompt = build_vision_system_prompt(
+            task_type=task_type,
+            image_count=len(resolved_images),
+            user_text=user_text,
+        )
+        user_prompt = (
+            user_text.strip()
+            if user_text.strip()
+            else "Analyse the attached image(s) and return structured technical context."
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            payload_encoded_lengths = [len(img.base64_data or "") for img in resolved_images]
+            payload_raw_sizes = [len(base64.b64decode(img.base64_data)) for img in resolved_images]
+            payload_mime_types = [img.mime_type for img in resolved_images]
+            logger.debug(
+                "VISION PAYLOAD CREATED request_id=%s model=%s payload_image_count=%d payload_image_source=%s payload_mime=%s payload_raw_size=%s payload_encoded_length=%s prompt_length=%d",
+                request_id,
+                self.settings.vision_model_name,
+                len(resolved_images),
+                request_image_sources,
+                payload_mime_types,
+                payload_raw_sizes,
+                payload_encoded_lengths,
+                len(user_prompt),
+            )
+
+        user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        for img in resolved_images:
+            user_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img.mime_type};base64,{img.base64_data}"},
+                }
+            )
+        chat_messages: list[ChatMessage] = build_conversation(
+            system_prompt=system_prompt,
+            latest_user_message=user_parts,
+        )
+
+        try:
+            response = await self.model_client.chat(
+                model=self.settings.vision_model_name,
+                messages=chat_messages,
+                temperature=0.15,
+                max_tokens=1200,
+                stream=False,
+            )
+            raw_content = extract_assistant_text(response.content)
+            analysis = self._parse_analysis(
+                task_type=task_type,
+                image_count=len(resolved_images),
+                hashes=image_hashes,
+                raw_text=raw_content,
+            )
+            result = VisionResult(
+                analysis=analysis,
+                context_markdown=render_vision_context(analysis),
+                cleaned_messages=cleaned_messages,
+                image_hashes=image_hashes,
+                cache_hit=False,
+            )
+            self._cache_put("|".join([task_type.value, user_text.strip()[:512], *image_hashes]), result)
+            return result
+        except Exception as exc:
+            logger.exception("Vision pipeline failed: %s", exc)
+            fallback = self._build_fallback_analysis(
+                task_type=task_type,
+                image_count=len(resolved_images),
+                hashes=image_hashes,
+                raw_text=str(exc),
+            )
+            return VisionResult(
+                analysis=fallback,
+                context_markdown=render_vision_context(fallback),
+                cleaned_messages=cleaned_messages,
+                image_hashes=image_hashes,
+                cache_hit=False,
+            )
+
     async def process(self, state: OrchestratorState) -> VisionResult | None:
         messages = state.request.messages
         request_headers = state.request.metadata.get("request_headers", {}) or {}
@@ -197,16 +311,29 @@ class VisionPipeline:
         user_text = state.request.user_message
         task_type = infer_vision_task(user_text)
 
+        semaphore = asyncio.Semaphore(max(1, int(self.settings.vision_fetch_concurrency)))
+
+        async def resolve_one(ref: str) -> ResolvedImage | None:
+            async with semaphore:
+                return await resolve_image_ref(
+                    ref,
+                    settings=self.settings,
+                    headers=request_headers,
+                    client=self.client,
+                )
+
+        candidates = await asyncio.gather(*(resolve_one(ref) for ref in images))
         resolved_images: list[ResolvedImage] = []
-        for ref in images:
-            resolved = await resolve_image_ref(
-                ref,
-                settings=self.settings,
-                headers=request_headers,
-                client=self.client,
-            )
-            if resolved is not None:
-                resolved_images.append(resolved)
+        total_bytes = 0
+        max_total_bytes = max(1, int(self.settings.vision_max_total_bytes))
+        for resolved in candidates:
+            if resolved is None:
+                continue
+            raw_size = len(resolved.base64_data or "") * 3 // 4
+            if total_bytes + raw_size > max_total_bytes:
+                break
+            resolved_images.append(resolved)
+            total_bytes += raw_size
 
         if not resolved_images:
             if logger.isEnabledFor(logging.DEBUG):
@@ -225,106 +352,40 @@ class VisionPipeline:
 
         image_hashes = [img.sha256 for img in resolved_images]
         cache_key = "|".join([task_type.value, user_text.strip()[:512], *image_hashes])
+        force_refresh = is_fresh_analysis_requested(state.request)
 
-        if cache_key in self._cache:
-            cached = self._cache[cache_key].model_copy(deep=True)
-            cached.cleaned_messages = cleaned_messages
-            cached.cache_hit = True
-            return cached
-
-        system_prompt = build_vision_system_prompt(
-            task_type=task_type,
-            image_count=len(resolved_images),
-            user_text=user_text,
-        )
-
-        user_prompt = (
-            user_text.strip()
-            if user_text.strip()
-            else "Analyse the attached image(s) and return structured technical context."
-        )
-        if logger.isEnabledFor(logging.DEBUG):
-            payload_encoded_lengths = [len(img.base64_data or "") for img in resolved_images]
-            payload_raw_sizes = [len(base64.b64decode(img.base64_data)) for img in resolved_images]
-            payload_mime_types = [img.mime_type for img in resolved_images]
-
-            logger.debug(
-                "VISION PAYLOAD CREATED request_id=%s model=%s payload_image_count=%d payload_image_source=%s payload_mime=%s payload_raw_size=%s payload_encoded_length=%s prompt_length=%d",
-                request_id,
-                self.settings.vision_model_name,
-                len(resolved_images),
-                request_image_sources,
-                payload_mime_types,
-                payload_raw_sizes,
-                payload_encoded_lengths,
-                len(user_prompt),
-            )
-
-        # Build OpenAI-compatible multimodal messages via the centralized
-        # assembler. Exactly one SYSTEM message is emitted and the latest user
-        # request (including image parts) becomes a real USER message.
-        user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
-        for img in resolved_images:
-            user_parts.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{img.mime_type};base64,{img.base64_data}"},
-                }
-            )
-        chat_messages: list[ChatMessage] = build_conversation(
-            system_prompt=system_prompt,
-            latest_user_message=user_parts,
-        )
+        async with self._cache_lock:
+            cached = None if force_refresh else self._cache_get(cache_key)
+            if cached is not None:
+                cached.cleaned_messages = cleaned_messages
+                cached.cache_hit = True
+                return cached
+            task = None if force_refresh else self._inflight.get(cache_key)
+            owner = task is None
+            if task is None:
+                task = asyncio.create_task(
+                    self._analyze_resolved_images(
+                        task_type=task_type,
+                        user_text=user_text,
+                        resolved_images=resolved_images,
+                        image_hashes=image_hashes,
+                        cleaned_messages=cleaned_messages,
+                        request_id=request_id,
+                        request_image_sources=request_image_sources,
+                    ),
+                    name=f"vision-analysis-{request_id or 'request'}",
+                )
+                self._inflight[cache_key] = task
 
         try:
-            # Use the generic OpenAI-compatible llama.cpp client for inference.
-            response = await self.model_client.chat(
-                model=self.settings.vision_model_name,
-                messages=chat_messages,
-                temperature=0.15,
-                max_tokens=1200,
-                stream=False,
-            )
-            raw_content = extract_assistant_text(response.content)
+            result = await asyncio.shield(task)
+        finally:
+            if owner:
+                async with self._cache_lock:
+                    if self._inflight.get(cache_key) is task:
+                        self._inflight.pop(cache_key, None)
 
-            analysis = self._parse_analysis(
-                task_type=task_type,
-                image_count=len(resolved_images),
-                hashes=image_hashes,
-                raw_text=raw_content,
-            )
-
-            context_markdown = render_vision_context(analysis)
-
-            result = VisionResult(
-                analysis=analysis,
-                context_markdown=context_markdown,
-                cleaned_messages=cleaned_messages,
-                image_hashes=image_hashes,
-                cache_hit=False,
-            )
-
-            self._cache[cache_key] = result.model_copy(deep=True)
-            return result
-
-        except Exception as exc:
-            logger.exception("Vision pipeline failed: %s", exc)
-            return VisionResult(
-                analysis=self._build_fallback_analysis(
-                    task_type=task_type,
-                    image_count=len(resolved_images),
-                    hashes=image_hashes,
-                    raw_text=str(exc),
-                ),
-                context_markdown=render_vision_context(
-                    self._build_fallback_analysis(
-                        task_type=task_type,
-                        image_count=len(resolved_images),
-                        hashes=image_hashes,
-                        raw_text=str(exc),
-                    )
-                ),
-                cleaned_messages=cleaned_messages,
-                image_hashes=image_hashes,
-                cache_hit=False,
-            )
+        result = result.model_copy(deep=True)
+        result.cleaned_messages = cleaned_messages
+        result.cache_hit = not owner
+        return result

@@ -8,7 +8,7 @@ from orchestrator.models.state import OrchestratorState
 from orchestrator.streaming.publisher import StreamPublisher
 
 from ..common.enums import ChatRole, SpecialistType
-from ..common.utils import _extract_json_object
+from .parsing import extract_json_object
 from ..context.assembler import build_conversation
 from ..context.builder import (
     build_controller_messages,
@@ -19,11 +19,12 @@ from ..context.builder import (
 )
 from ..context.conversation_evidence import render_reusable_evidence_summary
 from ..context.conversation_state import render_conversation_state
+from ..context.memory import build_memory_context, render_memory_context
 from ..context.parser import estimate_text_tokens, split_conversation
 from ..logging import get_logger
 from ..models.chat import ChatMessage
 from ..models.manager import ModelManager
-from ..models.ollama import (
+from ..models.generation import (
     ModelGenerationResponse,
     extract_assistant_text,
     normalize_generation_response,
@@ -148,8 +149,13 @@ def _bool_from_any(value: Any) -> bool:
 
 def _request_messages(
         state: OrchestratorState,
+        settings: Settings,
     ) -> list[ChatMessage]:
-    return list(state.request.messages)
+    return build_memory_context(
+        state,
+        settings,
+        token_budget=min(settings.max_context_history_tokens, settings.max_model_context_tokens),
+    ).history_messages
 
 
 def _response_text(response: Any) -> str:
@@ -405,14 +411,20 @@ class ControllerEngine:
         request_context = render_request_context(state.request)
         conversation_context = render_conversation_state(state.conversation)
         reusable_evidence_context = render_reusable_evidence_summary(state)
+        memory_context = render_memory_context(
+            state,
+            self.settings,
+            token_budget=min(self.settings.planner_context_tokens, self.settings.max_model_context_tokens),
+        )
 
         messages = build_controller_messages(
             system_prompt=system_prompt,
-            messages=_request_messages(state),
+            messages=_request_messages(state, self.settings),
             request_context=request_context,
             additional_context="\n\n".join(
-                part for part in (conversation_context, reusable_evidence_context) if part
+                part for part in (conversation_context, reusable_evidence_context, memory_context) if part
             ),
+            token_budget=min(self.settings.planner_context_tokens, self.settings.max_model_context_tokens),
         )
 
         logger.debug(
@@ -440,7 +452,7 @@ class ControllerEngine:
 
         raw_content = _response_text(response)
         _log_planner_response(raw_content)
-        parsed = _extract_json_object(raw_content)
+        parsed = extract_json_object(raw_content)
         if not isinstance(parsed, dict):
             parsed = {}
 
@@ -511,9 +523,10 @@ class ControllerEngine:
 
         validation_messages = build_controller_messages(
             system_prompt=build_controller_validation_prompt(),
-            messages=_request_messages(state),
+            messages=_request_messages(state, self.settings),
             request_context=render_request_context(state.request),
-            structured_context=render_structured_context(state),
+            structured_context=render_structured_context(state, self.settings),
+            token_budget=min(self.settings.validation_context_tokens, self.settings.max_model_context_tokens),
         )
 
         response = await self.models.client("controller").chat(
@@ -526,7 +539,7 @@ class ControllerEngine:
         )
 
         raw_content = response.content or response.raw or "{}"
-        parsed = _extract_json_object(raw_content)
+        parsed = extract_json_object(raw_content)
         if not isinstance(parsed, dict):
             parsed = {}
 
@@ -564,20 +577,25 @@ class ControllerEngine:
         state: OrchestratorState,
         publisher: StreamPublisher | None = None,
     ) -> ModelGenerationResponse:
-        finalizer_context = build_finalize_context(state)
+        finalizer_context = build_finalize_context(state, settings=self.settings)
 
         context_json = json.dumps(
             finalizer_context,
             separators=(",", ":"),
             ensure_ascii=False,
+            # Finalizer context is an internal prompt boundary. Keep a
+            # malformed/legacy checkpoint metadata value from taking down the
+            # completed specialist response.
+            default=str,
         )
 
         finalizer_prompt = build_controller_final_prompt()
 
         messages = build_finalizer_messages(
             system_prompt=finalizer_prompt,
-            messages=_request_messages(state),
+            messages=_request_messages(state, self.settings),
             evidence_context=context_json,
+            token_budget=min(self.settings.finalizer_context_tokens, self.settings.max_model_context_tokens),
         )
 
         logger.debug(
@@ -647,7 +665,7 @@ class ControllerEngine:
         self,
         state: OrchestratorState,
     ) -> ModelGenerationResponse:
-        structured_context = render_structured_context(state)
+        structured_context = render_structured_context(state, self.settings)
         latest_user_message = state.request.user_message
 
         # Build conversation history through the single authoritative
@@ -656,7 +674,15 @@ class ControllerEngine:
         # Reasoning Specialist consistent with every other orchestrator node.
         history_messages: list[ChatMessage] = []
         try:
-            history_messages, _, _ = split_conversation(state.request.messages)
+            memory_context = build_memory_context(
+                state,
+                self.settings,
+                token_budget=min(self.settings.reasoning_context_tokens, self.settings.max_model_context_tokens),
+            )
+            history_messages, _, _ = split_conversation(
+                memory_context.history_messages,
+                token_budget=min(self.settings.reasoning_context_tokens, self.settings.max_model_context_tokens),
+            )
         except ValueError:
             history_messages = []
 

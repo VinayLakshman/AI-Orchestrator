@@ -99,17 +99,6 @@ class ConversationContextInfo:
     # exceed the budget.
     budget_breached_by_current_user: bool = False
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "messages_examined": self.messages_examined,
-            "messages_included": self.messages_included,
-            "estimated_tokens": self.estimated_tokens,
-            "budget": self.budget,
-            "truncated": self.truncated,
-            "budget_breached_by_current_user": self.budget_breached_by_current_user,
-        }
-
-
 class ConversationContextBuilder:
     """Deterministic, token-budget-driven conversation history builder.
 
@@ -214,19 +203,4 @@ class ConversationContextBuilder:
         )
 
         return history_chat_messages, info
-
-    # -- convenience / future-provenance ------------------------------------
-
-    def build_history(
-        self,
-        messages: Iterable[dict[str, Any] | ChatMessage] | None,
-        *,
-        exclude_roles: Iterable[str] | None = None,
-    ) -> list[ChatMessage]:
-        """Return only the trimmed history (convenience wrapper)."""
-        history, _ = self.build(
-            messages,
-            exclude_roles=exclude_roles,
-        )
-        return history
 

@@ -3,15 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class LlamaCppModelConfig(BaseModel):
-    """Endpoint + container metadata for a single llama.cpp model role."""
-
-    endpoint: str
-    container_name: str
 
 
 class Settings(BaseSettings):
@@ -86,6 +78,11 @@ class Settings(BaseSettings):
     # Vision pipeline
     vision_enabled: bool = True
     vision_max_images: int = 8
+    vision_max_image_bytes: int = 8 * 1024 * 1024
+    vision_max_total_bytes: int = 32 * 1024 * 1024
+    vision_max_dimension: int = 2048
+    vision_cache_max_items: int = 32
+    vision_cache_ttl_s: float = 1800.0
     vision_timeout_s: float = 300.0
     vision_fetch_base_url: str = "http://open-webui:8080"
     vision_inject_analysis_as_system: bool = True
@@ -94,17 +91,41 @@ class Settings(BaseSettings):
     mcp_enabled: bool = True
 
     # Checkpoint / storage
+    checkpoint_backend: Literal["memory", "sqlite"] = "memory"
     checkpoint_sqlite_path: str = "/data/checkpoints.sqlite3"
 
     # Runtime limits
     # Conversation-history token budget (NOT the total model context budget).
     # Conversation history is trimmed oldest-first until it fits this budget.
-    max_context_history_tokens: int = 12000
+    max_context_history_tokens: int = 3072
+    # Total input+output context target for the local model stack. Individual
+    # stages reserve part of this budget for generation.
+    max_model_context_tokens: int = 8192
+    planner_context_tokens: int = 6144
+    validation_context_tokens: int = 4096
+    finalizer_context_tokens: int = 6144
+    reasoning_context_tokens: int = 6144
+    adaptive_fast_paths: bool = True
+    adaptive_confidence_threshold: float = 0.75
+    legacy_execution_mode: bool = False
+    model_queue_timeout_s: float = 1800.0
     request_timeout_s: float = 300.0
+    stream_replay_max_events: int = 4096
+    vision_fetch_concurrency: int = 4
+
+    # Bounded ChatGPT-like follow-up memory. Memory is checkpointed only for
+    # callers that reuse a stable thread id.
+    conversation_memory_enabled: bool = True
+    conversation_memory_max_turns: int = 12
+    conversation_memory_recent_turns: int = 4
+    conversation_memory_max_tokens: int = 3072
+    conversation_memory_max_chars: int = 24000
+    conversation_memory_answer_max_chars: int = 6000
 
     # Feature flags
     enable_rag: bool = True
     enable_vision: bool = True
+    enable_streaming: bool = True
 
     # Image generation (delegated to Open WebUI)
     # Open WebUI is the single source of truth for all image-generation
@@ -156,6 +177,7 @@ class Settings(BaseSettings):
     conversation_evidence_max_items: int = 12
     conversation_evidence_max_content_length: int = 4000
     conversation_evidence_max_total_chars: int = 24000
+    conversation_active_resources_max_items: int = 32
 
     @property
     def reasoning_think(self) -> bool:

@@ -9,7 +9,7 @@ from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import normalize_query
 from ..common.enums import ControllerAction, KnowledgeServicePolicy, SpecialistType
 from ..common.constants import FALLBACK_NO_ANSWER
-from ..common.utils import _extract_json_object
+from ..controller.parsing import extract_json_object
 from ..context.assembler import build_conversation
 from ..context.conversation_evidence import (
     lookup_document_evidence,
@@ -37,7 +37,7 @@ from ..models.evidence import (
     VisionEvidence,
     WebEvidence,
 )
-from ..models.ollama import extract_assistant_text
+from ..models.generation import extract_assistant_text
 from ..models.state import DebugState, OrchestratorState, ResponseState
 from ..context.conversation_state import (
     merge_request_resources,
@@ -46,6 +46,8 @@ from ..context.conversation_state import (
     record_thread,
     update_topic,
 )
+from ..context.memory import build_memory_context, commit_conversation_turn
+from ..preprocessing.conversation_resolver import resolve_conversation_context
 from ..models.execution import (
     ExecutionState,
     RetryState,
@@ -96,18 +98,36 @@ def _sanitize_retrieval_query(value: Any, *, max_chars: int = _KNOWLEDGE_RETRIEV
 
 def _fallback_retrieval_query(user_message: str, *, max_chars: int = _KNOWLEDGE_RETRIEVAL_QUERY_MAX_CHARS) -> str:
     candidate = " ".join((user_message or "").split())
-    return _sanitize_retrieval_query(candidate, max_chars=max_chars)
+    if not candidate:
+        return ""
+    if len(candidate) > max_chars:
+        candidate = candidate[: max_chars - 1].rstrip() + "…"
+    return candidate
 
 
 async def _derive_retrieval_query(
     state: OrchestratorState,
     controller: ControllerEngine | None,
+    settings: Settings,
+    *,
+    force_model: bool = False,
 ) -> tuple[str, str, str]:
     user_message = _request_user_text(state)
     fallback_query = _fallback_retrieval_query(user_message)
 
     if not user_message.strip():
         return "", "empty", "empty_request"
+
+    # A normalized user question is already a usable retrieval query. Avoid a
+    # second controller call on the common path; the model rewrite remains
+    # available when adaptive mode is disabled or no safe query exists.
+    if (
+        settings.adaptive_fast_paths
+        and not settings.legacy_execution_mode
+        and fallback_query
+        and not force_model
+    ):
+        return fallback_query, "direct", "adaptive_fast_path"
 
     if controller is None:
         if fallback_query:
@@ -349,8 +369,11 @@ def make_prepare_node(settings: Settings):
         # requests sharing the same thread_id. It is intentionally NOT reset.
         request = state.request
         conversation = record_thread(state.conversation, request.thread_id)
-        conversation = update_topic(conversation, request)
-        conversation = merge_request_resources(conversation, request)
+        conversation = merge_request_resources(
+            conversation,
+            request,
+            max_items=settings.conversation_active_resources_max_items,
+        )
         state.conversation = conversation
 
         # conversation_evidence is conversation-level reusable specialist
@@ -373,6 +396,69 @@ def make_prepare_node(settings: Settings):
         return state
 
     return prepare_node
+
+
+def make_conversation_resolve_node(
+    controller: ControllerEngine,
+    settings: Settings,
+    client_registry: Any,
+):
+    """Resolve follow-ups after checkpoint state has been restored."""
+
+    async def resolve_node(state: OrchestratorState) -> OrchestratorState:
+        request = state.request
+        existing_resolution = request.metadata.get("conversation_resolution")
+        has_route_resolution = isinstance(existing_resolution, dict)
+
+        if has_route_resolution and (
+            settings.legacy_execution_mode or bool(existing_resolution.get("applied"))
+        ):
+            state.conversation = update_topic(state.conversation, request)
+            return state
+
+        memory_context = build_memory_context(
+            state,
+            settings,
+            token_budget=min(
+                settings.max_context_history_tokens,
+                settings.max_model_context_tokens,
+            ),
+        )
+        # The resolver accepts the existing RequestState contract. Supplying a
+        # merged, sanitized message list lets it resolve latest-only requests
+        # from checkpoint memory without exposing raw attachments.
+        resolver_request = request.model_copy(
+            update={"messages": memory_context.history_messages}
+        )
+        try:
+            resolved = await resolve_conversation_context(
+                resolver_request,
+                settings=settings,
+                model_manager=controller.models,
+                client_registry=client_registry,
+            )
+            state.request = resolved.request
+        except Exception:
+            logger.exception("checkpoint_conversation_resolution_failed")
+            state.request = resolver_request
+
+        state.request.metadata = {
+            **state.request.metadata,
+            "conversation_context_source": memory_context.source,
+            "conversation_context_turns": memory_context.selected_turns,
+            "conversation_context_truncated": memory_context.truncated,
+        }
+        state.conversation = update_topic(state.conversation, state.request)
+        return state
+
+    return resolve_node
+
+
+def make_commit_conversation_node(settings: Settings):
+    async def commit_node(state: OrchestratorState) -> OrchestratorState:
+        return commit_conversation_turn(state, settings)
+
+    return commit_node
 
 
 def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
@@ -410,7 +496,9 @@ def make_controller_plan_node(controller: ControllerEngine, settings: Settings):
         execution.runtime.metadata["controller_model"] = controller.models.controller().name
         state.execution = execution
 
-        state.debug.planner_prompt = build_controller_plan_prompt()
+        # Keep checkpointed debug state compact; the static prompt is available
+        # from the source and need not be persisted per request.
+        state.debug.planner_prompt = "controller_plan_prompt"
         state.debug.planner_response = plan.model_dump(exclude_none=True)
 
         _log_transition(
@@ -492,7 +580,7 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             return state
 
         analysis = result.analysis
-        summary = str(getattr(analysis, "summary", "") or "").strip()
+        summary = _truncate(str(getattr(analysis, "summary", "") or "").strip(), 1200)
         observations = _compact_lines(
             str(getattr(analysis, "observations", "") or getattr(analysis, "answer_context", "") or summary),
             max_items=8,
@@ -502,9 +590,12 @@ def make_vision_node(vision_pipeline: VisionPipeline, settings: Settings):
             task=str(getattr(analysis, "task_type", "") and getattr(analysis.task_type, "value", analysis.task_type) or "").strip() or None,
             confidence=float(getattr(analysis, "confidence", 0.0) or 0.0),
             summary=summary,
-            context=str(result.context_markdown or ""),
+            context=_truncate(str(result.context_markdown or ""), 5000),
             observations=observations,
-            extracted_text=str(getattr(analysis, "ocr", "") or getattr(analysis, "raw_text", "") or result.context_markdown or ""),
+            extracted_text=_truncate(
+                str(getattr(analysis, "ocr", "") or getattr(analysis, "raw_text", "") or result.context_markdown or ""),
+                4000,
+            ),
             detected_objects=[],
             metadata={
                 "cache_hit": bool(result.cache_hit),
@@ -613,7 +704,11 @@ def make_knowledge_node(
             _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
             return state
 
-        retrieval_query, retrieval_query_source, retrieval_query_status = await _derive_retrieval_query(state, controller)
+        retrieval_query, retrieval_query_source, retrieval_query_status = await _derive_retrieval_query(
+            state,
+            controller,
+            settings,
+        )
         if not retrieval_query:
             evidence.repository = RepositoryEvidence(
                 repository=None,
@@ -649,19 +744,97 @@ def make_knowledge_node(
         if stream:
             await stream.knowledge_started(query=retrieval_query[:200])
 
-        result = await knowledge_client.retrieve(
-            question=retrieval_query,
-            top_k=settings.knowledge_top_k,
-            candidate_limit=settings.knowledge_candidate_limit,
-            neighbor_window=settings.knowledge_neighbor_window,
-        )
+        try:
+            result = await knowledge_client.retrieve(
+                question=retrieval_query,
+                top_k=settings.knowledge_top_k,
+                candidate_limit=settings.knowledge_candidate_limit,
+                neighbor_window=settings.knowledge_neighbor_window,
+            )
+        except Exception as exc:
+            # Retrieval is optional evidence. Preserve graceful degradation and
+            # let the existing validation/finalization path continue.
+            logger.warning("knowledge_retrieval_failed_continuing_to_finalize", exc_info=True)
+            evidence.repository = RepositoryEvidence(
+                repository=None,
+                branch=None,
+                commit=None,
+                question=retrieval_query,
+                retrieval_reason="knowledge service unavailable",
+                confidence=0.0,
+                context="",
+                hit_count=0,
+                primary_hits=[],
+                expanded_hits=[],
+                metadata={
+                    "status": "failed",
+                    "reason": "knowledge_service_unavailable",
+                    "error": str(exc)[:500],
+                    "retrieval_query": retrieval_query,
+                    "retrieval_query_source": retrieval_query_source,
+                },
+            )
+            execution = _advance_runtime(
+                execution,
+                SpecialistType.KNOWLEDGE,
+                success=False,
+                error="knowledge_service_unavailable",
+            )
+            state.execution = execution
+            _log_transition("specialist_complete", specialist=SpecialistType.KNOWLEDGE.value, **_state_snapshot(state))
+            _update_used_tools(state, "knowledge.retrieve")
+            return state
+
+        # Only spend another controller call when deterministic retrieval did
+        # not produce useful evidence. This preserves the fast path while
+        # retaining the old rewrite/retry behavior for difficult queries.
+        if (
+            settings.adaptive_fast_paths
+            and not settings.legacy_execution_mode
+            and retrieval_query_source == "direct"
+            and controller is not None
+            and not (
+                getattr(result, "primary_hits", None)
+                or getattr(result, "expanded_hits", None)
+                or str(getattr(result, "context", "") or "").strip()
+            )
+        ):
+            rewritten_query, rewritten_source, rewritten_status = await _derive_retrieval_query(
+                state,
+                controller,
+                settings,
+                force_model=True,
+            )
+            if rewritten_query and rewritten_query != retrieval_query:
+                try:
+                    rewritten_result = await knowledge_client.retrieve(
+                        question=rewritten_query,
+                        top_k=settings.knowledge_top_k,
+                        candidate_limit=settings.knowledge_candidate_limit,
+                        neighbor_window=settings.knowledge_neighbor_window,
+                    )
+                    result = rewritten_result
+                    retrieval_query = rewritten_query
+                    retrieval_query_source = rewritten_source
+                    retrieval_query_status = rewritten_status
+                    execution.runtime.metadata["knowledge_retrieval_query"] = retrieval_query
+                    execution.runtime.metadata["knowledge_retrieval_query_source"] = retrieval_query_source
+                    execution.runtime.metadata["knowledge_retrieval_query_status"] = retrieval_query_status
+                except Exception:
+                    logger.warning("knowledge_retrieval_rewrite_retry_failed", exc_info=True)
 
         if stream:
             sources = [f"{hit.repository}:{hit.path}" for hit in (result.primary_hits or [])[:3]]
             await stream.knowledge_finished(documents=len(result.primary_hits or []), sources=sources)
 
-        primary_hits = [hit.model_dump(exclude_none=True) if hasattr(hit, "model_dump") else hit for hit in (result.primary_hits or [])]
-        expanded_hits = [hit.model_dump(exclude_none=True) if hasattr(hit, "model_dump") else hit for hit in (result.expanded_hits or [])]
+        primary_hits = [
+            hit.model_dump(exclude_none=True) if hasattr(hit, "model_dump") else hit
+            for hit in (result.primary_hits or [])[: settings.knowledge_top_k]
+        ]
+        expanded_hits = [
+            hit.model_dump(exclude_none=True) if hasattr(hit, "model_dump") else hit
+            for hit in (result.expanded_hits or [])[: settings.knowledge_candidate_limit]
+        ]
 
         evidence.repository = RepositoryEvidence(
             repository=(primary_hits[0].get("repository") if primary_hits else None),
@@ -670,7 +843,7 @@ def make_knowledge_node(
             question=str(getattr(result, "question", "") or retrieval_query),
             retrieval_reason=str(getattr(result, "retrieval_reason", "") or ""),
             confidence=float(getattr(result, "confidence", 0.0) or 0.0),
-            context=str(getattr(result, "context", "") or ""),
+            context=_truncate(str(getattr(result, "context", "") or ""), 6000),
             hit_count=len(primary_hits),
             primary_hits=primary_hits,
             expanded_hits=expanded_hits,
@@ -796,14 +969,14 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
                     search_time_ms=int(getattr(result, "search_time_ms", 0) or 0),
                 )
 
-        results = list(getattr(result, "results", []) or [])
+        results = list(getattr(result, "results", []) or [])[: settings.web_search_max_results]
         evidence.web = WebEvidence(
             query=str(getattr(result, "query", "") or query),
             confidence=0.0,
             summary=_summarize_web_results(results),
             results=[item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item for item in results],
             snippets=[
-                str(item.snippet).strip()
+                _truncate(str(item.snippet).strip(), 800)
                 for item in results
                 if item.snippet
             ],
@@ -835,7 +1008,7 @@ def make_web_node(web_specialist: WebSpecialist, settings: Settings):
     return web_node
 
 
-def _build_coder_prompt(state: OrchestratorState) -> list[ChatMessage]:
+def _build_coder_prompt(state: OrchestratorState, settings: Settings) -> list[ChatMessage]:
     execution = state.execution
     evidence = state.evidence
 
@@ -983,12 +1156,15 @@ Do not expose internal reasoning.
     return build_conversation(
         system_prompt=system_prompt,
         structured_context="\n\n".join(structured_sections),
-        history=_coder_history(state),
+        history=_coder_history(
+            state,
+            settings,
+        ),
         latest_user_message=_request_user_text(state),
     )
 
 
-def _coder_history(state: OrchestratorState) -> list[ChatMessage]:
+def _coder_history(state: OrchestratorState, settings: Settings) -> list[ChatMessage]:
     """Recover conversation history for the coder.
 
     The coder is a specialist operating inside the orchestration graph. It
@@ -997,7 +1173,15 @@ def _coder_history(state: OrchestratorState) -> list[ChatMessage]:
     treated purely as history.
     """
     try:
-        history_messages, _, _ = split_conversation(state.request.messages)
+        memory_context = build_memory_context(
+            state,
+            settings,
+            token_budget=min(settings.max_context_history_tokens, settings.max_model_context_tokens),
+        )
+        history_messages, _, _ = split_conversation(
+            memory_context.history_messages,
+            token_budget=min(settings.max_context_history_tokens, settings.max_model_context_tokens),
+        )
         return history_messages
     except ValueError:
         return []
@@ -1015,7 +1199,7 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
         if stream:
             await stream.code_started(model=settings.coder_model_name)
 
-        messages = _build_coder_prompt(state)
+        messages = _build_coder_prompt(state, settings)
 
         response = await controller.models.client("coder").chat(
             model=settings.coder_model_name,
@@ -1026,7 +1210,7 @@ def make_coder_node(controller: ControllerEngine, settings: Settings):
         )
 
         text = extract_assistant_text(response.content) or extract_assistant_text(response.raw) or ""
-        parsed = _extract_json_object(text)
+        parsed = extract_json_object(text)
         if not isinstance(parsed, dict):
             parsed = {}
 
@@ -1087,6 +1271,24 @@ def make_tools_node(settings: Settings):
             _log_transition("specialist_complete", specialist=SpecialistType.TOOLS.value, **_state_snapshot(state))
             return state
 
+        if not settings.mcp_enabled:
+            evidence.tools = ToolEvidence(
+                executions=[],
+                metadata={
+                    "status": "disabled",
+                    "message": "Tool execution is disabled by configuration.",
+                },
+            )
+            execution = _advance_runtime(
+                execution,
+                SpecialistType.TOOLS,
+                success=False,
+                error="tools_disabled",
+            )
+            state.execution = execution
+            _log_transition("specialist_complete", specialist=SpecialistType.TOOLS.value, **_state_snapshot(state))
+            return state
+
         executions: list[dict[str, Any]] = []
         for request in tool_requests:
             req = request.model_dump(exclude_none=True) if hasattr(request, "model_dump") else dict(request)
@@ -1106,16 +1308,20 @@ def make_tools_node(settings: Settings):
         evidence.tools = ToolEvidence(
             executions=executions,
             metadata={
-                "status": "planned",
+                "status": "planned_not_executed",
                 "message": "Controller produced tool requests. Execution is not implemented yet.",
             },
         )
 
-        execution = _advance_runtime(execution, SpecialistType.TOOLS, success=True)
+        execution = _advance_runtime(
+            execution,
+            SpecialistType.TOOLS,
+            success=False,
+            error="tool_execution_not_implemented",
+        )
         state.execution = execution
         state.conversation = record_specialist_success(state.conversation, SpecialistType.TOOLS)
         _log_transition("specialist_complete", specialist=SpecialistType.TOOLS.value, **_state_snapshot(state))
-        _update_used_tools(state, "mcp.plan")
         return state
 
     return tools_node
@@ -1166,7 +1372,7 @@ def make_controller_validate_node(controller: ControllerEngine, settings: Settin
         execution.runtime.metadata["validation_summary"] = validation.summary
         execution.runtime.metadata["controller_model"] = controller.models.controller().name
         state.execution = execution
-        state.debug.validator_prompt = build_controller_validation_prompt()
+        state.debug.validator_prompt = "controller_validation_prompt"
         state.debug.validator_response = validation.model_dump(exclude_none=True)
 
         # Emit validation complete

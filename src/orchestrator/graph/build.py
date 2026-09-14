@@ -3,18 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-import httpx
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from ..clients.llama_cpp import LlamaCppClient
 from ..clients.knowledge import KnowledgeClient
 from ..clients.searxng import SearXNGClient
 from ..clients.registry import ClientRegistry
 from ..controller.engine import ControllerEngine
 from ..models.manager import ModelManager
-from ..runtime.model_provider import ModelProvider
-
 from ..models.state import OrchestratorState
 from ..logging import get_logger
 from ..settings import Settings
@@ -23,22 +19,25 @@ from ..streaming.hub import StreamHub
 from ..vision.pipeline import VisionPipeline
 from .image_generation import make_image_generation_node
 from .nodes import (
-    make_clarify_node,
     make_controller_plan_node,
     make_controller_validate_node,
-    make_coder_node,
-    make_finalize_node,
-    make_knowledge_node,
-    make_web_node,
+    make_commit_conversation_node,
+    make_conversation_resolve_node,
     make_prepare_node,
-    make_reasoning_node,
-    make_tools_node,
-    make_vision_node,
     _state_snapshot,
-
     _log_transition,
 )
 from .instrumentation import timed_node
+from .specialists import (
+    make_clarify_node,
+    make_coder_node,
+    make_finalize_node,
+    make_knowledge_node,
+    make_reasoning_node,
+    make_tools_node,
+    make_vision_node,
+    make_web_node,
+)
 
 
 CheckpointerKind = Literal["memory", "sqlite"]
@@ -148,7 +147,21 @@ class OrchestratorRuntime:
 
     async def close(self) -> None:
         """Close runtime-owned transports exactly once."""
+        # Stop lifecycle activity before closing transports used by its
+        # readiness and GPU-release paths.
+        close_lifecycle = getattr(self.model_lifecycle, "close", None)
+        if close_lifecycle is not None:
+            await close_lifecycle()
+
         clients = [self.knowledge_client.client, *self.client_registry.clients()]
+
+        # Managed role views intentionally do not own the shared router
+        # transport. Close that transport exactly once through the underlying
+        # LlamaCppClient.
+        for client in self.client_registry.clients():
+            underlying = getattr(client, "underlying_client", None)
+            if underlying is not None:
+                clients.append(underlying)
 
         if self.searxng_client is not None:
             clients.append(self.searxng_client.client)
@@ -160,10 +173,15 @@ class OrchestratorRuntime:
             if client is None or id(client) in closed:
                 continue
             closed.add(id(client))
-            await client.aclose()
+            close = getattr(client, "aclose", None)
+            if close is not None:
+                await close()
 
 
 def build_checkpointer(settings: Settings) -> tuple[Any, CheckpointerKind]:
+    if settings.checkpoint_backend == "memory":
+        return MemorySaver(), "memory"
+
     sqlite_path = settings.checkpoint_sqlite_path.strip()
 
     try:
@@ -177,8 +195,11 @@ def build_checkpointer(settings: Settings) -> tuple[Any, CheckpointerKind]:
             conn_string = f"sqlite:///{sqlite_path}"
 
         return SqliteSaver.from_conn_string(conn_string), "sqlite"
-    except Exception:
-        return MemorySaver(), "memory"
+    except Exception as exc:
+        raise RuntimeError(
+            "CHECKPOINT_BACKEND=sqlite was requested, but the SQLite LangGraph "
+            "checkpointer dependency or configuration is unavailable"
+        ) from exc
 
 
 def build_graph(
@@ -198,6 +219,11 @@ def build_graph(
     )
 
     prepare_node = make_prepare_node(settings)
+    resolve_node = make_conversation_resolve_node(
+        controller,
+        settings,
+        client_registry,
+    )
     plan_node = make_controller_plan_node(controller, settings)
     vision_node = make_vision_node(vision_pipeline, settings)
 
@@ -217,8 +243,10 @@ def build_graph(
 
     clarify_node = make_clarify_node()
     finalize_node = make_finalize_node(controller, settings)
+    commit_node = make_commit_conversation_node(settings)
 
     prepare_node = timed_node("prepare", prepare_node, display_name="Prepare")
+    resolve_node = timed_node("conversation_resolution", resolve_node, display_name="Conversation Resolution")
     plan_node = timed_node("planner", plan_node, display_name="Planner")
     vision_node = timed_node("vision", vision_node, display_name="Vision")
     knowledge_node = timed_node("knowledge", knowledge_node, display_name="Knowledge")
@@ -230,8 +258,10 @@ def build_graph(
     image_generation_node = timed_node("image_generation", image_generation_node, display_name="Image Generation")
     clarify_node = timed_node("clarify", clarify_node, display_name="Clarification")
     finalize_node = timed_node("finalize", finalize_node, display_name="Finalizer")
+    commit_node = timed_node("conversation_commit", commit_node, display_name="Conversation Commit")
 
     builder.add_node("prepare", prepare_node)
+    builder.add_node("conversation_resolution", resolve_node)
     builder.add_node("plan", plan_node)
     builder.add_node("vision", vision_node)
     builder.add_node("knowledge", knowledge_node)
@@ -243,9 +273,11 @@ def build_graph(
     builder.add_node("image_generation", image_generation_node)
     builder.add_node("clarify", clarify_node)
     builder.add_node("finalize", finalize_node)
+    builder.add_node("conversation_commit", commit_node)
 
     builder.add_edge(START, "prepare")
-    builder.add_edge("prepare", "plan")
+    builder.add_edge("prepare", "conversation_resolution")
+    builder.add_edge("conversation_resolution", "plan")
 
     def _next_node(state: OrchestratorState) -> str:
         # DEBUG: trace runtime queue -> selected node
@@ -312,6 +344,33 @@ def build_graph(
 
         return selected
 
+    def route_after_specialist(state: OrchestratorState) -> str:
+        """Skip validation only for a proven, single-step success.
+
+        Multi-specialist, low-confidence, failed, and legacy executions retain
+        the existing validator/retry path. This keeps quality-sensitive and
+        fallback behavior unchanged while removing one controller round trip
+        from the common simple-request path.
+        """
+        plan = state.execution.plan
+        runtime = state.execution.runtime
+        eligible = (
+            settings.adaptive_fast_paths
+            and not settings.legacy_execution_mode
+            and len(runtime.queue) == 1
+            and float(plan.confidence or 0.0) >= settings.adaptive_confidence_threshold
+            and runtime.metadata.get("last_status") == "success"
+        )
+        selected = _next_node(state) if eligible else "validate"
+        state.execution.runtime.metadata["validation_fast_path"] = bool(eligible)
+        _log_transition(
+            "route_after_specialist",
+            selected_next_node=selected,
+            validation_fast_path=bool(eligible),
+            **_state_snapshot(state),
+        )
+        return selected
+
     builder.add_conditional_edges(
         "plan",
         route_after_plan,
@@ -328,11 +387,23 @@ def build_graph(
         },
     )
 
-    builder.add_edge("vision", "validate")
-    builder.add_edge("knowledge", "validate")
-    builder.add_edge("web", "validate")
-    builder.add_edge("coder", "validate")
-    builder.add_edge("tools", "validate")
+    specialist_route_map = {
+        "vision": "vision",
+        "knowledge": "knowledge",
+        "web": "web",
+        "coder": "coder",
+        "tools": "tools",
+        "validate": "validate",
+        "finalize": "finalize",
+        "clarify": "clarify",
+        "reasoning": "reasoning",
+    }
+    for specialist_name in ("vision", "knowledge", "web", "coder", "tools"):
+        builder.add_conditional_edges(
+            specialist_name,
+            route_after_specialist,
+            specialist_route_map,
+        )
 
     # Image generation is a TERMINAL workload path. It must NOT fan out into
     # normal controller validation or normal textual finalization:
@@ -359,7 +430,7 @@ def build_graph(
     # whatever resource it needs through the normal lifecycle machinery.
     # graph_finished is published by the API layer only after this node
     # returns, so it cannot precede successful ComfyUI release.
-    builder.add_edge("image_generation", END)
+    builder.add_edge("image_generation", "conversation_commit")
 
     builder.add_conditional_edges(
         "validate",
@@ -377,8 +448,9 @@ def build_graph(
     )
 
     builder.add_edge("reasoning", "finalize")
-    builder.add_edge("clarify", END)
-    builder.add_edge("finalize", END)
+    builder.add_edge("clarify", "conversation_commit")
+    builder.add_edge("finalize", "conversation_commit")
+    builder.add_edge("conversation_commit", END)
 
     checkpointer, _kind = build_checkpointer(settings)
     graph = TypedGraphFacade(builder.compile(checkpointer=checkpointer))
@@ -386,125 +458,4 @@ def build_graph(
     return graph, checkpointer
 
 
-async def build_runtime(settings: Settings) -> OrchestratorRuntime:
-    logger.info("registering runtime dependencies")
-
-    from ..runtime.model_lifecycle import ModelLifecycle
-    from ..runtime.docker_runtime import DockerRuntime
-
-    # Create Docker runtime for EXISTING LLM container management only.
-    # Docker is never used for Open WebUI / ComfyUI GPU arbitration.
-    docker = DockerRuntime()
-
-    provider = ModelProvider(settings)
-
-    router_health_timeout = max(1.0, min(5.0, float(settings.health_timeout_s)))
-    async with httpx.AsyncClient(
-        base_url=provider.router_origin_url,
-        timeout=httpx.Timeout(router_health_timeout),
-        follow_redirects=False,
-    ) as health_client:
-        try:
-            response = await health_client.get("/health")
-            response.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Router health check failed at {provider.router_origin_url}/health"
-            ) from exc
-
-    knowledge_http = httpx.AsyncClient(
-        base_url=settings.knowledge_service_url,
-        timeout=settings.request_timeout_s,
-    )
-
-    client_registry = ClientRegistry()
-
-    # Register Open WebUI client (image-generation delegation boundary).
-    # Open WebUI owns all image-generation configuration; the orchestrator
-    # only calls its authenticated image-generation API.
-    openwebui_client = None
-    if settings.openwebui_base_url:
-        from ..clients.openwebui import OpenWebUIClient
-        openwebui_http = httpx.AsyncClient(
-            base_url=settings.openwebui_base_url,
-            timeout=max(settings.image_generation_timeout, 60.0),
-        )
-        openwebui_client = OpenWebUIClient(settings=settings, client=openwebui_http)
-        client_registry.register("openwebui", openwebui_client)
-
-    router_client = LlamaCppClient(
-        settings=settings,
-        base_url=provider.router_base_url,
-    )
-    for role in ("controller", "reasoning", "coder", "vision"):
-        client_registry.register(role, router_client)
-
-    knowledge_client = KnowledgeClient(settings=settings, client=knowledge_http)
-
-    searxng_client: SearXNGClient | None = None
-    if settings.web_search_enabled:
-        web_http = httpx.AsyncClient(
-            base_url=settings.web_search_url,
-            timeout=settings.web_search_timeout_s,
-        )
-        searxng_client = SearXNGClient(settings=settings, client=web_http)
-
-    model_manager = ModelManager(settings=settings, client_registry=client_registry, provider=provider)
-
-    controller = ControllerEngine(
-        settings=settings,
-        models=model_manager,
-    )
-
-    vision_fetch_http = httpx.AsyncClient(
-        base_url=settings.vision_fetch_base_url,
-        timeout=settings.vision_timeout_s,
-    )
-    vision_pipeline = VisionPipeline(
-        settings=settings,
-        client=vision_fetch_http,
-        model_client=client_registry.get("vision"),
-    )
-    stream_hub = StreamHub()
-
-    # ModelLifecycle depends on the fully constructed ModelManager, so it is
-    # created here — AFTER model_manager and BEFORE the graph/runtime that
-    # consume it (initialization order: settings -> DockerRuntime ->
-    # ModelManager -> ModelLifecycle -> graph -> OrchestratorRuntime).
-    model_lifecycle = ModelLifecycle(
-        settings=settings,
-        models=model_manager,
-        docker=docker,
-    )
-
-    graph, checkpointer = build_graph(
-        settings=settings,
-        controller=controller,
-        knowledge_client=knowledge_client,
-        client_registry=client_registry,
-        model_lifecycle=model_lifecycle,
-        vision_pipeline=vision_pipeline,
-        searxng_client=searxng_client,
-    )
-
-    runtime = OrchestratorRuntime(
-        settings=settings,
-        model_manager=model_manager,
-        controller=controller,
-        knowledge_client=knowledge_client,
-        model_lifecycle=model_lifecycle,
-        client_registry=client_registry,
-        vision_pipeline=vision_pipeline,
-        stream_hub=stream_hub,
-        graph=graph,
-        checkpointer=checkpointer,
-        searxng_client=searxng_client,
-    )
-    runtime.validate_dependencies()
-    logger.info(
-        "runtime dependency registration complete web_search=%s knowledge=%s vision=%s",
-        runtime.searxng_client is not None,
-        settings.enable_rag,
-        settings.enable_vision,
-    )
-    return runtime
+from .runtime_factory import build_runtime

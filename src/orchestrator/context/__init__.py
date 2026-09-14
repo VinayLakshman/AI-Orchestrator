@@ -9,6 +9,8 @@ This package is split into layers:
 - ``orchestrator.context.parser``: conversation parsing / history management
   (extracting the latest user message, preserving history, token budgeting).
   History trimming delegates to ConversationContextBuilder.
+- ``orchestrator.context.history``: the maintained history-facing import
+  boundary used by orchestration code.
 - ``orchestrator.context.assembler``: the single authoritative conversation
   assembly layer. It constructs valid outbound conversations from structured
   inputs and validates them against the core OpenAI-compatible invariants.
