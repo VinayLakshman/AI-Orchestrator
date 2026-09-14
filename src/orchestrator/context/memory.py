@@ -8,6 +8,7 @@ not a second evidence store and never persists raw attachments or debug data.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,7 +19,6 @@ from ..models.state import (
     ConversationTurn,
     OrchestratorState,
 )
-from ..request_normalizer import sanitize_controller_messages
 from ..settings import Settings
 from .conversation_builder import ConversationContextBuilder, estimate_text_tokens
 
@@ -46,11 +46,41 @@ def _truncate(value: str, limit: int) -> str:
     return value[: max(0, limit - 1)].rstrip() + "…"
 
 
+_DATA_URL_RE = re.compile(
+    r"data:[^,;]+(?:;[^,]*)?,[A-Za-z0-9+/=\s]+",
+    re.IGNORECASE,
+)
+
+
+def _safe_content(content: Any) -> str:
+    if isinstance(content, str):
+        return _DATA_URL_RE.sub("[Attachment Attached]", content)
+    if not isinstance(content, list):
+        return _text(content)
+
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").lower()
+        if item_type == "text":
+            text = _text(item.get("text") or item.get("content"))
+            if text:
+                parts.append(_DATA_URL_RE.sub("[Attachment Attached]", text))
+            continue
+        if "image" in item_type or "file" in item_type or "document" in item_type:
+            parts.append("[Attachment Attached]")
+            continue
+        value = item.get("text") or item.get("content")
+        if isinstance(value, str) and value.strip():
+            parts.append(_DATA_URL_RE.sub("[Attachment Attached]", value.strip()))
+    return "\n".join(parts).strip()
+
+
 def _safe_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
-    sanitized = sanitize_controller_messages(messages)
     result: list[ChatMessage] = []
-    for message in sanitized:
-        content = _truncate(_text(message.content), 6000)
+    for message in messages:
+        content = _truncate(_safe_content(message.content), 6000)
         result.append(message.model_copy(update={"content": content}))
     return result
 
