@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     max_context_chars: int = 24000
 
     api_key: str | None = None
-    require_auth: bool = True
+    require_auth: bool = False
 
     @property
     def model_router_url(self) -> str:

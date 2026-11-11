@@ -4,7 +4,7 @@
 
 This checkout previously implemented a FastAPI/LangGraph general-purpose orchestrator. It contained a client for an external Knowledge Service but no repository ingestion, Git handling, parser, chunker, embedding call, Qdrant integration, synchronization worker, or repository registry. The Knowledge Service source, deployment manifests, Qdrant configuration, collections, clones, and indexed data are not present in this repository.
 
-The implemented target keeps the Knowledge Service independent as the canonical owner of repository registration, Git access, indexing, embeddings, and Qdrant. Zion now provides the authenticated API/control and grounded-answer layer and uses llama-router's `expert` alias for answer generation. Current legacy `/retrieve` remains usable for unfiltered search and answers. Repository management operations target a new Knowledge Service v1 contract and require matching implementation in that separate service.
+The implemented target keeps the Knowledge Service independent as the canonical owner of repository registration, Git access, indexing, embeddings, and Qdrant. Zion provides the Open WebUI-facing OpenAI-compatible API and grounded-answer layer and uses llama-router's `expert` alias for answer generation. API-key authentication is disabled by default, matching the requested Open WebUI setup. Current legacy `/retrieve` remains usable for unfiltered search and answers. Repository management operations target a new Knowledge Service v1 contract and require matching implementation in that separate service.
 
 No Qdrant collection, volume, clone, credential, or external service was modified by this refactor.
 
@@ -73,7 +73,8 @@ The application had no API-key authentication. `/chat` exposed execution/evidenc
 
 ```mermaid
 flowchart LR
-    Hermes[Hermes / trusted client] --> Zion[Zion authenticated REST API]
+    OpenWebUI[Open WebUI] --> Zion[OpenAI-compatible Zion API]
+    Hermes[Hermes / trusted client] --> Zion
     Zion -->|register / status / sync / search| KS[Independent Knowledge Service]
     KS --> Git[Git providers and local clones]
     KS --> Parse[Parsing / chunking / metadata]
@@ -84,7 +85,7 @@ flowchart LR
     Zion -->|answer + citations| Hermes
 ```
 
-Zion owns HTTP authentication, request validation, API response shaping, retrieval-to-answer context assembly, expert-model calls, citations based on upstream metadata, metrics, and health. The Knowledge Service owns repository identity and credentials, Git clones, branch/commit synchronization, parser/chunker behavior, embedding generation, vector writes/deletes, and job state. Qdrant remains exclusively behind the Knowledge Service.
+Zion owns OpenAI-compatible request/response shaping, optional bearer authentication, retrieval-to-answer context assembly, expert-model calls, citations based on upstream metadata, metrics, and health. The Knowledge Service owns repository identity and credentials, Git clones, branch/commit synchronization, parser/chunker behavior, embedding generation, vector writes/deletes, and job state. Qdrant remains exclusively behind the Knowledge Service.
 
 Zion configuration is `ZION_LLM_BASE_URL=http://192.168.1.61:8081/v1`, `ZION_LLM_MODEL=expert`, `ZION_KNOWLEDGE_SERVICE_URL`, and `ZION_API_KEY`. Embedding configuration belongs to the Knowledge Service; do not duplicate it in Zion.
 
@@ -92,6 +93,8 @@ Zion configuration is `ZION_LLM_BASE_URL=http://192.168.1.61:8081/v1`, `ZION_LLM
 
 | Method and path | Purpose | Backend dependency |
 |---|---|---|
+| `GET /v1/models` | OpenAI-compatible model discovery, preserving historical IDs | Local |
+| `POST /v1/chat/completions` | OpenAI-compatible JSON/SSE completions with grounded RAG | Knowledge Service `/retrieve` and llama-router |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Operations | Local |
 | `GET /api/v1/repositories` | List | Knowledge Service v1 |
 | `POST /api/v1/repositories` | Register | Knowledge Service v1 |
@@ -103,19 +106,22 @@ Zion configuration is `ZION_LLM_BASE_URL=http://192.168.1.61:8081/v1`, `ZION_LLM
 | `POST /api/v1/search` | Search/hits/citations | Existing `/retrieve` for unfiltered requests |
 | `POST /api/v1/ask` | Grounded expert answer and structured citations | Existing `/retrieve` plus llama-router |
 
-All repository/search/ask endpoints require `Authorization: Bearer ...` by default. `ZION_REQUIRE_AUTH=false` is an explicit local-only override. Startup fails if auth is enabled and `ZION_API_KEY` is missing. Health, readiness, and metrics remain public for container probes.
+Routes accept unauthenticated requests by default. Set `ZION_REQUIRE_AUTH=true` and `ZION_API_KEY` to opt into bearer authentication. Health, readiness, and metrics remain public for container probes.
+
+The OpenAI endpoint accepts the prior `model`, `messages`, `stream`, `temperature`, `max_tokens`, `params`, and `metadata` fields; echoes the requested model ID; honors thread identity from `X-Orchestrator-Thread-ID` or `metadata.thread_id`; and returns citation/grounding metadata. Streaming follows OpenAI SSE role/content/finish chunks and `[DONE]`, with citation metadata attached to the terminal extension chunk. Prior user/assistant messages are used to resolve follow-up retrieval questions. Image content is rejected because vision is outside Zion's RAG scope.
 
 `Citation` currently contains repository, branch, commit, path, chunk index, score, optional line bounds, and optional URL. Line bounds and URLs are returned only when the upstream service supplies them. The old Knowledge Service endpoint is unverified with respect to repository/branch filters; Zion responds `501` to filtered retrieval rather than risking cross-repository results.
 
 ## Implementation changes
 
 1. Replaced general graph routes with focused FastAPI endpoints and a small runtime in `src/orchestrator/api.py` and `main.py`.
-2. Added bearer authentication, required-key startup validation, repository/job proxy operations, structured search citations, expert-model grounded answering, and an explicit no-grounding answer.
+2. Added repository/job proxy operations, structured search citations, expert-model grounded answering, and an explicit no-grounding answer.
 3. Retained `POST /retrieve` as the migration compatibility path. Added upstream request/error handling and optional citation fields to `models/knowledge.py`.
 4. Replaced broad settings with `ZION_`-prefixed API, expert-model, and Knowledge Service settings.
 5. Removed Docker CLI installation from the image and reduced declared runtime dependencies to the focused HTTP application.
 6. Rewrote README with current routes, configuration, and external data ownership.
 7. Removed the legacy graph, controller, conversation-memory, web, vision, image-generation, specialist, Docker/GPU-lifecycle, and old HTTP/streaming modules after replacing the entrypoint. This makes the reduced dependency manifest consistent with the source tree; Git history remains the source for recovering prior implementation if needed.
+8. Restored `/v1/models` and `/v1/chat/completions` for Open WebUI, including JSON/SSE responses, thread/request headers, historical model IDs, follow-up context, citation metadata, and unauthenticated-by-default behavior.
 
 ## Data preservation, migration, and rollback
 
@@ -133,7 +139,9 @@ Bearer authentication protects data operations. Configure secrets outside source
 
 ## Testing and acceptance criteria
 
-No tests were run or added during this change. The checkout contains no tracked Python test files, and no live services or test fixtures are provided. Before production adoption, add isolated tests for:
+Added `tests/test_openai_compat.py`. It covers default authentication state, model discovery, non-streaming completion envelopes and headers, prior-turn follow-up context, SSE framing/citation metadata, insufficient-context behavior, and unsupported image input. The suite passes with `.venv/bin/pytest -q` (7 passed). Runtime service integration still requires external Knowledge Service and llama-router instances.
+
+Before production adoption, also add isolated tests for:
 
 - auth missing/invalid/valid cases and health probe behavior;
 - successful/empty/malformed/timed-out/error Knowledge Service responses;

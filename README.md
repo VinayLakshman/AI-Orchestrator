@@ -1,10 +1,18 @@
 # Zion Git Repository RAG API
 
-Zion exposes authenticated repository search and grounded answers for Hermes and other trusted clients. Repository registration, Git synchronization, parsing, chunking, embeddings, and Qdrant writes are owned by the independent Knowledge Service. Answer generation uses the configured OpenAI-compatible llama-router endpoint.
+Zion exposes repository search and grounded answers, with Open WebUI as its primary chat interface. Repository registration, Git synchronization, parsing, chunking, embeddings, and Qdrant writes are owned by the independent Knowledge Service. Answer generation uses the configured OpenAI-compatible llama-router endpoint.
 
 ## API
 
-Protected endpoints require `Authorization: Bearer $ZION_API_KEY`:
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/v1/models` | OpenAI-compatible model discovery (`orchestrator` is the primary model ID). |
+| POST | `/v1/chat/completions` | OpenAI-compatible JSON and streaming chat completions grounded in repository results. |
+| GET | `/healthz`, `/readyz`, `/metrics` | Liveness, readiness, and Prometheus metrics. |
+
+The chat endpoint accepts the previous request fields (`model`, `messages`, `stream`, `temperature`, `max_tokens`, `params`, and `metadata`). Use `X-Orchestrator-Thread-ID` or `metadata.thread_id` to preserve a conversation identity; send prior turns in `messages` for follow-up resolution. Responses echo the requested model ID and carry grounding/citation information in `metadata`. Streaming uses OpenAI SSE deltas and `[DONE]`, with citation metadata on the terminal chunk.
+
+Additional repository endpoints:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -17,7 +25,6 @@ Protected endpoints require `Authorization: Bearer $ZION_API_KEY`:
 | GET | `/api/v1/jobs/{id}` | Index job status. |
 | POST | `/api/v1/search` | Retrieve repository context and citations. |
 | POST | `/api/v1/ask` | Answer from grounded repository evidence. |
-| GET | `/healthz`, `/readyz`, `/metrics` | Liveness, readiness, and Prometheus metrics. |
 
 `/api/v1/ask` returns `answer`, `grounded`, `confidence`, `citations`, retrieval metadata, and optionally the retrieved context. When the Knowledge Service reports no grounded evidence, Zion returns an explicit insufficient-context answer without calling the LLM.
 
@@ -29,8 +36,8 @@ Settings use the `ZION_` prefix and may be supplied through environment variable
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ZION_API_KEY` | unset | Required bearer credential when auth is enabled. |
-| `ZION_REQUIRE_AUTH` | `true` | Require authentication on repository/search/ask endpoints. |
+| `ZION_API_KEY` | unset | Optional bearer credential when auth is explicitly enabled. |
+| `ZION_REQUIRE_AUTH` | `false` | Optional authentication gate for Zion API routes. |
 | `ZION_LLM_BASE_URL` | `http://192.168.1.61:8081/v1` | llama-router OpenAI-compatible API. |
 | `ZION_LLM_MODEL` | `expert` | Answer-generation model alias. |
 | `ZION_LLM_API_KEY` | unset | Optional llama-router credential. |
@@ -47,7 +54,7 @@ Embedding configuration belongs to the Knowledge Service because that service ow
 ```sh
 python -m venv .venv
 .venv/bin/pip install .
-ZION_API_KEY='replace-with-a-secret' PYTHONPATH=src .venv/bin/uvicorn orchestrator.main:app --host 0.0.0.0 --port 8001
+PYTHONPATH=src .venv/bin/uvicorn orchestrator.main:app --host 0.0.0.0 --port 8001
 ```
 
 Build the container with `docker build -t zion-git-rag .`. The application image does not install Docker CLI or manage other containers. Zion requires network access to the Knowledge Service and llama-router. Qdrant is accessed by the Knowledge Service, not directly by Zion.
