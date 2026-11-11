@@ -1,2 +1,0 @@
-"""Vision helpers and pipeline."""
-

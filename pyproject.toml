@@ -3,22 +3,18 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ai-orchestrator"
+name = "zion-git-rag"
 version = "0.1.0"
-description = "LangGraph-based orchestrator for homelab AI services"
+description = "Authenticated Git repository RAG API backed by Knowledge Service and llama-router"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1.0",
   "uvicorn[standard]>=0.30,<1.0",
-  "langgraph>=0.2,<1.0",
   "pydantic>=2.8,<3.0",
   "pydantic-settings>=2.4,<3.0",
   "httpx>=0.27,<1.0",
-  "tenacity>=8.5,<10.0",
-  "orjson>=3.10,<4.0",
   "python-dotenv>=1.0,<2.0",
-  "Pillow>=10,<12",
 ]
 
 [project.optional-dependencies]
@@ -26,9 +22,6 @@ dev = [
   "pytest>=8.0,<9.0",
   "pytest-asyncio>=0.24,<1.0",
   "ruff>=0.6,<1.0",
-]
-persistence = [
-  "langgraph-checkpoint-sqlite>=1.0,<3.0",
 ]
 
 [tool.setuptools]

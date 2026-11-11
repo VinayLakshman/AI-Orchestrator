@@ -1,86 +1,53 @@
 from __future__ import annotations
 
-import asyncio
-from contextlib import asynccontextmanager, suppress
-from pathlib import Path
+from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 
-from .api import router as api_router
-from .graph.build import build_runtime
-from .logging import get_logger
-from .logging import configure_logging
+from .api import ZionRuntime, router
+from .clients.knowledge import KnowledgeClient
+from .clients.llama_cpp import LlamaCppClient
+from .logging import configure_logging, get_logger
 from .settings import get_settings
 
-
 logger = get_logger(__name__)
-
-
-async def _cleanup_streams(runtime) -> None:
-    while True:
-        await asyncio.sleep(300)
-        await runtime.stream_hub.cleanup()
+settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
     configure_logging(settings)
-    logger.info(
-        "startup settings loaded: log_level=%s cwd=%s env_file=%s env_exists=%s",
-        settings.log_level,
-        Path.cwd(),
-        ".env",
-        Path(".env").exists(),
+    if settings.require_auth and not settings.api_key:
+        raise RuntimeError("ZION_API_KEY must be configured while ZION_REQUIRE_AUTH is enabled")
+    knowledge_http = httpx.AsyncClient(
+        base_url=settings.knowledge_service_url.rstrip("/"),
+        timeout=httpx.Timeout(settings.knowledge_timeout_s),
+        headers=(
+            {"Authorization": f"Bearer {settings.knowledge_service_api_key}"}
+            if settings.knowledge_service_api_key
+            else {}
+        ),
     )
-
-    runtime = await build_runtime(settings)
-    enabled = ["coder", "reasoning"]
-    disabled: list[str] = []
-    if settings.mcp_enabled:
-        enabled.append("tools")
-    else:
-        disabled.append("tools")
-    if settings.enable_rag:
-        enabled.append("knowledge")
-    else:
-        disabled.append("knowledge")
-    if settings.enable_vision:
-        enabled.append("vision")
-    else:
-        disabled.append("vision")
-    if settings.web_search_enabled:
-        enabled.append("web")
-    else:
-        disabled.append("web")
-    logger.info("runtime dependencies registered enabled_specialists=%s disabled_specialists=%s", enabled, disabled)
-    logger.debug(
-        "runtime dependency map settings=%s model_manager=%s controller=%s knowledge_client=%s searxng_client=%s client_registry=%s vision_pipeline=%s stream_hub=%s graph=%s checkpointer=%s",
-        type(runtime.settings).__name__,
-        type(runtime.model_manager).__name__,
-        type(runtime.controller).__name__,
-        type(runtime.knowledge_client).__name__,
-        type(runtime.searxng_client).__name__ if runtime.searxng_client else None,
-        type(runtime.client_registry).__name__,
-        type(runtime.vision_pipeline).__name__,
-        type(runtime.stream_hub).__name__,
-        type(runtime.graph).__name__,
-        type(runtime.checkpointer).__name__,
+    llm_http = httpx.AsyncClient(
+        base_url=settings.llm_base_url.rstrip("/"),
+        timeout=httpx.Timeout(settings.llm_timeout_s),
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}),
+        },
     )
-    app.state.runtime = runtime
-
-    cleanup_task = asyncio.create_task(_cleanup_streams(runtime))
-
+    knowledge = KnowledgeClient(settings, client=knowledge_http)
+    llm = LlamaCppClient(settings, client=llm_http, base_url=settings.llm_base_url.rstrip("/"))
+    app.state.settings = settings
+    app.state.runtime = ZionRuntime(settings, knowledge, llm)
+    logger.info("Zion RAG API started model=%s knowledge_service=%s", settings.llm_model,
+                settings.knowledge_service_url)
     try:
         yield
     finally:
-        cleanup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await cleanup_task
-        await runtime.close()
+        await app.state.runtime.close()
 
 
-settings = get_settings()
-
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
-app.include_router(api_router)
+app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
+app.include_router(router)
