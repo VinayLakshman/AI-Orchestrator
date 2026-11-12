@@ -5,11 +5,23 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class OpenAIFunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+
+class OpenAIToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: OpenAIFunctionCall
+
+
 class OpenAIMessage(BaseModel):
     role: str
-    content: str | list[dict[str, Any]]
+    content: str | list[dict[str, Any]] | None = None
     name: str | None = None
     tool_call_id: str | None = None
+    tool_calls: list[OpenAIToolCall] | None = None
 
 
 class OpenAIChatCompletionRequest(BaseModel):
@@ -20,6 +32,8 @@ class OpenAIChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    tool_choice: str | dict[str, Any] | None = None
 
 
 class OpenAIChatCompletionChoice(BaseModel):

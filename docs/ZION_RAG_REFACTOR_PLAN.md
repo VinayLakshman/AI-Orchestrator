@@ -4,7 +4,7 @@
 
 This checkout previously implemented a FastAPI/LangGraph general-purpose orchestrator. It contained a client for an external Knowledge Service but no repository ingestion, Git handling, parser, chunker, embedding call, Qdrant integration, synchronization worker, or repository registry. The Knowledge Service source, deployment manifests, Qdrant configuration, collections, clones, and indexed data are not present in this repository.
 
-The implemented target keeps the Knowledge Service independent as the canonical owner of repository registration, Git access, indexing, embeddings, and Qdrant. Zion provides the Open WebUI-facing OpenAI-compatible API and grounded-answer layer and uses llama-router's `expert` alias for answer generation. API-key authentication is disabled by default, matching the requested Open WebUI setup. Current legacy `/retrieve` remains usable for unfiltered search and answers. Repository management operations target a new Knowledge Service v1 contract and require matching implementation in that separate service.
+The implemented target keeps the Knowledge Service independent as the canonical owner of repository registration, Git access, indexing, embeddings, and Qdrant. Zion provides the Open WebUI-facing OpenAI-compatible API and uses llama-router's `expert` alias for general answers and repository-grounded answers. A conservative intent decision skips Knowledge Service retrieval for clearly general questions; repository questions remain grounded-only. API-key authentication is disabled by default, matching the requested Open WebUI setup. Current legacy `/retrieve` remains usable for unfiltered search and answers. Repository management operations target a new Knowledge Service v1 contract and require matching implementation in that separate service.
 
 No Qdrant collection, volume, clone, credential, or external service was modified by this refactor.
 
@@ -74,13 +74,17 @@ The application had no API-key authentication. `/chat` exposed execution/evidenc
 ```mermaid
 flowchart LR
     OpenWebUI[Open WebUI] --> Zion[OpenAI-compatible Zion API]
+    Zion -->|assistant search_web tool call| OpenWebUI
+    OpenWebUI -->|executes search_web| Web[Configured SearXNG provider]
+    Web --> OpenWebUI
+    OpenWebUI -->|tool result follow-up| Zion
     Hermes[Hermes / trusted client] --> Zion
     Zion -->|register / status / sync / search| KS[Independent Knowledge Service]
     KS --> Git[Git providers and local clones]
     KS --> Parse[Parsing / chunking / metadata]
     KS --> Embed[llama-router embedding alias]
     Embed --> Qdrant[(Existing Qdrant)]
-    Zion -->|grounded context| Expert[llama-router expert alias]
+    Zion -->|general answers or grounded context| Expert[llama-router expert alias]
     Expert --> Zion
     Zion -->|answer + citations| Hermes
 ```
@@ -94,7 +98,7 @@ Zion configuration is `ZION_LLM_BASE_URL=http://192.168.1.61:8081/v1`, `ZION_LLM
 | Method and path | Purpose | Backend dependency |
 |---|---|---|
 | `GET /v1/models` | OpenAI-compatible model discovery, preserving historical IDs | Local |
-| `POST /v1/chat/completions` | OpenAI-compatible JSON/SSE completions with grounded RAG | Knowledge Service `/retrieve` and llama-router |
+| `POST /v1/chat/completions` | OpenAI-compatible JSON/SSE, general-vs-repository routing, and Native Web Search tool-call round | llama-router; Knowledge Service for repository turns; Open WebUI executes `search_web` |
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Operations | Local |
 | `GET /api/v1/repositories` | List | Knowledge Service v1 |
 | `POST /api/v1/repositories` | Register | Knowledge Service v1 |
@@ -108,7 +112,11 @@ Zion configuration is `ZION_LLM_BASE_URL=http://192.168.1.61:8081/v1`, `ZION_LLM
 
 Routes accept unauthenticated requests by default. Set `ZION_REQUIRE_AUTH=true` and `ZION_API_KEY` to opt into bearer authentication. Health, readiness, and metrics remain public for container probes.
 
-The OpenAI endpoint accepts the prior `model`, `messages`, `stream`, `temperature`, `max_tokens`, `params`, and `metadata` fields; echoes the requested model ID; honors thread identity from `X-Orchestrator-Thread-ID` or `metadata.thread_id`; and returns citation/grounding metadata. Streaming follows OpenAI SSE role/content/finish chunks and `[DONE]`, with citation metadata attached to the terminal extension chunk. Prior user/assistant messages are used to resolve follow-up retrieval questions. Image content is rejected because vision is outside Zion's RAG scope.
+The OpenAI endpoint accepts the prior `model`, `messages`, `stream`, `temperature`, `max_tokens`, `params`, and `metadata` fields, plus OpenAI `tools` and assistant/tool messages; it echoes the requested model ID and honors thread identity from `X-Orchestrator-Thread-ID` or `metadata.thread_id`. The `expert` model classifies each turn using conversation history. Clearly general questions are answered without a Knowledge Service call and are marked `mode=general`, `grounded=false`, with no repository citations. Repository questions use `/retrieve`; unclear intent defaults to repository mode, and unsupported repository answers remain explicitly insufficient rather than falling back to general knowledge.
+
+When the request includes the Native `search_web` tool and the current turn has not already attempted it, Zion returns one OpenAI tool call. Open WebUI runs that tool using its configured search provider and sends the result back in a follow-up request. Zion detects the matching tool result, does not request another search for the same turn, and adds bounded result snippets as untrusted answer context. Web results may supplement general answers and relevant grounded repository answers, but cannot establish facts about the user's repository. Responses report search status and web sources separately from repository citations; used web sources are linked in answer text. Search errors or empty results do not block the ordinary general-answer path. Streaming uses standard tool-call/content deltas, `finish_reason=tool_calls` for the search handoff, and `[DONE]`. `/api/v1/ask` remains grounded-only.
+
+The Open WebUI `orchestrator` model must have Web Search capability enabled, Native function calling active, and SearXNG configured as the Web Search provider. Zion does not call SearXNG directly. Open WebUI documents the native `search_web` tool and its result format in [Agentic Web Search](https://docs.openwebui.com/features/chat-conversations/web-search/agentic-search/).
 
 `Citation` currently contains repository, branch, commit, path, chunk index, score, optional line bounds, and optional URL. Line bounds and URLs are returned only when the upstream service supplies them. The old Knowledge Service endpoint is unverified with respect to repository/branch filters; Zion responds `501` to filtered retrieval rather than risking cross-repository results.
 
@@ -122,6 +130,8 @@ The OpenAI endpoint accepts the prior `model`, `messages`, `stream`, `temperatur
 6. Rewrote README with current routes, configuration, and external data ownership.
 7. Removed the legacy graph, controller, conversation-memory, web, vision, image-generation, specialist, Docker/GPU-lifecycle, and old HTTP/streaming modules after replacing the entrypoint. This makes the reduced dependency manifest consistent with the source tree; Git history remains the source for recovering prior implementation if needed.
 8. Restored `/v1/models` and `/v1/chat/completions` for Open WebUI, including JSON/SSE responses, thread/request headers, historical model IDs, follow-up context, citation metadata, and unauthenticated-by-default behavior.
+9. Added conservative general-vs-repository routing to OpenAI chat. General turns skip Knowledge Service retrieval and are answered by `expert`; repository turns retain grounded retrieval and insufficient-evidence behavior. `/api/v1/ask` remains unchanged.
+10. Added OpenAI tool-call handling for Open WebUI Native Web Search. Zion requests `search_web` once per turn when that tool is present, consumes the returned tool result, and includes useful linked web sources separately from repository citations. Open WebUI remains the SearXNG client/provider owner.
 
 ## Data preservation, migration, and rollback
 
@@ -133,24 +143,13 @@ The OpenAI endpoint accepts the prior `model`, `messages`, `stream`, `temperatur
 
 ## Deployment and security
 
-The Zion container now needs only network access to the Knowledge Service and llama-router. It does not launch an LLM, connect to Qdrant, require Docker socket/CLI access, or depend on Open WebUI, ComfyUI, SearXNG, speech services, or homelab management containers. No Compose edits were possible because none exist in this repository.
+The Zion container needs network access to the Knowledge Service and llama-router. It does not launch an LLM, connect to Qdrant or SearXNG, require Docker socket/CLI access, or depend on ComfyUI, speech services, or homelab management containers. Open WebUI must be configured with SearXNG and with Web Search capability enabled for the `orchestrator` model; Zion consumes Open WebUI's tool-call result. No Compose edits were possible because none exist in this repository.
 
 Bearer authentication protects data operations. Configure secrets outside source control. Upstream failures are returned without forwarding raw response bodies. Expert-model exceptions are mapped to a generic `502`. Repository registration payload validation is delegated to the Knowledge Service; it must enforce URL schemes, SSRF-safe destination rules, credential handling, authorization, and clone-path containment. The current Zion implementation does not yet provide per-repository authorization, rate limiting, or streaming job progress.
 
 ## Testing and acceptance criteria
 
-Added `tests/test_openai_compat.py`. It covers default authentication state, model discovery, non-streaming completion envelopes and headers, prior-turn follow-up context, SSE framing/citation metadata, insufficient-context behavior, and unsupported image input. The suite passes with `.venv/bin/pytest -q` (7 passed). Runtime service integration still requires external Knowledge Service and llama-router instances.
-
-Before production adoption, also add isolated tests for:
-
-- auth missing/invalid/valid cases and health probe behavior;
-- successful/empty/malformed/timed-out/error Knowledge Service responses;
-- unfiltered search, citations with/without line fields, and explicit insufficient-context behavior;
-- expert model payload, provider error mapping, and output handling;
-- repository and branch filter rejection until upstream support exists;
-- every management proxy route against a contract fixture;
-- upstream auth, URL validation/SSRF defenses, and repository-level authorization;
-- Hermes request/response integration and rollout rollback.
+No tests are included in this repository, per project preference. The general-vs-repository and Native Web Search tool-call flows have not been exercised against live llama-router, Knowledge Service, or Open WebUI services. Verify manually through Open WebUI before deployment: search off/on, one tool handoff and result consumption, general and repository answers, independent web/repository citations, empty/error results, follow-ups, and JSON/SSE behavior.
 
 In the separate Knowledge Service repository, test Git auth, branch/commit selection, incremental add/change/delete/rename, ignore rules, parser fallback, chunk line attribution, embedding dimensions/model consistency, idempotent Qdrant writes, repository isolation, retry recovery, snapshots, and restore using isolated fixtures only.
 
